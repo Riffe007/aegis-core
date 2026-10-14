@@ -8,7 +8,7 @@ if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
   set(CMAKE_CUDA_ARCHITECTURES native)
 endif()
 
-project(aegis_core LANGUAGES CXX CUDA)
+project(aegis_core LANGUAGES C CXX CUDA)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -29,10 +29,13 @@ add_library(aegis_kernels STATIC
   src/gemm/registry.cu
 )
 target_include_directories(aegis_kernels PUBLIC include)
-set_target_properties(aegis_kernels PROPERTIES CUDA_SEPARABLE_COMPILATION OFF)
+# PIC: the kernels also go into the shared C ABI library.
+set_target_properties(aegis_kernels PROPERTIES CUDA_SEPARABLE_COMPILATION OFF
+                                               POSITION_INDEPENDENT_CODE ON)
 
 # aegis::matmul: tuned-winner dispatch over the kernels, cuBLAS fallback.
-add_library(aegis STATIC src/matmul.cu)
+add_library(aegis STATIC src/matmul.cu src/manifest.cpp)
+set_target_properties(aegis PROPERTIES POSITION_INDEPENDENT_CODE ON)
 # matmul.cu pulls winners in with __has_include, which dependency scanning
 # misses when a header first appears; glob them so `tune.py --emit-header`
 # triggers a rebuild.
@@ -44,8 +47,35 @@ add_executable(bench_gemm bench/bench_gemm.cu)
 target_link_libraries(bench_gemm PRIVATE aegis_kernels CUDA::cudart CUDA::cublas)
 
 add_executable(aegis_manifest tools/aegis_manifest.cu)
-target_include_directories(aegis_manifest PRIVATE include)
-target_link_libraries(aegis_manifest PRIVATE CUDA::cudart)
+target_link_libraries(aegis_manifest PRIVATE aegis)
+
+# C ABI (include/aegis/aegis.h): libaegis_capi.a and libaegis_capi.so. The
+# shared library exports only the AEGIS_API symbols.
+add_library(aegis_capi_objs OBJECT src/capi.cpp)
+target_link_libraries(aegis_capi_objs PUBLIC aegis)
+set_target_properties(aegis_capi_objs PROPERTIES POSITION_INDEPENDENT_CODE ON
+                                                 CXX_VISIBILITY_PRESET hidden)
+add_library(aegis_capi_static STATIC $<TARGET_OBJECTS:aegis_capi_objs>)
+target_link_libraries(aegis_capi_static PUBLIC aegis)
+add_library(aegis_capi_shared SHARED $<TARGET_OBJECTS:aegis_capi_objs>)
+target_link_libraries(aegis_capi_shared PRIVATE aegis)
+# Keep symbols from the static kernel/matmul libraries out of the dynamic table.
+target_link_options(aegis_capi_shared PRIVATE -Wl,--exclude-libs,ALL)
+set_target_properties(aegis_capi_static aegis_capi_shared PROPERTIES OUTPUT_NAME aegis_capi)
+set_target_properties(aegis_capi_shared PROPERTIES CUDA_VISIBILITY_PRESET hidden
+                                                   VISIBILITY_INLINES_HIDDEN ON
+                                                   VERSION 1.0 SOVERSION 1)
+target_include_directories(aegis_capi_static INTERFACE include)
+target_include_directories(aegis_capi_shared INTERFACE include)
+
+# The C test, compiled as strict C11, against both libraries.
+foreach(kind static shared)
+  add_executable(capi_test_${kind} tests/capi_test.c)
+  target_link_libraries(capi_test_${kind} PRIVATE aegis_capi_${kind} m)
+  set_target_properties(capi_test_${kind} PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON
+                                                      C_EXTENSIONS OFF)
+  target_compile_options(capi_test_${kind} PRIVATE -Wall -Wextra -Wpedantic -Werror)
+endforeach()
 
 add_executable(test_matmul tests/test_matmul.cu)
 target_link_libraries(test_matmul PRIVATE aegis)
@@ -75,3 +105,5 @@ foreach(impl ${AEGIS_IMPLS})
 endforeach()
 
 add_test(NAME matmul_dispatch COMMAND test_matmul)
+add_test(NAME capi_static COMMAND capi_test_static)
+add_test(NAME capi_shared COMMAND capi_test_shared)

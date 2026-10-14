@@ -1,0 +1,100 @@
+/*
+ * AEGIS Core C ABI. Pure C (C99 and later), no C++ or CUDA types.
+ *
+ * All functions return an int status: AEGIS_OK (0) or a negative AEGIS_ERR_*.
+ * aegis_status_string() describes any status. When a CUDA call failed, the
+ * context also remembers the CUDA error text (aegis_last_error()).
+ *
+ * Memory: GEMM operands are device pointers to FP16 data (IEEE binary16 bit
+ * patterns, uint16_t on the host). Allocate them with aegis_device_alloc() or
+ * any CUDA allocator in the same process.
+ *
+ * Threading: a context may be used from one thread at a time.
+ *
+ * Example:
+ *   aegis_context* ctx;
+ *   if (aegis_create(&ctx, 0) != AEGIS_OK) ...;
+ *   aegis_gemm_f16(ctx, dA, dB, dC, M, N, K);
+ *   aegis_synchronize(ctx);
+ *   aegis_destroy(ctx);
+ */
+#ifndef AEGIS_AEGIS_H
+#define AEGIS_AEGIS_H
+
+#include <stddef.h>
+#include <stdint.h>
+
+#if defined(_WIN32)
+#define AEGIS_API __declspec(dllexport)
+#else
+#define AEGIS_API __attribute__((visibility("default")))
+#endif
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* Status codes. */
+#define AEGIS_OK 0
+#define AEGIS_ERR_INVALID_ARGUMENT (-1)  /* null pointer, non-positive dimension */
+#define AEGIS_ERR_CUDA (-2)              /* a CUDA runtime call failed */
+#define AEGIS_ERR_BUFFER_TOO_SMALL (-3)  /* see the `needed` out-parameter */
+#define AEGIS_ERR_NO_DEVICE (-4)         /* device index out of range / no GPU */
+#define AEGIS_ERR_OUT_OF_MEMORY (-5)
+
+/* ABI version: bump the major on any incompatible change. */
+#define AEGIS_ABI_VERSION_MAJOR 1
+#define AEGIS_ABI_VERSION_MINOR 0
+AEGIS_API int aegis_abi_version(void); /* major * 1000 + minor */
+
+/* Static description of a status code. Never NULL. */
+AEGIS_API const char* aegis_status_string(int status);
+
+/* Opaque context: one device and one stream (a private non-blocking stream,
+ * or the caller's, see aegis_set_stream). */
+typedef struct aegis_context aegis_context;
+
+AEGIS_API int aegis_create(aegis_context** out, int device);
+AEGIS_API int aegis_destroy(aegis_context* ctx); /* NULL is a no-op */
+
+/* Use a caller-owned cudaStream_t (passed as void*); NULL restores the
+ * context's own stream. The context never destroys a caller's stream. */
+AEGIS_API int aegis_set_stream(aegis_context* ctx, void* cuda_stream);
+
+/* Wait for all work queued on the context's stream. */
+AEGIS_API int aegis_synchronize(aegis_context* ctx);
+
+/* Text of the last CUDA error seen by this context ("" if none). */
+AEGIS_API const char* aegis_last_error(const aegis_context* ctx);
+
+/* Device memory helpers (synchronous). */
+AEGIS_API int aegis_device_alloc(aegis_context* ctx, size_t bytes, void** out);
+AEGIS_API int aegis_device_free(aegis_context* ctx, void* ptr); /* NULL is a no-op */
+AEGIS_API int aegis_copy_to_device(aegis_context* ctx, void* dst, const void* src, size_t bytes);
+AEGIS_API int aegis_copy_to_host(aegis_context* ctx, void* dst, const void* src, size_t bytes);
+
+/* C[M,N] = A[M,K] * B[K,N]; row-major, FP16 in, FP32 accumulate, FP16 out.
+ * Runs the tuned winner for the device (aegis::matmul), else cuBLAS.
+ * Asynchronous on the context's stream. */
+AEGIS_API int aegis_gemm_f16(aegis_context* ctx, const void* A, const void* B, void* C,
+                             int M, int N, int K);
+
+/* Name of the implementation aegis_gemm_f16 would run for this shape, copied
+ * NUL-terminated into buf. `needed` (optional) receives the size required,
+ * including the NUL; AEGIS_ERR_BUFFER_TOO_SMALL if buf_len is less. */
+AEGIS_API int aegis_gemm_choice(aegis_context* ctx, int M, int N, int K, char* buf,
+                                size_t buf_len, size_t* needed);
+
+/* JSON device manifest (the same document tools/aegis_manifest prints), copied
+ * NUL-terminated into buf. The first call per device measures bandwidth
+ * (~0.1 s, briefly allocates 1 GiB of device memory); later calls in the same
+ * process return the same document, so a size query followed by a fill is
+ * consistent. `needed` (optional) receives the size required including the
+ * NUL; pass buf = NULL, buf_len = 0 to query it. */
+AEGIS_API int aegis_device_manifest(int device, char* buf, size_t buf_len, size_t* needed);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* AEGIS_AEGIS_H */
