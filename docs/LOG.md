@@ -583,3 +583,37 @@ Bandwidth moved: the bring-up manifest said 214.7 GB/s (remote desktop on);
 three aegis_manifest runs tonight read 227.0, 233.9, 236.3 GB/s and the new
 probe 235.9–238.2. Runs ingested before tonight carry 214.7 in
 `runs.measured_bw_gbps`.
+
+### 4. Launch-overhead probe (`microbench/launch_overhead.cu`)
+
+Host-to-completion latency of one launch of the M = 1 winner
+`mma_pipe_64x64x32_2x2_s4` (all three M = 1 shapes): steady_clock before the
+call to after `cudaStreamSynchronize`, 2,000 samples after 200 warm-ups,
+methods interleaved round-robin, operands warm in L2. Run `0de7ff68bb2f`,
+idle guard 1.1%. Not CPU-pinned; CPU frequency not controlled.
+
+| Shape | Method | Median µs | p99 µs |
+|---|---|---|---|
+| 1x896x896 | runtime (`<<<>>>` via registry) | 14.26 | 20.46 |
+| | driver (`cuLaunchKernel`) | 14.03 | 20.02 |
+| | CUDA Graph replay | **13.89** | **17.55** |
+| | `aegis::matmul` end to end | 14.38 | 19.42 |
+| 1x4864x896 | runtime | 17.07 | 25.07 |
+| | driver | 16.80 | 26.14 |
+| | graph | 16.67 | 23.33 |
+| | matmul | 17.15 | 25.65 |
+| 1x896x4864 | runtime | 51.52 | 54.40 |
+| | driver | 51.31 | 55.09 |
+| | graph | 51.17 | 54.40 |
+| | matmul | 51.68 | 55.22 |
+| any | empty kernel `<<<1,32>>>` (runtime) | 4.99–5.01 | 8.32–8.90 |
+| any | `cudaStreamSynchronize` on an idle stream | 0.18 | 0.19–0.27 |
+
+Against the winner's warm v2 per-launch time from decode run `6e1000a59892`
+(9.47, 12.23, 47.15 µs), the single-launch cost is kernel + **~4.4–4.8 µs**
+(runtime path), matching the 5.0 µs empty-kernel floor. Method differences are
+small: graph replay is 0.3–0.4 µs faster than the runtime launch at the median
+and has the lowest p99 on the two short shapes; the driver API saves ~0.2 µs;
+`aegis::matmul`'s winner lookup adds ~0.1 µs over a direct registry launch.
+At 1x896x896 the fixed cost is ~1/3 of the end-to-end time, so for decode
+the launch path matters about as much as the remaining gap to cublaslt_best.

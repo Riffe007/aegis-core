@@ -144,7 +144,7 @@ only to compare with old rows (`--protocol 1`).
   `batch_n`, `timer_res_ns`, `cache_mode`, `buffer_sets`.
 - **What v2 does not measure: single-launch latency.** Launch overhead, the
   CPU submission path, first-launch and cold-start costs belong to the
-  launch-overhead probe (`microbench/`, planned), never to this harness.
+  launch-overhead probe (`microbench/launch_overhead.cu`), never to this harness.
   Do not compare a v2 per-launch time with an end-to-end latency.
 - **Cache state is explicit.** `cold` (ranks configs, the default):
   launches rotate through K = max(2, ceil(3 x L2 / footprint)) buffer sets

@@ -4,3 +4,8 @@ foreach(probe ptr_chase mma_latency mma_throughput ldmatrix smem_banks cp_async 
   add_executable(mb_${probe} ${probe}.cu)
   target_link_libraries(mb_${probe} PRIVATE CUDA::cudart)
 endforeach()
+
+# Host-to-completion launch latency of the decode winner: runtime, driver
+# (cuLaunchKernel), CUDA Graph, aegis::matmul. Needs the library and libcuda.
+add_executable(mb_launch_overhead launch_overhead.cu)
+target_link_libraries(mb_launch_overhead PRIVATE aegis CUDA::cuda_driver)
