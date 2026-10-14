@@ -1,0 +1,108 @@
+{
+  "device": "NVIDIA GB10",
+  "dram_bandwidth_gbps": {
+    "method": "cudaMemcpyAsync D2D, 512 MiB, (read + write bytes) / time; median of 20 copies per rep, median of reps",
+    "reps": [
+      236.307,
+      235.897,
+      237.921,
+      238.191,
+      236.848
+    ],
+    "source": {
+      "probe": "dram_bandwidth",
+      "run_id": "d601cda25a28"
+    },
+    "value": 236.848
+  },
+  "dram_latency": {
+    "source": {
+      "probe": "ptr_chase_latency",
+      "runs": [
+        {
+          "layout": "both",
+          "run_id": "6141123bbcc4"
+        },
+        {
+          "layout": "cross_page",
+          "run_id": "f1925d6a0fa4"
+        },
+        {
+          "layout": "both",
+          "run_id": "a825f4e557a3"
+        }
+      ]
+    },
+    "value": {
+      "cycles": 960.66,
+      "method": "dependent-load pointer chase, one thread, 128 B node stride, median of 5 repeats per point; the value is the median across points and runs",
+      "ns": 381.25,
+      "ns_max": 400.853,
+      "ns_min": 370.439,
+      "points": 25,
+      "working_sets": ">= 32 MiB"
+    }
+  },
+  "generated_by": "aegis-perf emit-arch on spark-5822, 2026-10-14 19:21 UTC",
+  "l2_bytes": 25165824,
+  "l2_latency": {
+    "source": {
+      "clocks": [
+        {
+          "run_id": "6141123bbcc4",
+          "sm_clock_mhz": 2557.22
+        },
+        {
+          "run_id": "f1925d6a0fa4",
+          "sm_clock_mhz": 2558.06
+        },
+        {
+          "run_id": "a825f4e557a3",
+          "sm_clock_mhz": 2406.78
+        }
+      ],
+      "probe": "ptr_chase_latency",
+      "runs": [
+        {
+          "layout": "both",
+          "run_id": "6141123bbcc4"
+        },
+        {
+          "layout": "cross_page",
+          "run_id": "f1925d6a0fa4"
+        },
+        {
+          "layout": "both",
+          "run_id": "a825f4e557a3"
+        }
+      ]
+    },
+    "value": {
+      "cycles": 337.9465,
+      "method": "dependent-load pointer chase, one thread, 128 B node stride, median of 5 repeats per point; the value is the median across points and runs",
+      "ns": 132.292,
+      "ns_max": 139.376,
+      "ns_min": 132.115,
+      "points": 30,
+      "working_sets": "256 KiB - 8 MiB"
+    }
+  },
+  "mma_peak": {
+    "at": {
+      "chains": 8,
+      "sms": 48,
+      "warps_per_sm": 32
+    },
+    "hmma_per_clk_per_sm": 0.249981,
+    "instruction": "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32",
+    "source": {
+      "probe": "mma_throughput",
+      "run_id": "eb3e197afc8e"
+    },
+    "tflops": 125.597
+  },
+  "note": "Measured on this device (CLAUDE.md rule 8). Regenerate with aegis-perf emit-arch after re-running the probes; do not edit by hand.",
+  "schema": "aegis-arch-params/1",
+  "sm_arch": 121,
+  "sm_count": 48
+}

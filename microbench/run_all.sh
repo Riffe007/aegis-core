@@ -18,7 +18,7 @@ mkdir -p "$ROOT/results" "$SASS"
 [[ -f "$MANIFEST" ]] || "$ROOT/build/aegis_manifest" > "$MANIFEST"
 
 status=0
-for probe in ptr_chase mma_latency mma_throughput ldmatrix smem_banks cp_async; do
+for probe in ptr_chase mma_latency mma_throughput ldmatrix smem_banks cp_async dram_bw; do
   exe="$BIN/mb_$probe"
   [[ -x "$exe" ]] || { echo "missing $exe; build first" >&2; exit 1; }
   echo "== $probe" >&2

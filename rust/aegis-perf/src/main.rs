@@ -9,6 +9,8 @@
 //!     aegis-perf tune [--shapes shapes/default.txt] [--seed S] [--allow-busy]
 //!     aegis-perf emit-header [--arch 121]
 //!     aegis-perf roofline --arch 121 [--out results/roofline-sm121.svg]
+//!     aegis-perf emit-arch --arch 121 [--ptr-chase RUN[:LAYOUT]]...
+mod arch;
 mod db;
 mod pyjson;
 mod roofline;
@@ -104,6 +106,20 @@ enum Cmd {
         #[arg(long, default_value = "results")]
         results_dir: PathBuf,
     },
+    /// Measured machine parameters (L2/DRAM latency, DRAM bandwidth, mma peak)
+    /// -> include/aegis/arch/sm_<arch>.json, for the cost model.
+    EmitArch {
+        #[arg(long)]
+        arch: i64,
+        /// Pointer-chase runs to use, RUN or RUN:LAYOUT (cross_page / page_local_64k);
+        /// repeatable. Default: every current (non-superseded) run.
+        #[arg(long = "ptr-chase")]
+        ptr_chase: Vec<String>,
+        #[arg(long)]
+        out: Option<PathBuf>,
+        #[arg(long, default_value = "results")]
+        results_dir: PathBuf,
+    },
     /// SVG roofline from measured roofs (manifest bandwidth, mma_throughput microbench) and winners.
     Roofline {
         #[arg(long)]
@@ -154,6 +170,9 @@ fn main() -> Result<()> {
         }),
         Cmd::EmitHeader { arch, out, results_dir } => {
             tune::cmd_emit_header(&cli.db, arch, &results_dir, out.as_deref())
+        }
+        Cmd::EmitArch { arch, ptr_chase, out, results_dir } => {
+            arch::cmd_emit_arch(&cli.db, arch, &ptr_chase, &results_dir, out.as_deref())
         }
         Cmd::Roofline { arch, out } => {
             let out = out.unwrap_or_else(|| PathBuf::from(format!("results/roofline-sm{arch}.svg")));
