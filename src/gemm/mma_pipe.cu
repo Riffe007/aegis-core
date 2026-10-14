@@ -22,7 +22,7 @@
 //     cp.async; empty: zero store; partial: valid halves + explicit zeros).
 //   - otherwise (misaligned): tier 3's synchronous loop with the scalar,
 //     element-wise bounds-checked loader.
-// Smem layout per operand layout, padding and compute: mma_common.cuh.
+// Smem layout per operand layout (XOR-swizzled) and compute: mma_common.cuh.
 // PTX ISA citations for every instruction used: see mma_common.cuh.
 #include <array>
 #include <string>
@@ -169,7 +169,7 @@ std::string config_of(const MmaPipeConfig& c) {
   return "{\"BM\":" + std::to_string(c.BM) + ",\"BN\":" + std::to_string(c.BN) +
          ",\"BK\":" + std::to_string(c.BK) + ",\"WARPS_M\":" + std::to_string(c.WARPS_M) +
          ",\"WARPS_N\":" + std::to_string(c.WARPS_N) + ",\"STAGES\":" +
-         std::to_string(c.STAGES) + ",\"smem\":\"pad8\"}";
+         std::to_string(c.STAGES) + ",\"smem\":\"xor\"}";
 }
 
 template <size_t... I>

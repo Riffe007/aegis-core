@@ -320,7 +320,10 @@ pub fn cmd_ingest(
     Ok(())
 }
 
-type KernelShapeKey = (i64, String, String, i64, i64, i64, String); // arch, op, dtype, m, n, k, kernel_id
+// arch, op, dtype, m, n, k, impl. Keyed by impl, not kernel_id: a code change that
+// alters the config serialization (e.g. "smem":"pad" -> "xor") gives the same
+// config a new kernel_id, and its older rows must not compete with the new ones.
+type KernelShapeKey = (i64, String, String, i64, i64, i64, String);
 type ShapeKey = (i64, String, String, i64, i64, i64); // arch, op, dtype, m, n, k
 
 /// Microbench probe lines (microbench/*): one run row with the device metadata
@@ -379,7 +382,7 @@ pub fn cmd_ingest_microbench(db: &Path, results: &Path, manifest: Option<&Path>,
     Ok(())
 }
 
-/// Latest passing measurement per (arch, kernel, shape).
+/// Latest passing measurement per (arch, impl, shape).
 #[derive(Clone, Debug)]
 pub struct Latest {
     pub sm_arch: i64,
@@ -399,7 +402,7 @@ pub struct Latest {
     pub smem_bytes: Option<i64>,
 }
 
-/// Most recent measurement per (arch, kernel, shape); only checked+passing rows
+/// Most recent measurement per (arch, impl, shape); only checked+passing rows
 /// are eligible, except cuBLAS which is the reference itself. Keeps Python's
 /// dict semantics: first-seen key order, later runs overwrite values.
 pub fn latest_per_kernel_shape(con: &Connection, arch: Option<i64>, sel: &Selection) -> Result<Vec<Latest>> {
@@ -439,7 +442,7 @@ pub fn latest_per_kernel_shape(con: &Connection, arch: Option<i64>, sel: &Select
     let mut order: Vec<Latest> = Vec::new();
     let mut index: HashMap<KernelShapeKey, usize> = HashMap::new();
     for r in rows {
-        let key = (r.sm_arch, r.op.clone(), r.dtype.clone(), r.m, r.n, r.k, r.kernel_id.clone());
+        let key = (r.sm_arch, r.op.clone(), r.dtype.clone(), r.m, r.n, r.k, r.impl_.clone());
         match index.get(&key) {
             Some(&i) => order[i] = r,
             None => {

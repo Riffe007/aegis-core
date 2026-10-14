@@ -8,12 +8,10 @@
 // and global memory. Loads here are synchronous (global -> regs -> smem, then
 // barrier), so load latency is exposed once per BK step; tier 4 hides it.
 //
-// Shared memory is padded, not XOR-swizzled: +8 halves per row makes the row
-// stride an odd number of 16 B chunks, so every ldmatrix phase and every 16 B
-// store hits 8 distinct bank groups (see mma_common.cuh). Padding costs ~18%
-// more smem at 128x128x32 but needs no index math in the hot loop and stays
-// correct for any BK/BN that is a multiple of 16; a swizzle would save that
-// smem, which matters only if a STAGES config stops fitting.
+// Shared memory is XOR-swizzled at 16-byte chunk granularity, unpadded: every
+// ldmatrix phase and every 16 B store hits 8 distinct bank groups (see
+// mma_common.cuh, SmemOperand). It replaced +8-halves-per-row padding on
+// 2026-10-15 (saves 1/(row chunks + 1) of the tile; lets 4-stage 128x256 fit).
 //
 // General GEMM (GemmParams). Paths: vec (16 B-compatible) with an unpredicated
 // interior fast path and per-CTA masks on boundary CTAs (k mask only on the
@@ -142,7 +140,7 @@ std::string name_of(const MmaConfig& c) {
 std::string config_of(const MmaConfig& c) {
   return "{\"BM\":" + std::to_string(c.BM) + ",\"BN\":" + std::to_string(c.BN) +
          ",\"BK\":" + std::to_string(c.BK) + ",\"WARPS_M\":" + std::to_string(c.WARPS_M) +
-         ",\"WARPS_N\":" + std::to_string(c.WARPS_N) + ",\"smem\":\"pad8\"}";
+         ",\"WARPS_N\":" + std::to_string(c.WARPS_N) + ",\"smem\":\"xor\"}";
 }
 
 template <size_t... I>

@@ -1068,3 +1068,59 @@ before issuing step s's MMAs (tier 4 only; on tier 3 it spilled
   -> smem copy issue into the MMA stream, as TMA would) or nothing at all: with
   the tensor pipe ~50% busy and issue active ~18%, they may not be the binding
   limit. Not pursued further in Phase B.
+
+## 2026-10-15 — Phase B b: XOR swizzle replaces padding; s4 at 128x256 / 256x128
+
+`SmemOperand<ROWS, COLS>::at(row, col)` (`mma_common.cuh`) swizzles 16-byte
+chunks instead of padding rows by 8 halves: rows of >= 8 chunks put chunk c at
+c ^ (row & 7) within each group of 8; rows of 4 chunks (k-contiguous BK = 32)
+pack two rows per 128-byte line and XOR the position with the line index. The
+term repeats every 8 (16) rows, so `OperandPlan` and `compute_tile` keep
+compile-time offsets. A 128x256x32 stage shrinks from 27,136 to 24,576 B, which
+fits 4 stages in sm_121's 101,376 B: new configs `mma_pipe_128x256x32_2x4_s4`
+and `mma_pipe_256x128x32_4x2_s4` (98,304 B). Config JSON now carries
+`"smem":"xor"`, so every tier-3/4 kernel_id changed.
+
+- **Correctness:** ctest 149/149 (fuzz_2000, fuzz_poison, sm87_gate).
+  Registers: 128x256 s3 188 -> 204, s4 206, 256x128 s4 206, 128x128 s2 124;
+  no spills.
+- **Bank conflicts (ncu):** ldmatrix (LDSM) conflicts 0 in every profiled
+  config; the standard ld/st bank-conflict counters are 0/0 for the three 4096³
+  configs (128x128 s3 @ 2048³: 3,009 ld, against 18.9 M instructions). The
+  remaining excess shared wavefronts are all on LDGSTS (cp.async smem writes)
+  of the A tile: 128x256 s3 @ 4096³ 4.19 M excess of 16.78 M (padding: 25.17 M
+  of 37.75 M). That is exactly 4 extra per A-tile LDGSTS (8 instead of 4);
+  B-tile LDGSTS are ideal. Each A instruction writes 8 rows of 64 B and the
+  swizzle is a permutation inside each 128-byte line, so the addresses do not
+  conflict. Hypothesis (unverified): LDGSTS writes shared memory per
+  global row segment (one wavefront per 64 B row), which only a BK = 64 tile
+  (128 B rows) would avoid.
+- **Tune** (`shapes/large.txt`, run `92ea023af8b5`; `shapes/default.txt`, run
+  `41cc8ffb03fd`; idle guard 0.0%). Instructions from ncu; HMMA = MNK / 2048.
+
+| Shape | Winner (Phase A -> B b) | Instr / HMMA | Tensor busy | lt / ours (paired) | % cublaslt_best |
+|---|---|---|---|---|---|
+| 2048³ | 128x128 s2 -> **128x128 s3** | 4.50 | 57.2% | 0.833 [0.830, 0.836] | 71.1% -> 83.6% |
+| 4096³ | 128x256 s3 -> **256x128 s4** | 3.72 (Phase A 3.16) | 64.0% (Phase A 53.0%) | 0.711 [0.705, 0.715] | 63.6% -> 71.0% |
+
+  At 4096³ the default-set run's unpaired medians put 128x128 s3 first, but its
+  paired test gave runner-up / fastest [0.994, 0.998], so `paired_swap` picked
+  256x128 s4, matching run `92ea023af8b5` (256x128 s4 over 128x128 s3, [1.009,
+  1.033]). 128x256 s4 loses to s3 (ncu 2.536 vs 2.145 ms); not investigated.
+- **Swizzle alone, same impl across builds** (`paired-ab`, A = Phase A build,
+  30 pairs, cold): 128x256 s3 @ 4096³ B/A 0.944 [0.916, 0.959]; 128x128 s3 @
+  2048³ 0.740 [0.738, 0.743]; 128x128 s2 @ 2048³ 0.892 [0.889, 0.898];
+  64x64 s4 @ 1024³ 0.687 [0.684, 0.689], @ 1x896x896 0.968 [0.965, 0.969],
+  @ 1x896x4864 0.972 [0.969, 0.974], @ 16x896x4864 0.986 [0.983, 0.988]. Faster
+  everywhere measured. Lower decode % of cublaslt_best vs. the previous header
+  (1x896x4864 77.8 -> 74.9) is the cuBLASLt side across runs, not ours.
+- **Per-shape winners vs. previous header:** 1024³ 128x128 s2 -> 128x64 s2
+  (75.2 -> 98.8%); 512x896x896 and 512x896x4864 128x64 s3 -> 64x64 s4 (74.8 ->
+  90.1%, 63.8 -> 82.6%); 512x4864x896 128x128 s2 -> 128x64 s2 (67.1 -> 79.3%);
+  256³ 91.8 -> 98.2%; 512³ 79.7 -> 87.5%; M = 1/16 winners unchanged
+  (64x64 s4).
+- **Tool fix:** `latest_per_kernel_shape` keyed rows by kernel_id, so the
+  pre-swizzle rows of the same impl names (old kernel_ids) still competed: the
+  first emit-header showed stale numbers and "TIED with" an empty partner (an
+  impl tied with its own old row). Now keyed by impl: the newest measurement of
+  a config supersedes older code versions.

@@ -83,19 +83,43 @@ __device__ __forceinline__ void cp_async_wait() {
 // contiguous dimension is the smem row, so every global 16 B chunk lands in
 // one smem chunk (cp.async cannot transpose). A row-major: As[m][k]; A
 // column-major: As[k][m]; B row-major: Bs[k][n]; B column-major: Bs[n][k].
-// ldmatrix then picks .trans or not per layout (compute_tile). Each smem row
-// is padded by 8 halves (16 B): ldmatrix serves 8 row addresses of 16 B per
-// phase, and with an odd row stride in 16-byte chunks 8 consecutive rows land
-// in 8 distinct chunk positions of a 128 B bank line: conflict-free. The same
-// holds for the 16-byte stores from global.
+// ldmatrix then picks .trans or not per layout (compute_tile).
+//
+// The tile is unpadded and XOR-swizzled at 16-byte chunk granularity
+// (SmemOperand::at). ldmatrix serves 8 row addresses of 16 B per phase, at
+// the same chunk column of 8 consecutive rows; the 16-byte copies from global
+// write whole rows of chunks. Both are conflict-free when those 8 chunks land
+// in 8 distinct 16-byte positions of a 128-byte bank line:
+//   - rows of >= 8 chunks (>= 128 B): chunk c of row r goes to position
+//     (c ^ r) & 7 within its group of 8 chunks;
+//   - rows of 4 chunks (64 B, the k-contiguous BK = 32 tiles): two rows share a
+//     128-byte line L = r / 2; position p = 4 * (r % 2) + c goes to p ^ (L & 7).
+// The XOR term repeats every 8 rows (every 16 for 4-chunk rows), so offsets of
+// rows 8 (16) apart differ by an immediate: OperandPlan and compute_tile keep
+// their per-chunk offsets compile-time constants. Versus the earlier padding
+// (+8 halves per row) this saves 1/(row chunks + 1) of the tile: a 128x256x32
+// stage is 24,576 B instead of 27,136 B, which lets 128x256 and 256x128 run 4
+// stages within sm_121's 101,376 B per-block limit.
 template <int ROWS_, int COLS_>
 struct SmemOperand {
   static constexpr int ROWS = ROWS_, COLS = COLS_;
-  static constexpr int PAD = 8;
-  static constexpr int LD = COLS + PAD;
-  static constexpr int ELEMS = ROWS * LD;
+  static constexpr int CHUNKS = COLS / 8;
+  static constexpr int ELEMS = ROWS * COLS;
+  // Rows between which the swizzle term repeats.
+  static constexpr int PERIOD = CHUNKS >= 8 ? 8 : 16;
   static_assert(COLS % 8 == 0, "16-byte chunks");
-  static_assert((LD / 8) % 2 == 1, "padding must give an odd chunk stride");
+  static_assert(CHUNKS >= 8 ? CHUNKS % 8 == 0 : CHUNKS == 4, "swizzle covers rows of 4 or 8k chunks");
+
+  // Element offset of (row, col); col % 8 is the position inside the chunk.
+  __device__ __forceinline__ static int at(int row, int col) {
+    const int c = col >> 3, e = col & 7;
+    if constexpr (CHUNKS >= 8) {
+      return row * COLS + (((c & ~7) | ((c ^ row) & 7)) << 3) + e;
+    } else {
+      const int line = row >> 1, pos = ((row & 1) << 2) | c;
+      return (line << 6) + (((pos ^ line) & 7) << 3) + e;
+    }
+  }
 };
 
 template <int BM_, int BN_, int BK_, int WARPS_M_, int WARPS_N_, Layout LA_ = Layout::RowMajor,
@@ -112,7 +136,6 @@ struct Tile {
   static constexpr bool B_K_CONTIG = LB == Layout::ColMajor;
   using SA = SmemOperand<A_K_CONTIG ? BM : BK, A_K_CONTIG ? BK : BM>;
   using SB = SmemOperand<B_K_CONTIG ? BN : BK, B_K_CONTIG ? BK : BN>;
-  static constexpr int LDA = SA::LD, LDB = SB::LD;
   static constexpr int A_ELEMS = SA::ELEMS, B_ELEMS = SB::ELEMS;
   static constexpr int STAGE_ELEMS = A_ELEMS + B_ELEMS;
   static constexpr size_t STAGE_BYTES = size_t(STAGE_ELEMS) * sizeof(__half);
@@ -132,8 +155,9 @@ struct Tile {
 // col0, rows row0 + i * ROW_STEP. K_IS_ROW: the tile's rows are the k
 // dimension (A column-major, B row-major); else its columns are (A row-major,
 // B column-major). The other dimension is M (A) or N (B), bounded by mn_limit.
-template <int ROWS, int COLS, int LD_S, int THREADS, bool K_IS_ROW>
+template <class SOp, int THREADS, bool K_IS_ROW>
 struct OperandPlan {
+  static constexpr int ROWS = SOp::ROWS, COLS = SOp::COLS;
   static constexpr int CHUNKS = COLS / 8;
   static constexpr int ROW_STEP = THREADS / CHUNKS;
   static constexpr int ITERS = ROWS * CHUNKS / THREADS;
@@ -141,6 +165,8 @@ struct OperandPlan {
   static_assert(THREADS % CHUNKS == 0 && (ROWS * CHUNKS) % THREADS == 0,
                 "every thread copies the same number of chunks, one chunk column");
   static_assert(ITERS <= 32, "row mask is 32 bits");
+  static_assert(ROW_STEP % SOp::PERIOD == 0,
+                "chunk i's smem offset must be chunk 0's plus an immediate (swizzle period)");
 
   const __half* g;       // this thread's chunk 0 of the current k-tile
   long long row_step;    // ROW_STEP rows, in elements
@@ -155,7 +181,7 @@ struct OperandPlan {
     row0 = tid / CHUNKS;
     col0 = (tid % CHUNKS) * 8;
     row_step = (long long)ROW_STEP * ld;
-    s_off = uint32_t(row0 * LD_S + col0) * sizeof(__half);
+    s_off = uint32_t(SOp::at(row0, col0)) * sizeof(__half);
     if constexpr (K_IS_ROW) {  // rows = k (start 0), cols = mn
       g = X + (long long)row0 * ld + mn0 + col0;
       k_advance = (long long)K_TILE * ld;
@@ -195,7 +221,7 @@ struct OperandPlan {
   __device__ __forceinline__ void load_async(uint32_t s_tile, int k0, int K) const {
 #pragma unroll
     for (int i = 0; i < ITERS; ++i) {
-      const uint32_t dst = s_tile + s_off + uint32_t(i * ROW_STEP * LD_S * sizeof(__half));
+      const uint32_t dst = s_tile + s_off + uint32_t(i * ROW_STEP * COLS * sizeof(__half));
       const __half* src = g + i * row_step;
       if constexpr (!MASK_MN && !MASK_K) {
         cp_async_16(dst, src);
@@ -220,7 +246,7 @@ struct OperandPlan {
   __device__ __forceinline__ void load_sync(__half* s_tile, int k0, int K) const {
 #pragma unroll
     for (int i = 0; i < ITERS; ++i) {
-      __half* dst = s_tile + s_off / sizeof(__half) + i * ROW_STEP * LD_S;
+      __half* dst = s_tile + s_off / sizeof(__half) + i * ROW_STEP * COLS;
       const __half* src = g + i * row_step;
       const int bytes = (!MASK_MN && !MASK_K) ? 16 : chunk_bytes<MASK_MN, MASK_K>(i, k0, K);
       if (bytes == 16) {
@@ -237,20 +263,20 @@ struct OperandPlan {
 };
 
 template <class T>
-using PlanA = OperandPlan<T::SA::ROWS, T::SA::COLS, T::LDA, T::THREADS, !T::A_K_CONTIG>;
+using PlanA = OperandPlan<typename T::SA, T::THREADS, !T::A_K_CONTIG>;
 template <class T>
-using PlanB = OperandPlan<T::SB::ROWS, T::SB::COLS, T::LDB, T::THREADS, !T::B_K_CONTIG>;
+using PlanB = OperandPlan<typename T::SB, T::THREADS, !T::B_K_CONTIG>;
 
 // Scalar global->smem copy of one operand tile, any alignment, every element
 // bounds-checked: the fallback for misaligned pointers / leading dimensions.
 // Tile rows/cols start at (r0, c0) in the operand's storage order.
-template <int ROWS, int COLS, int LD_S, int THREADS>
+template <class SOp, int THREADS>
 __device__ __forceinline__ void load_operand_scalar(__half* s, const __half* X, long long ld, int r0,
                                                     int r_limit, int c0, int c_limit) {
   const __half zero = __float2half(0.f);
-  for (int i = threadIdx.x; i < ROWS * COLS; i += THREADS) {
-    const int r = i / COLS, c = i % COLS;
-    s[r * LD_S + c] = (r0 + r < r_limit && c0 + c < c_limit) ? X[(long long)(r0 + r) * ld + c0 + c] : zero;
+  for (int i = threadIdx.x; i < SOp::ROWS * SOp::COLS; i += THREADS) {
+    const int r = i / SOp::COLS, c = i % SOp::COLS;
+    s[SOp::at(r, c)] = (r0 + r < r_limit && c0 + c < c_limit) ? X[(long long)(r0 + r) * ld + c0 + c] : zero;
   }
 }
 
@@ -259,13 +285,13 @@ template <class T>
 __device__ __forceinline__ void load_tile_scalar(__half* As, __half* Bs, const __half* A, const __half* B,
                                                  const KParams& p, int m0, int n0, int k0) {
   if constexpr (T::A_K_CONTIG)
-    load_operand_scalar<T::SA::ROWS, T::SA::COLS, T::LDA, T::THREADS>(As, A, p.lda, m0, p.M, k0, p.K);
+    load_operand_scalar<typename T::SA, T::THREADS>(As, A, p.lda, m0, p.M, k0, p.K);
   else
-    load_operand_scalar<T::SA::ROWS, T::SA::COLS, T::LDA, T::THREADS>(As, A, p.lda, k0, p.K, m0, p.M);
+    load_operand_scalar<typename T::SA, T::THREADS>(As, A, p.lda, k0, p.K, m0, p.M);
   if constexpr (T::B_K_CONTIG)
-    load_operand_scalar<T::SB::ROWS, T::SB::COLS, T::LDB, T::THREADS>(Bs, B, p.ldb, n0, p.N, k0, p.K);
+    load_operand_scalar<typename T::SB, T::THREADS>(Bs, B, p.ldb, n0, p.N, k0, p.K);
   else
-    load_operand_scalar<T::SB::ROWS, T::SB::COLS, T::LDB, T::THREADS>(Bs, B, p.ldb, k0, p.K, n0, p.N);
+    load_operand_scalar<typename T::SB, T::THREADS>(Bs, B, p.ldb, k0, p.K, n0, p.N);
 }
 
 // One BK slab: per k16 step, ldmatrix A (MI x4) and B (NI/2 x4) fragments,
@@ -286,17 +312,17 @@ __device__ __forceinline__ void compute_tile(const __half* As, const __half* Bs,
 #pragma unroll
     for (int mi = 0; mi < T::MI; ++mi) {
       if constexpr (T::A_K_CONTIG)  // As[m][k]: matrix j = rows m + (j%2)*8, k + (j/2)*8
-        ldmatrix_x4(a[mi], smem_addr(As + (wm + mi * 16 + lane % 16) * T::LDA + kk + (lane / 16) * 8));
+        ldmatrix_x4(a[mi], smem_addr(As + T::SA::at(wm + mi * 16 + lane % 16, kk + (lane / 16) * 8)));
       else  // As[k][m]: rows k + (j/2)*8, cols m + (j%2)*8, transposed
-        ldmatrix_x4_trans(a[mi], smem_addr(As + (kk + l8 + (j / 2) * 8) * T::LDA + wm + mi * 16 + (j % 2) * 8));
+        ldmatrix_x4_trans(a[mi], smem_addr(As + T::SA::at(kk + l8 + (j / 2) * 8, wm + mi * 16 + (j % 2) * 8)));
     }
 #pragma unroll
     for (int nj = 0; nj < T::NI / 2; ++nj) {
       uint32_t r[4];
       if constexpr (T::B_K_CONTIG)  // Bs[n][k]: matrix j = rows n + (j/2)*8, k + (j%2)*8
-        ldmatrix_x4(r, smem_addr(Bs + (wn + nj * 16 + (j / 2) * 8 + l8) * T::LDB + kk + (j % 2) * 8));
+        ldmatrix_x4(r, smem_addr(Bs + T::SB::at(wn + nj * 16 + (j / 2) * 8 + l8, kk + (j % 2) * 8)));
       else  // Bs[k][n]: rows k + (j%2)*8, cols n + (j/2)*8, transposed
-        ldmatrix_x4_trans(r, smem_addr(Bs + (kk + l8 + (j % 2) * 8) * T::LDB + wn + nj * 16 + (j / 2) * 8));
+        ldmatrix_x4_trans(r, smem_addr(Bs + T::SB::at(kk + l8 + (j % 2) * 8, wn + nj * 16 + (j / 2) * 8)));
       b[2 * nj][0] = r[0]; b[2 * nj][1] = r[1];
       b[2 * nj + 1][0] = r[2]; b[2 * nj + 1][1] = r[3];
     }
