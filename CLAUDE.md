@@ -73,6 +73,7 @@ rust/               cargo workspace: aegis-sys, aegis-perf
 tools/              aegis_manifest.cu, aegis_tune.cu, sass_dump.sh
 results/            JSONL runs, device manifests, perf DB (gitignored)
 artifacts/          SASS dumps per arch, microbench SASS proofs (gitignored)
+docs/               LOG.md (dated run log), analysis/ (consolidated analyses, e.g. gemm-large.md)
 ```
 
 ## Rules (non-negotiable)
@@ -130,6 +131,46 @@ artifacts/          SASS dumps per arch, microbench SASS proofs (gitignored)
    records `tied`, `tie_set`, `pick_reason`, `tie_method` and the CIs
    (`ratio_ci_lo/hi`, `lt_ratio_ci_lo/hi` vs cublaslt_best); `emit-header` writes
    them as comments. Never hand-edit a winner.
+
+## Production bar (minimum for "done")
+
+This bar is the minimum for a kernel to count as done. Peak-silicon tuning is stage 3
+and starts only after all Core components meet it.
+
+1. Correctness
+   - Any M, N, K >= 1, including primes and odd K.
+   - Row- and column-major A and B (NN, NT, TN, TT) and arbitrary leading dimensions.
+   - Misaligned pointers or leading dimensions fall back to a narrower vector width or
+     a scalar path; never fault.
+   - alpha and beta: C = alpha*A*B + beta*C.
+   - Batched and strided-batched GEMM.
+   - M, N or K equal to 0 is a no-op that returns success.
+   - NaN and Inf propagate; nothing is silently flushed.
+   - Tolerance scales with K: c * sqrt(K) * eps_fp16 * max|A| * max|B|, with c
+     documented.
+   - Clean under compute-sanitizer memcheck, racecheck, initcheck and synccheck.
+   - Randomized fuzzer against a reference: 2,000 cases in ctest, 50,000 nightly.
+
+2. Robustness
+   - Deterministic output on repeated runs by default (no atomics in split-K unless
+     explicitly requested).
+   - Stream-safe.
+   - No allocation and no host synchronization on the call path.
+   - Every failure returns an error code; the library never exits the process.
+
+3. Performance (paired CI, cold cache, v2 protocol)
+   - Shapes >= 1024 in every dimension: >= 90% of cublaslt_best.
+   - Decode (M <= 16): >= 100% of cublaslt_best (a tie or a win).
+   - No shape in the sweep below 80%; aegis::matmul dispatches to cuBLASLt instead of
+     running a kernel that falls below 80%.
+
+4. Maintainability
+   - One templated kernel family with CUTLASS-style structure (threadblock / warp /
+     MMA / epilogue); no copy-pasted variants.
+   - Fused epilogues: bias, SiLU, GELU, residual add.
+   - Documented dispatch heuristics for shapes not in the winners table.
+   - A pre-commit regression gate that fails on a slowdown over 3% on the tracked
+     shape set.
 
 ## Benchmark policy
 
@@ -195,6 +236,15 @@ only to compare with old rows (`--protocol 1`).
   datacenter path (`tcgen05`, TMEM, UMMA, 2-CTA MMA). Tensor cores are driven
   with warp-level `mma.sync`, same family as Ampere. Verify any new instruction
   against the PTX ISA for sm_120/sm_121 before using it.
+- **TMA is available on sm_121** (2026-10-15). cuBLASLt's sm_121 GEMM kernels
+  (`nvjet_sm121_*_tmaAB_*`) issue `UTMALDG`. PTX ISA: `cp.async.bulk.tensor`
+  (.tile, .mbarrier::complete_tx::bytes) is "PTX ISA 8.0, sm_90" (Data Movement
+  instructions, cp.async.bulk.tensor; as encoded in CUDA 13.0's generated
+  `cccl/cuda/__ptx/instructions/generated/cp_async_bulk_tensor.h`); only the
+  .cta_group and gather4/scatter4 variants need sm_100a/sm_101a. Checked with
+  ptxas: the 2d tile form assembles to `UTMALDG.2D` for sm_120 and sm_121, and is
+  rejected for sm_87 ("requires .target sm_90 or higher"). So a TMA load path is
+  sm_121-only; the shared kernel keeps `cp.async` for sm_87.
 - So one templated `mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32` kernel
   with `ldmatrix` and `cp.async` should run on both archs. The autotuner picks
   different tile configs per arch. That divergence is the project's story.
