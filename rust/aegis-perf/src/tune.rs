@@ -77,8 +77,13 @@ pub fn cmd_tune(a: &TuneArgs) -> Result<()> {
 pub fn run_table(jsonl: &str) -> Result<String> {
     let mut order: Vec<(i64, i64, i64)> = Vec::new();
     let mut rows: HashMap<(i64, i64, i64), Vec<Value>> = HashMap::new();
+    let mut paired: Vec<Value> = Vec::new();
     for line in jsonl.lines().filter(|l| !l.trim().is_empty()) {
         let r: Value = serde_json::from_str(line)?;
+        if r["kind"] == "paired" {
+            paired.push(r);
+            continue;
+        }
         let s = &r["shape"];
         let key = (s["M"].as_i64().unwrap_or(0), s["N"].as_i64().unwrap_or(0), s["K"].as_i64().unwrap_or(0));
         if !rows.contains_key(&key) {
@@ -89,8 +94,8 @@ pub fn run_table(jsonl: &str) -> Result<String> {
     let med = |r: &Value| r["median_us"].as_f64().unwrap_or(f64::INFINITY);
     let mut out = String::new();
     let hdr = format!(
-        "{:>5} {:>5} {:>5}  {:<30} {:>9} {:>9}  {:<30} {:>6}  {:>9}",
-        "M", "N", "K", "winner", "% cuBLAS", "% LtBest", "runner-up", "gap", "warm %"
+        "{:>5} {:>5} {:>5}  {:<30} {:>9} {:>9}  {:<30} {:>6} {:>15}  {:>9}  {:>15}",
+        "M", "N", "K", "winner", "% cuBLAS", "% LtBest", "runner-up", "gap", "ru/win CI", "warm %", "lt/win CI"
     );
     writeln!(out, "{hdr}")?;
     writeln!(out, "{}", "-".repeat(hdr.len()))?;
@@ -117,7 +122,25 @@ pub fn run_table(jsonl: &str) -> Result<String> {
             None => format!("{:>9}", "-"),
         };
         let p90 = |r: &Value| r["p90_us"].as_f64().unwrap_or(f64::INFINITY);
+        let pair_ci = |a: &Value, b: &Value| {
+            paired
+                .iter()
+                .find(|p| p["shape"] == rows[&key][0]["shape"] && p["a"] == *a && p["b"] == *b)
+                .map(|p| (p["ratio_ci_lo"].as_f64().unwrap_or(0.0), p["ratio_ci_hi"].as_f64().unwrap_or(0.0)))
+        };
+        let ci = |o: Option<&&Value>| match o.and_then(|r| pair_ci(&w["impl"], &r["impl"])) {
+            Some((lo, hi)) => format!("[{lo:.3},{hi:.3}]"),
+            None => "-".to_string(),
+        };
+        let ci_ru = ci(ok.get(1));
+        let ci_lt = ci(lt.as_ref());
         let (ru, gap) = match ok.get(1) {
+            // The paired tie test decides when it ran for this pair (same pair as winners).
+            Some(r) if pair_ci(&w["impl"], &r["impl"]).is_some() => {
+                let (lo, hi) = pair_ci(&w["impl"], &r["impl"]).unwrap_or_default();
+                let g = if lo <= 1.0 && hi >= 1.0 { "  tied".to_string() } else { format!("{:5.1}%", (med(r) / med(w) - 1.0) * 100.0) };
+                (r["impl"].as_str().unwrap_or("?").to_string(), g)
+            }
             Some(r) if med(r) <= p90(w) => (r["impl"].as_str().unwrap_or("?").to_string(), "  tied".to_string()),
             Some(r) => (r["impl"].as_str().unwrap_or("?").to_string(), format!("{:5.1}%", (med(r) / med(w) - 1.0) * 100.0)),
             None => ("-".to_string(), format!("{:>6}", "-")),
@@ -129,7 +152,7 @@ pub fn run_table(jsonl: &str) -> Result<String> {
         };
         writeln!(
             out,
-            "{m:>5} {n:>5} {k:>5}  {:<30} {pct} {pct_lt}  {ru:<30} {gap}  {warm_pct}",
+            "{m:>5} {n:>5} {k:>5}  {:<30} {pct} {pct_lt}  {ru:<30} {gap} {ci_ru:>15}  {warm_pct}  {ci_lt:>15}",
             w["impl"].as_str().unwrap_or("?")
         )?;
     }
@@ -138,7 +161,9 @@ pub fn run_table(jsonl: &str) -> Result<String> {
         "\n% cuBLAS: cuBLAS median / winner median (100% = parity). gap: how much slower the runner-up's median is than the winner's;\n\
          \"tied\": the runner-up's median is inside the winner's p10-p90 (this run only; the DB winner is picked by the tie-break).\n\
          % LtBest: the same against cublaslt_best. Ranked on cache_mode=cold rows.\n\
-         warm %: cublaslt_best warm median / winner warm median (protocol v2)."
+         warm %: cublaslt_best warm median / winner warm median (protocol v2).\n\
+         ru/win CI, lt/win CI: 95% bootstrap CI of the paired median ratio runner-up / winner and cublaslt_best / winner\n\
+         (30 alternating windows); when present it decides \"tied\" (the CI contains 1.0)."
     )?;
     Ok(out)
 }
@@ -147,7 +172,8 @@ pub fn run_table(jsonl: &str) -> Result<String> {
 /// apart from line 1: generator name, host, time).
 pub fn header_text(con: &rusqlite::Connection, arch: i64, generated: &str) -> Result<(String, usize)> {
     let mut stmt = con.prepare(
-        "SELECT w.shape_bucket, k.impl, w.pct_of_cublas, w.tied, w.tie_set, w.pick_reason, w.pct_of_cublaslt_best \
+        "SELECT w.shape_bucket, k.impl, w.pct_of_cublas, w.tied, w.tie_set, w.pick_reason, w.pct_of_cublaslt_best, \
+                w.tie_method, w.ratio_ci_lo, w.ratio_ci_hi \
          FROM winners w \
          JOIN kernels k USING(kernel_id) WHERE w.sm_arch = ? AND w.op = 'gemm' \
          AND w.dtype = 'f16f32f16'",
@@ -162,9 +188,17 @@ pub fn header_text(con: &rusqlite::Connection, arch: i64, generated: &str) -> Re
             r.get::<_, Option<String>>(4)?,
             r.get::<_, Option<String>>(5)?,
             r.get::<_, Option<f64>>(6)?,
+            r.get::<_, Option<String>>(7)?,
+            r.get::<_, Option<f64>>(8)?,
+            r.get::<_, Option<f64>>(9)?,
         ))
     })? {
-        let (bucket, impl_, pct, tied, tie_set, reason, pct_lt) = row?;
+        let (bucket, impl_, pct, tied, tie_set, reason, pct_lt, method, ci_lo, ci_hi) = row?;
+        // Paired tie test: runner-up / winner, 95% CI of the median ratio.
+        let ci_note = match (method.as_deref(), ci_lo, ci_hi) {
+            (Some("paired"), Some(lo), Some(hi)) => format!(" [paired CI {lo:.3}-{hi:.3}]"),
+            _ => String::new(),
+        };
         // Tie status: which configs the measurements could not separate, and why this one.
         let lt_note = pct_lt.map(|p| format!(", {p:.1}% of cublaslt_best")).unwrap_or_default();
         let tie_note = if tied != 0 {
@@ -172,9 +206,9 @@ pub fn header_text(con: &rusqlite::Connection, arch: i64, generated: &str) -> Re
                 .into_iter()
                 .filter(|i| *i != impl_)
                 .collect();
-            format!("{lt_note}; TIED with {} ({})", others.join(", "), reason.unwrap_or_default())
+            format!("{lt_note}; TIED with {}{ci_note} ({})", others.join(", "), reason.unwrap_or_default())
         } else {
-            lt_note
+            format!("{lt_note}{ci_note}")
         };
         let dims: Vec<i64> = bucket.split('x').map(str::parse).collect::<Result<_, _>>().context("shape_bucket")?;
         let [m, n, k] = dims[..] else { bail!("bad shape_bucket {bucket}") };

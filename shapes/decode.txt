@@ -1,0 +1,7 @@
+# Decode shapes (M = 1, 16) of the Qwen2.5-0.5B projections; subset of default.txt.
+1 896 896
+1 4864 896
+1 896 4864
+16 896 896
+16 4864 896
+16 896 4864

@@ -48,6 +48,11 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("winners", "protocol_version", "INTEGER NOT NULL DEFAULT 1"),
     ("winners", "warm_median_us", "REAL"),
     ("winners", "pct_of_cublaslt_best", "REAL"),
+    ("winners", "tie_method", "TEXT"),
+    ("winners", "ratio_ci_lo", "REAL"),
+    ("winners", "ratio_ci_hi", "REAL"),
+    ("winners", "lt_ratio_ci_lo", "REAL"),
+    ("winners", "lt_ratio_ci_hi", "REAL"),
 ];
 
 /// Reference implementations: always eligible (they are what --check compares
@@ -189,11 +194,13 @@ pub fn cmd_ingest(
     temp_start: Option<f64>,
 ) -> Result<()> {
     let text = std::fs::read_to_string(results).with_context(|| format!("read {}", results.display()))?;
-    let rows: Vec<Value> = text
+    let all: Vec<Value> = text
         .lines()
         .filter(|l| !l.trim().is_empty())
         .map(serde_json::from_str)
         .collect::<Result<_, _>>()?;
+    // aegis_tune interleaves paired tie-test lines ("kind":"paired") with measurement rows.
+    let (paired, rows): (Vec<Value>, Vec<Value>) = all.into_iter().partition(|r| r["kind"] == "paired");
     if rows.is_empty() {
         bail!("no rows in results file");
     }
@@ -267,8 +274,25 @@ pub fn cmd_ingest(
             ],
         )?;
     }
+    for r in &paired {
+        let s = get(r, "shape")?;
+        tx.execute(
+            "INSERT INTO paired (run_id, op, dtype, m, n, k, a_impl, b_impl, role, pairs, ratio_median, \
+             ratio_ci_lo, ratio_ci_hi, tied, bootstrap_resamples, bootstrap_seed, protocol_version, cache_mode, \
+             allow_busy) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            params![
+                run_id, sql(Some(get(r, "op")?)), sql(Some(get(r, "dtype")?)),
+                sql(Some(get(s, "M")?)), sql(Some(get(s, "N")?)), sql(Some(get(s, "K")?)),
+                sql(Some(get(r, "a")?)), sql(Some(get(r, "b")?)), sql(r.get("role")), sql(Some(get(r, "pairs")?)),
+                sql(Some(get(r, "ratio_median")?)), sql(Some(get(r, "ratio_ci_lo")?)),
+                sql(Some(get(r, "ratio_ci_hi")?)), get(r, "tied")?.as_bool().unwrap_or(false) as i64,
+                sql(r.get("bootstrap_resamples")), sql(r.get("bootstrap_seed")), sql(r.get("protocol_version")),
+                sql(r.get("cache_mode")), r.get("allow_busy").and_then(Value::as_bool).unwrap_or(false) as i64,
+            ],
+        )?;
+    }
     tx.commit()?;
-    println!("run {run_id}: ingested {} measurements", rows.len());
+    println!("run {run_id}: ingested {} measurements, {} paired tie tests", rows.len(), paired.len());
     Ok(())
 }
 
@@ -407,17 +431,61 @@ fn latest_per_kernel_shape(con: &Connection, arch: Option<i64>, sel: &Selection)
 /// inside the fastest one's p10-p90 band (a tie). Only the runner-up joins:
 /// widening to every config inside the band let one noisy p90 (3.5x the
 /// median at 512x4864x896) pull in configs up to 2x slower.
-fn tie_set<'a>(ours: &[&'a Latest]) -> Vec<&'a Latest> {
+///
+/// When aegis_tune ran the paired tie test for exactly these two (same run),
+/// that decides instead: tied when the 95% bootstrap CI of the median ratio
+/// runner-up / fastest contains 1.0 (tie_method "paired"). Otherwise the band
+/// rule above applies (tie_method "band": v1 rows, sweep rows, --no-paired).
+struct TieCall<'a> {
+    set: Vec<&'a Latest>,
+    ci: Option<(f64, f64)>,
+    method: &'static str,
+}
+
+fn tie_set<'a>(ours: &[&'a Latest], paired: &PairedMap) -> TieCall<'a> {
     let mut sorted: Vec<&Latest> = ours.to_vec();
     sorted.sort_by(|a, b| a.median_us.total_cmp(&b.median_us).then_with(|| a.impl_.cmp(&b.impl_)));
     match sorted[..] {
-        [] => Vec::new(),
-        [w] => vec![w],
-        [w, r, ..] => {
-            let (lo, hi) = (w.p10_us.min(w.median_us), w.p90_us.max(w.median_us));
-            if r.median_us >= lo && r.median_us <= hi { vec![w, r] } else { vec![w] }
-        }
+        [] => TieCall { set: Vec::new(), ci: None, method: "none" },
+        [w] => TieCall { set: vec![w], ci: None, method: "none" },
+        [w, r, ..] => match paired_ci(paired, w, &r.impl_, &r.run_id) {
+            Some((lo, hi)) => {
+                let set = if lo <= 1.0 && hi >= 1.0 { vec![w, r] } else { vec![w] };
+                TieCall { set, ci: Some((lo, hi)), method: "paired" }
+            }
+            None => {
+                let (lo, hi) = (w.p10_us.min(w.median_us), w.p90_us.max(w.median_us));
+                let set = if r.median_us >= lo && r.median_us <= hi { vec![w, r] } else { vec![w] };
+                TieCall { set, ci: None, method: "band" }
+            }
+        },
     }
+}
+
+/// Paired tie tests: (run_id, m, n, k, a_impl, b_impl) -> 95% CI of b / a.
+type PairedMap = HashMap<(String, i64, i64, i64, String, String), (f64, f64)>;
+
+fn load_paired(con: &Connection) -> Result<PairedMap> {
+    let mut stmt = con.prepare(
+        "SELECT run_id, m, n, k, a_impl, b_impl, ratio_ci_lo, ratio_ci_hi FROM paired \
+         WHERE protocol_version = 2 AND cache_mode = 'cold' AND allow_busy = 0",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok(((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?), (r.get(6)?, r.get(7)?)))
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// CI of `other` / `w` from a paired test in the run both rows came from.
+fn paired_ci(paired: &PairedMap, w: &Latest, other: &str, other_run: &str) -> Option<(f64, f64)> {
+    if w.run_id != other_run {
+        return None;
+    }
+    let key = |a: &str, b: &str| (w.run_id.clone(), w.m, w.n, w.k, a.to_string(), b.to_string());
+    if let Some(&ci) = paired.get(&key(&w.impl_, other)) {
+        return Some(ci);
+    }
+    paired.get(&key(other, &w.impl_)).map(|&(lo, hi)| (1.0 / hi, 1.0 / lo))
 }
 
 /// Neighboring shapes for the tie-break: same N and K with a different M (the
@@ -432,7 +500,8 @@ fn neighbors(a: &ShapeKey, b: &ShapeKey) -> bool {
 }
 
 /// Winner per (arch, op, dtype, shape). Clear win: the fastest median. Tie
-/// (runner-up median inside the fastest one's p10-p90): of the two, the one
+/// (paired tie test CI of runner-up / fastest contains 1.0; without one,
+/// the runner-up median inside the fastest one's p10-p90): of the two, the one
 /// that wins or ties on the most neighboring shapes, then fewer registers,
 /// then less smem, then lower median, then name.
 pub fn cmd_winners(db: &Path, arch: Option<i64>) -> Result<()> {
@@ -440,6 +509,7 @@ pub fn cmd_winners(db: &Path, arch: Option<i64>) -> Result<()> {
     // Ranked on protocol v2, cold, idle-GPU rows only (CLAUDE.md Benchmark policy).
     let sel = Selection::ranking();
     let rows = latest_per_kernel_shape(&con, arch, &sel)?;
+    let paired = load_paired(&con)?;
     let mut groups: Vec<(ShapeKey, Vec<&Latest>)> = Vec::new();
     let mut index = HashMap::new();
     for r in &rows {
@@ -455,7 +525,7 @@ pub fn cmd_winners(db: &Path, arch: Option<i64>) -> Result<()> {
         .iter()
         .map(|(key, rs)| {
             let ours: Vec<&Latest> = rs.iter().copied().filter(|r| !is_baseline(&r.impl_)).collect();
-            (key.clone(), tie_set(&ours).iter().map(|r| r.impl_.clone()).collect())
+            (key.clone(), tie_set(&ours, &paired).set.iter().map(|r| r.impl_.clone()).collect())
         })
         .collect();
 
@@ -483,7 +553,12 @@ pub fn cmd_winners(db: &Path, arch: Option<i64>) -> Result<()> {
         let cublas = rs.iter().find(|r| r.impl_ == "cublas");
         let lt_best = rs.iter().find(|r| r.impl_ == "cublaslt_best");
         let ours: Vec<&Latest> = rs.iter().copied().filter(|r| !is_baseline(&r.impl_)).collect();
-        let tie = tie_set(&ours);
+        let call = tie_set(&ours, &paired);
+        let tie = &call.set;
+        let lt_ci = match (tie.first(), lt_best) {
+            (Some(w), Some(lt)) => paired_ci(&paired, w, &lt.impl_, &lt.run_id),
+            _ => None,
+        };
         let Some(&fastest) = tie.first() else { continue };
         let (pick, reason) = if tie.len() == 1 {
             (fastest, "fastest".to_string())
@@ -518,11 +593,13 @@ pub fn cmd_winners(db: &Path, arch: Option<i64>) -> Result<()> {
         let set_json = serde_json::to_string(&tie.iter().map(|r| r.impl_.as_str()).collect::<Vec<_>>())?;
         con.execute(
             "INSERT OR REPLACE INTO winners (sm_arch, op, dtype, shape_bucket, kernel_id, run_id, median_us, \
-             pct_of_cublas, tied, tie_set, pick_reason, protocol_version, warm_median_us, pct_of_cublaslt_best) \
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+             pct_of_cublas, tied, tie_set, pick_reason, protocol_version, warm_median_us, pct_of_cublaslt_best, \
+             tie_method, ratio_ci_lo, ratio_ci_hi, lt_ratio_ci_lo, lt_ratio_ci_hi) \
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             params![arch, op, dtype, shape_bucket(*m, *nn, *k), pick.kernel_id, pick.run_id, pick.median_us, pct,
                     (tie.len() > 1) as i64, set_json, reason, sel.protocol,
-                    warm_of(&pick.kernel_id, (*arch, dtype.as_str(), *m, *nn, *k))?, pct_lt],
+                    warm_of(&pick.kernel_id, (*arch, dtype.as_str(), *m, *nn, *k))?, pct_lt, call.method,
+                    call.ci.map(|c| c.0), call.ci.map(|c| c.1), lt_ci.map(|c| c.0), lt_ci.map(|c| c.1)],
         )?;
         n += 1;
     }

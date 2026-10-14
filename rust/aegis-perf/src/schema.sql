@@ -61,6 +61,11 @@ CREATE TABLE IF NOT EXISTS winners (
   protocol_version INTEGER NOT NULL DEFAULT 1,  -- of the measurements it was picked from
   warm_median_us REAL,              -- the pick's cache_mode=warm median (v2), if measured
   pct_of_cublaslt_best REAL,        -- cublaslt_best median / pick median x 100 (v2)
+  tie_method TEXT,                  -- 'paired' (bootstrap CI) or 'band' (p10-p90, no paired test)
+  ratio_ci_lo REAL,                 -- paired: runner-up / fastest, 95% CI of the median ratio
+  ratio_ci_hi REAL,
+  lt_ratio_ci_lo REAL,              -- paired: cublaslt_best / fastest, 95% CI
+  lt_ratio_ci_hi REAL,
   PRIMARY KEY (sm_arch, op, dtype, shape_bucket)
 );
 CREATE TABLE IF NOT EXISTS microbench (
@@ -73,3 +78,26 @@ CREATE TABLE IF NOT EXISTS microbench (
   superseded_by TEXT                      -- run_id of that later run
 );
 CREATE INDEX IF NOT EXISTS idx_micro_probe ON microbench(probe);
+-- Paired tie tests (aegis_tune, protocol v2): `pairs` alternating windows of
+-- a (the fastest cold config) and b; ratio = b / a per pair; 95% percentile
+-- bootstrap CI of the median ratio. Tied when the CI contains 1.0.
+CREATE TABLE IF NOT EXISTS paired (
+  run_id TEXT NOT NULL REFERENCES runs(run_id),
+  op TEXT NOT NULL,
+  dtype TEXT NOT NULL,
+  m INTEGER, n INTEGER, k INTEGER,
+  a_impl TEXT NOT NULL,
+  b_impl TEXT NOT NULL,
+  role TEXT,                  -- 'runner_up' | 'cublaslt_best'
+  pairs INTEGER,
+  ratio_median REAL,
+  ratio_ci_lo REAL,
+  ratio_ci_hi REAL,
+  tied INTEGER,
+  bootstrap_resamples INTEGER,
+  bootstrap_seed INTEGER,
+  protocol_version INTEGER,
+  cache_mode TEXT,
+  allow_busy INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_paired_shape ON paired(run_id, m, n, k);

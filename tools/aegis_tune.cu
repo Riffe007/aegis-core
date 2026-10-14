@@ -2,7 +2,7 @@
 //
 //   aegis_tune --shapes shapes/default.txt [--seed S] [--prefix regblock_,mma_,mma_pipe_]
 //              [--reps 20] [--cublas-reps 50] [--warmup 3] [--data-seed 42] [--protocol 2]
-//              [--warm-top 2] [--allow-busy]
+//              [--warm-top 2] [--allow-busy] [--no-paired]
 //
 // For each shape (from a file, "M N K" per line, # comments) it allocates the
 // problem once, then runs the baselines (cuBLAS; cublaslt_best: the fastest
@@ -15,6 +15,11 @@
 // cuBLAS and the --warm-top fastest configs are timed again with cache_mode=warm
 // (recorded for winners, not used to rank). Configs failing the check are
 // not timed and not emitted; they are listed on stderr.
+//
+// Paired tie test (protocol v2): per shape, the fastest cold config is compared
+// with the runner-up and with cublaslt_best over 30 alternating windows
+// (A, B, A, B...); a bootstrap gives the 95% CI of the median ratio B/A. One
+// line per comparison: {"kind":"paired", ..., "ratio_ci_lo", "ratio_ci_hi"}.
 //
 // Idle guard: before anything else, GPU utilization is sampled for 2 s (NVML);
 // above 2% the tuner refuses to start unless --allow-busy is given.
@@ -48,6 +53,7 @@ struct Args {
   int protocol = 2;
   int warm_top = 2;  // warm rows for cuBLAS and the N fastest cold configs per shape
   bool allow_busy = false;
+  bool paired = true;  // --no-paired skips the paired tie tests
 };
 
 std::vector<std::string> split(const std::string& s, char sep) {
@@ -76,6 +82,7 @@ Args parse(int argc, char** argv) {
     else if (k == "--protocol") a.protocol = std::stoi(next());
     else if (k == "--warm-top") a.warm_top = std::stoi(next());
     else if (k == "--allow-busy") a.allow_busy = true;
+    else if (k == "--no-paired") a.paired = false;
     else { std::fprintf(stderr, "unknown arg %s\n", k.c_str()); std::exit(2); }
   }
   if (a.shapes.empty()) { std::fprintf(stderr, "--shapes FILE is required\n"); std::exit(2); }
@@ -199,6 +206,34 @@ int main(int argc, char** argv) {
       d.cold_us = t.median_us;
       emit(d, t, aegis::bench::CacheMode::Cold);
       done.push_back(d);
+    }
+    // Paired tie tests (v2): the fastest cold config against the runner-up and
+    // against cublaslt_best, kPairedWindows alternating windows each.
+    if (a.protocol == 2 && a.paired) {
+      std::vector<const Done*> ours;
+      const Done* ltd = nullptr;
+      for (const Done& d : done) {
+        if (d.ours) ours.push_back(&d);
+        else if (d.impl.plan) ltd = &d;
+      }
+      std::sort(ours.begin(), ours.end(), [](const Done* x, const Done* y) { return x->cold_us < y->cold_us; });
+      auto pair_row = [&](const Done& w, const Done& o, const char* role) {
+        const aegis::bench::Paired r =
+            h.paired(w.impl, o.impl, p, options(true, aegis::bench::CacheMode::Cold),
+                     aegis::bench::kPairedWindows, shape_seed);
+        std::printf(
+            "{\"kind\":\"paired\",\"op\":\"gemm\",\"dtype\":\"f16f32f16\",\"shape\":{\"M\":%d,\"N\":%d,\"K\":%d},"
+            "\"a\":\"%s\",\"b\":\"%s\",\"role\":\"%s\",\"pairs\":%d,\"ratio_median\":%.5f,"
+            "\"ratio_ci_lo\":%.5f,\"ratio_ci_hi\":%.5f,\"tied\":%s,\"batch_a\":%lld,\"batch_b\":%lld,"
+            "\"bootstrap_resamples\":%d,\"bootstrap_seed\":%llu,\"protocol_version\":2,\"cache_mode\":\"cold\"%s}\n",
+            s.M, s.N, s.K, w.name, o.name, role, r.pairs, r.median, r.ci_lo, r.ci_hi, r.tied ? "true" : "false",
+            r.batch_a, r.batch_b, aegis::bench::kBootstrapResamples, shape_seed, idle_json.c_str());
+        std::fflush(stdout);
+        std::fprintf(stderr, "  paired %-28s vs %-28s ratio %.4f [%.4f, %.4f] %s\n", w.name, o.name, r.median,
+                     r.ci_lo, r.ci_hi, r.tied ? "TIED" : "");
+      };
+      if (ours.size() >= 2) pair_row(*ours[0], *ours[1], "runner_up");
+      if (!ours.empty() && ltd) pair_row(*ours[0], *ltd, "cublaslt_best");
     }
     if (a.protocol == 2 && a.warm_top > 0) {
       std::vector<Done> warm;

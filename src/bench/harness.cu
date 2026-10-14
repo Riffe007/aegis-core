@@ -279,41 +279,44 @@ float Harness::timed_window(cudaGraphExec_t g, bool flush) {
   return ms;
 }
 
-Timing Harness::time_v2(const Impl& e, Problem& p, const TimingOptions& o) {
+Harness::Calibrated Harness::calibrate(const Impl& e, Problem& p, const TimingOptions& o) {
   const double target_ms =
       std::max(o.min_window_ms, o.min_window_ticks * timer_.tick_ns * 1e-6);
   // Cache state. cold: launch i uses buffer set i mod K, with K sets covering
   // >= 3x L2, so no launch finds its operands in L2 from an earlier launch;
   // L2 is also flushed before each window (outside it). warm: one set, no
   // flush; the operands stay L2-resident across launches when they fit.
-  const bool cold = o.cache == CacheMode::Cold;
-  const int sets = cold ? cold_sets(p) : 1;
-  p.ensure_sets(sets);
+  Calibrated c;
+  c.cold = o.cache == CacheMode::Cold;
+  c.sets = c.cold ? cold_sets(p) : 1;
+  p.ensure_sets(c.sets);
 
-  // Calibrate N: grow the batch until one window reaches the target. Each
-  // candidate graph is replayed once untimed (first-replay costs) first.
-  long long n = 1;
-  cudaGraphExec_t g = nullptr;
+  // Grow the batch until one window reaches the target. Each candidate graph
+  // is replayed once untimed (first-replay costs) first.
   for (int iter = 0;; ++iter) {
-    g = capture(e, p, n, sets);
-    AEGIS_CUDA_CHECK(cudaGraphLaunch(g, stream_));
-    const float ms = timed_window(g, cold);
-    if (ms >= target_ms || n >= o.max_batch || iter >= 16) {
+    c.graph = capture(e, p, c.n, c.sets);
+    AEGIS_CUDA_CHECK(cudaGraphLaunch(c.graph, stream_));
+    const float ms = timed_window(c.graph, c.cold);
+    if (ms >= target_ms || c.n >= o.max_batch || iter >= 16) {
       if (ms < target_ms)
-        std::fprintf(stderr, "warning: window %.3f ms < target %.3f ms at N=%lld\n", ms, target_ms, n);
+        std::fprintf(stderr, "warning: window %.3f ms < target %.3f ms at N=%lld\n", ms, target_ms, c.n);
       break;
     }
     // Aim 25% above the target; grow at most 64x per step (the first windows
     // of tiny batches are dominated by fixed graph-launch cost).
-    const double want = ms > 0 ? std::ceil(n * target_ms * 1.25 / ms) : double(n) * 64;
+    const double want = ms > 0 ? std::ceil(c.n * target_ms * 1.25 / ms) : double(c.n) * 64;
     const long long next = std::min<long long>(
-        o.max_batch, std::max<long long>(n + 1, std::min<long long>(n * 64, (long long)want)));
-    AEGIS_CUDA_CHECK(cudaGraphExecDestroy(g));
-    n = next;
+        o.max_batch, std::max<long long>(c.n + 1, std::min<long long>(c.n * 64, (long long)want)));
+    AEGIS_CUDA_CHECK(cudaGraphExecDestroy(c.graph));
+    c.n = next;
   }
+  for (int i = 0; i < o.warmup; ++i) AEGIS_CUDA_CHECK(cudaGraphLaunch(c.graph, stream_));
+  return c;
+}
 
-  for (int i = 0; i < o.warmup; ++i) AEGIS_CUDA_CHECK(cudaGraphLaunch(g, stream_));
-
+Timing Harness::time_v2(const Impl& e, Problem& p, const TimingOptions& o) {
+  const Calibrated c = calibrate(e, p, o);
+  const long long n = c.n;
   const int reps = o.reps;
   std::vector<cudaEvent_t> starts(reps), stops(reps);
   for (int i = 0; i < reps; ++i) {
@@ -321,9 +324,9 @@ Timing Harness::time_v2(const Impl& e, Problem& p, const TimingOptions& o) {
     AEGIS_CUDA_CHECK(cudaEventCreate(&stops[i]));
   }
   for (int i = 0; i < reps; ++i) {
-    if (cold) flush_l2(i);  // outside the window
+    if (c.cold) flush_l2(i);  // outside the window
     AEGIS_CUDA_CHECK(cudaEventRecord(starts[i], stream_));
-    AEGIS_CUDA_CHECK(cudaGraphLaunch(g, stream_));
+    AEGIS_CUDA_CHECK(cudaGraphLaunch(c.graph, stream_));
     AEGIS_CUDA_CHECK(cudaEventRecord(stops[i], stream_));
   }
   AEGIS_CUDA_CHECK(cudaStreamSynchronize(stream_));
@@ -334,7 +337,7 @@ Timing Harness::time_v2(const Impl& e, Problem& p, const TimingOptions& o) {
     cudaEventDestroy(starts[i]);
     cudaEventDestroy(stops[i]);
   }
-  AEGIS_CUDA_CHECK(cudaGraphExecDestroy(g));
+  AEGIS_CUDA_CHECK(cudaGraphExecDestroy(c.graph));
 
   Timing t;
   t.reps = reps;
@@ -345,8 +348,46 @@ Timing Harness::time_v2(const Impl& e, Problem& p, const TimingOptions& o) {
   t.batch_n = n;
   t.window_ms = percentile(window, 0.5);
   t.cache = o.cache;
-  t.buffer_sets = sets;
+  t.buffer_sets = c.sets;
   return t;
+}
+
+Paired Harness::paired(const Impl& a, const Impl& b, Problem& p, const TimingOptions& o, int pairs,
+                       unsigned long long seed, int resamples) {
+  if (o.protocol != 2) {
+    std::fprintf(stderr, "paired windows need timing protocol v2\n");
+    std::exit(2);
+  }
+  // Each side keeps its own calibrated graph (its own N); a pair is one A
+  // window then one B window, back to back, so slow drifts (clock, thermal,
+  // background load) hit both sides of a pair alike.
+  Calibrated ca = calibrate(a, p, o), cb = calibrate(b, p, o);
+  Paired r;
+  r.pairs = pairs;
+  r.ratio.resize(static_cast<size_t>(pairs));
+  for (int i = 0; i < pairs; ++i) {
+    const double ta = timed_window(ca.graph, ca.cold) / double(ca.n);
+    const double tb = timed_window(cb.graph, cb.cold) / double(cb.n);
+    r.ratio[size_t(i)] = float(tb / ta);
+  }
+  AEGIS_CUDA_CHECK(cudaGraphExecDestroy(ca.graph));
+  AEGIS_CUDA_CHECK(cudaGraphExecDestroy(cb.graph));
+  r.batch_a = ca.n;
+  r.batch_b = cb.n;
+  r.median = percentile(r.ratio, 0.5);
+
+  // Percentile bootstrap of the median ratio.
+  std::mt19937_64 rng(seed);
+  std::uniform_int_distribution<int> pick(0, pairs - 1);
+  std::vector<float> sample(static_cast<size_t>(pairs)), medians(static_cast<size_t>(resamples));
+  for (int k = 0; k < resamples; ++k) {
+    for (int i = 0; i < pairs; ++i) sample[size_t(i)] = r.ratio[size_t(pick(rng))];
+    medians[size_t(k)] = float(percentile(sample, 0.5));
+  }
+  r.ci_lo = percentile(medians, 0.025);
+  r.ci_hi = percentile(medians, 0.975);
+  r.tied = r.ci_lo <= 1.0 && r.ci_hi >= 1.0;
+  return r;
 }
 
 std::string Harness::json_row(const char* impl, const Impl& impl_e, const Problem& p,

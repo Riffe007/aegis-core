@@ -116,6 +116,20 @@ struct Timing {
   int buffer_sets = 1;       // v2: K
 };
 
+// Paired comparison (protocol v2): `pairs` alternating windows A, B, A, B...
+// ratio[i] = per-launch time of B / per-launch time of A in pair i; a
+// percentile bootstrap gives the 95% CI of the median ratio. Tied when the CI
+// contains 1.0.
+inline constexpr int kPairedWindows = 30;
+inline constexpr int kBootstrapResamples = 10000;
+struct Paired {
+  int pairs = 0;
+  std::vector<float> ratio;
+  double median = 0, ci_lo = 0, ci_hi = 0;
+  bool tied = false;
+  long long batch_a = 0, batch_b = 0;
+};
+
 struct TimerResolution {
   double tick_ns = 0;       // smallest step between distinct deltas: the resolution
   double min_delta_ns = 0;  // smallest nonzero delta: event spacing, not resolution
@@ -193,6 +207,10 @@ class Harness {
   // cublaslt_best on p: run, check and time every heuristic algorithm under
   // `o`; leaves the best one's result in p.C.
   LtBest cublaslt_best(Problem& p, const TimingOptions& o);
+  // Paired tie test of b against a (see Paired); bootstrap seeded with `seed`.
+  Paired paired(const Impl& a, const Impl& b, Problem& p, const TimingOptions& o,
+                int pairs = kPairedWindows, unsigned long long seed = 0,
+                int resamples = kBootstrapResamples);
   // ,"lt":{...}: which algorithm cublaslt_best picked, for the row's extra.
   static std::string lt_json(const LtBest& b);
 
@@ -203,6 +221,14 @@ class Harness {
 
  private:
   Timing time_v1(const Impl& e, Problem& p, const TimingOptions& o);
+  // A calibrated v2 measurement: N launches in one graph (caller destroys it).
+  struct Calibrated {
+    cudaGraphExec_t graph = nullptr;
+    long long n = 1;
+    int sets = 1;
+    bool cold = true;
+  };
+  Calibrated calibrate(const Impl& e, Problem& p, const TimingOptions& o);
   Timing time_v2(const Impl& e, Problem& p, const TimingOptions& o);
 
   int cold_sets(const Problem& p) const;
