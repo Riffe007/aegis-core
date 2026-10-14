@@ -1,0 +1,20 @@
+[package]
+name = "aegis-perf"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+description = "AEGIS perf DB CLI: init, ingest, winners, report, sweep (port of tools/perfdb.py + tools/sweep.py)"
+
+[[bin]]
+name = "aegis-perf"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+clap = { version = "4", features = ["derive", "env"] }
+gethostname = "0.5"
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde_json = "1"
+sha1 = "0.10"
+uuid = { version = "1", features = ["v4"] }

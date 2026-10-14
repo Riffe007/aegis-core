@@ -3,3 +3,4 @@ results/
 artifacts/
 __pycache__/
 *.db
+rust/target/
