@@ -462,3 +462,30 @@ readings appear only unprofiled and only at 16 warps so far (3 of 30 runs at
 difference is not significant). The 16-warp kernel runs twice as long
 (8.4M vs 4.2M cycles), so a fixed rate of outside interruptions would hit it
 twice as often; that remains a hypothesis.
+
+### Step 3 rerun — pointer chase
+
+Three runs, same conditions:
+
+| Median ns | 64 KiB | 128 KiB | 256 KiB–8 MiB | 16 MiB | 32 MiB | 512 MiB |
+|---|---|---|---|---|---|---|
+| `f1925d6a0fa4` cross_page (guard 1.0%) | 14 | 108 | 132–135 | 137 | 376 | 375 |
+| `f1925d6a0fa4` page_local_64k, measured second | 14 | 117 | 132 → **177 at 4 MiB, 396 at 8 MiB** | 375 | 387 | 377 |
+| repeat 1, `a825f4e557a3` (guard 0.0%), both layouts | 15 | 111 | 139 | 141–159 | 396–399 | 396–400 |
+| repeat 2, not ingested (guard read 6.8% mean / 68% max just before) | — | — | 139 | 141–143 | 373–399 | — |
+
+Repeat 1 ran at 2407 MHz against 2558 MHz for `f1925d6a0fa4`; in cycles the
+plateau is the same (~335 cycles). `a825f4e557a3` is the current row set
+(it superseded `f1925d6a0fa4`, which is kept).
+
+**Verdict: the L2 plateau is real.** In five of six layout-runs since remote
+desktop was stopped, L2-resident sets (256 KiB–16 MiB) cost 132–141 ns and
+DRAM (>= 32 MiB) 373–400 ns, the step between 16 and 32 MiB matching the
+24 MiB L2. **The earlier missing plateau is an intermittent effect, not a
+property of the hardware:** in the second half of `f1925d6a0fa4` (the
+page_local layout) L2-sized sets again cost DRAM latency from 8 MiB, with
+remote desktop stopped, i.e. the same symptom as the first run. The desktop
+still produces bursts (6.8% mean / 68% max over 2 s, minutes later). Cause not
+established; the working hypothesis is still another GPU context evicting or
+time-slicing L2, now Xorg/gnome-shell/Firefox rather than remote desktop.
+Test: the same probe from a text console with `multi-user.target`.
