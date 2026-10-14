@@ -554,3 +554,15 @@ ratio moves from 1.003–1.012 to 0.997–1.006. The full run also differed on
 median. Final DB state (latest rows: decode run 2 for the decode shapes, full
 run for the rest) regenerated `winners/sm_121.h`; 16x4864x896 and 1x4864x896
 are tied and resolved by the tie-break (less smem → `mma_pipe_64x64x32_2x2_s4`).
+
+### 2. ldmatrix x4, 8 vs 16 warps/SM — CLOSED
+
+**8 warps saturate ldmatrix.x4 at 128 B/clk/SM** (two ncu sessions, 20
+profiled runs: 0 bank conflicts, 4 wavefronts per LDSM.x4, LSU writeback busy
+99.9–99.98% of active cycles at both 8 and 16 warps; 16 warps only add
+mio_throttle queueing, ~1.5 → 11.3 stalls per issue). **The 16-warp dips
+(99–128 B/clk with remote desktop on; 3 of 30 unprofiled runs since) remain
+an untested interference hypothesis**: another GPU context interrupting the
+probe's clock64 window, more often for the 16-warp kernel because it runs
+twice as long. Not pursued further; the cost model uses 128 B/clk/SM with 8+
+warps.
