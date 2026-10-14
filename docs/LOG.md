@@ -686,7 +686,8 @@ compile for sm_87 fails the build. The pre-commit hook enables the option.
 Nothing runs on sm_87.
 
 Result now: **45 sm_87 kernels, all pass**: no spills, no local memory, all
-shared memory dynamic or ≤ 48 KB static, most registers sm_87. Negative checks:
+shared memory dynamic or ≤ 48 KB static (largest static: 32768 B), most
+registers per thread REG:128. Negative checks:
 a kernel built with `-maxrregcount=24` → `FAIL spill/local (STACK:9208)`; an
 sm_121-only object → `FAIL no sm_87 code`; 52 KB of static smem → ptxas
 compile error ("uses too much shared data"), i.e. a failed build. No CUDA
