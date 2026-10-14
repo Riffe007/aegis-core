@@ -334,3 +334,31 @@ and are rarer with remote desktop off (1/15) than on (3/5). Hypothesis, not
 tested: another GPU context (the desktop) occasionally preempts or shares the
 SM during block 0's window, which clock64 counts. A test would read
 %globaltimer and per-SM active cycles alongside clock64 in the probe.
+
+### Pointer chase rerun (step 3): the L2 plateau is there
+
+Run `6141123bbcc4` (same probe binary, SASS proof ok, 5 repeats per point;
+145 rows ingested, the 145 rows of `fb77bc085d64` marked superseded). Remote
+desktop stopped, after a reboot; desktop still up. Median ns [p10–p90], both
+layouts agree within noise, cross_page shown:
+
+| Working set | v2 (earlier, remote desktop on) | now |
+|---|---|---|
+| 4–64 KiB | — | 14 [14–14] |
+| 128 KiB | 151.5 | 108 [106–115] |
+| 256 KiB – 8 MiB | 262 → 434 | 132 [132–132 … 206] |
+| 16 MiB | 439.6 | 138 [138–267] |
+| 32 MiB | 438.5 | 373 [373–382] |
+| 64–512 MiB | ~435 | 374–380 |
+
+**Verdict: the missing plateau was not real.** L2 hits now take ~132 ns
+(338 cycles at 2557 MHz) flat from 256 KiB to 16 MiB, and latency steps to
+DRAM (~375 ns, 954 cycles) between 16 and 32 MiB, consistent with the 24 MiB
+L2. In the earlier run the SM clock was the same (2532 MHz) but L2-sized sets
+cost ~1100 cycles, the same as DRAM then, so L2 was effectively missing, and
+DRAM was ~15% slower too. Two things changed between the runs: remote desktop
+stopped and a reboot. Hypothesis, not tested: remote desktop's GPU context
+(compute + graphics) time-slicing with the probe costs it its L2 contents.
+Test: rerun with `systemctl --user start gnome-remote-desktop` and a client
+connected. Until then, microbench and latency numbers taken with remote desktop
+on are suspect (the ptr_chase rows of `fb77bc085d64` are superseded).
