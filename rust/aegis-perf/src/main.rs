@@ -9,8 +9,10 @@
 //!     aegis-perf sweep [--impls tiled cublas] [--quick]
 //!     aegis-perf tune [--shapes shapes/default.txt] [--seed S]
 //!     aegis-perf emit-header [--arch 121]
+//!     aegis-perf roofline --arch 121 [--out results/roofline-sm121.svg]
 mod db;
 mod pyjson;
+mod roofline;
 mod sweep;
 mod tune;
 
@@ -87,6 +89,14 @@ enum Cmd {
         #[arg(long, default_value = "results")]
         results_dir: PathBuf,
     },
+    /// SVG roofline from measured roofs (manifest bandwidth, mma_throughput microbench) and winners.
+    Roofline {
+        #[arg(long)]
+        arch: i64,
+        /// Default: results/roofline-sm<arch>.svg
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
     /// Run every registered impl over the shape set, then ingest and recompute winners.
     Sweep {
         #[arg(long, num_args = 1..)]
@@ -123,6 +133,10 @@ fn main() -> Result<()> {
         }),
         Cmd::EmitHeader { arch, out, results_dir } => {
             tune::cmd_emit_header(&cli.db, arch, &results_dir, out.as_deref())
+        }
+        Cmd::Roofline { arch, out } => {
+            let out = out.unwrap_or_else(|| PathBuf::from(format!("results/roofline-sm{arch}.svg")));
+            roofline::cmd_roofline(&cli.db, arch, &out)
         }
         Cmd::Sweep { impls, quick, build_dir, results_dir } => {
             sweep::cmd_sweep(&cli.db, &build_dir, &results_dir, impls, quick)

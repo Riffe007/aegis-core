@@ -30,10 +30,7 @@ for probe in ptr_chase mma_latency mma_throughput ldmatrix smem_banks cp_async; 
 done
 
 PERF="$ROOT/rust/target/release/aegis-perf"
-if [[ -x "$PERF" ]]; then
-  (cd "$ROOT" && "$PERF" ingest-microbench "$OUT" --manifest "$MANIFEST")
-else
-  (cd "$ROOT" && python3 tools/perfdb.py ingest-microbench "$OUT" --manifest "$MANIFEST")
-fi
+[[ -x "$PERF" ]] || { echo "missing $PERF; cargo build --release --manifest-path rust/Cargo.toml" >&2; exit 1; }
+(cd "$ROOT" && "$PERF" ingest-microbench "$OUT" --manifest "$MANIFEST")
 echo "results: $OUT" >&2
 exit $status

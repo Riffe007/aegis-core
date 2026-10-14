@@ -17,15 +17,15 @@ Follow CLAUDE.md. Do all of these in one change:
 3. Add the file to `aegis_kernels` in `CMakeLists.txt` and every impl name to
    `AEGIS_IMPLS` (the ctest list).
 4. Add its entries to `registry()` in `src/gemm/registry.cu`. Check with
-   `./build/bench_gemm --list`.
-5. Add every impl name to `IMPLS` in `tools/sweep.py`.
+   `./build/bench_gemm --list` (sweep and tune read the registry from there).
+5. Kernel host code returns `cudaError_t` and never exits the process.
 6. Build, then run `ctest --test-dir build --output-on-failure`. All shapes,
    including the odd ones, must pass. Fix before going further.
 7. Run `tools/sass_dump.sh` and report: registers, local (spill) bytes, and the
    instruction-mix row for the new kernel. If you used inline PTX, confirm the
    intended instructions appear.
-8. Run `python3 tools/sweep.py --impls $1 tiled cublas --quick` and show the
-   `perfdb.py report` output. Do not summarize performance beyond what that
-   report shows.
+8. Run `rust/target/release/aegis-perf sweep --impls <new names> tiled cublas --quick`
+   and show the `aegis-perf report` output. Do not summarize performance
+   beyond what that report shows.
 
 Stop and ask before changing the public signature of any existing impl.
