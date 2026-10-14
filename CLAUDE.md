@@ -183,6 +183,11 @@ only to compare with old rows (`--protocol 1`).
   Graphs (a whole decode step per graph) or a persistent decode kernel. That
   is a separate experiment, not started.
 
+- **Spark first (2026-10-14).** All Core work happens on the DGX Spark
+  (sm_121) until v1 is complete; the Jetson (sm_87) port comes after. Until
+  then sm_87 is a compile-only gate (no runs, no sm_87 numbers), and the
+  Jetson items in the milestone list wait.
+
 ## Architecture notes you must respect
 
 - GB10 (sm_121) is consumer-lineage Blackwell. It does **not** have the sm_100
