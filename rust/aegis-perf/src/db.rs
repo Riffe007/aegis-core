@@ -191,6 +191,48 @@ pub fn cmd_ingest(
 type KernelShapeKey = (i64, String, String, i64, i64, i64, String); // arch, op, dtype, m, n, k, kernel_id
 type ShapeKey = (i64, String, String, i64, i64, i64); // arch, op, dtype, m, n, k
 
+/// Microbench probe lines (microbench/*): one run row with the device metadata
+/// of the first line, then (run_id, probe, param_json, value, unit) per line.
+pub fn cmd_ingest_microbench(db: &Path, results: &Path, manifest: Option<&Path>, run_id: Option<String>) -> Result<()> {
+    let text = std::fs::read_to_string(results).with_context(|| format!("read {}", results.display()))?;
+    let rows: Vec<Value> = text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(serde_json::from_str)
+        .collect::<Result<_, _>>()?;
+    if rows.is_empty() {
+        bail!("no rows in microbench file");
+    }
+    let manifest: Value = match manifest {
+        Some(p) => serde_json::from_str(&std::fs::read_to_string(p)?)?,
+        None => Value::Object(Default::default()),
+    };
+    let first = &rows[0];
+    let mut con = connect(db)?;
+    let tx = con.transaction()?;
+    let run_id = run_id.unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string()[..12].to_string());
+    let device_id = manifest.get("device_id").cloned().unwrap_or_else(|| Value::String(hostname()));
+    let started_at = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.6f+00:00").to_string();
+    tx.execute(
+        "INSERT INTO runs VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        params![
+            run_id, sql(Some(&device_id)), sql(Some(get(first, "sm_arch")?)), sql(first.get("device")),
+            sql(first.get("cuda_runtime")), sql(first.get("cuda_driver")), git_sha(), power_mode(),
+            SqlValue::Null, gpu_temp_c(), sql(manifest.get("measured_d2d_bw_gbps")), started_at,
+        ],
+    )?;
+    for r in &rows {
+        tx.execute(
+            "INSERT INTO microbench VALUES (?,?,?,?,?)",
+            params![run_id, sql(Some(get(r, "probe")?)), dumps_sorted(get(r, "param")?),
+                    sql(Some(get(r, "value")?)), sql(Some(get(r, "unit")?))],
+        )?;
+    }
+    tx.commit()?;
+    println!("run {run_id}: ingested {} microbench rows", rows.len());
+    Ok(())
+}
+
 /// One row of `_latest_per_kernel_shape` in perfdb.py.
 #[derive(Clone, Debug)]
 pub struct Latest {

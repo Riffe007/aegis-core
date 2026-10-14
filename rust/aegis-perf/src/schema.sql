@@ -48,3 +48,11 @@ CREATE TABLE IF NOT EXISTS winners (
   pct_of_cublas REAL,
   PRIMARY KEY (sm_arch, op, dtype, shape_bucket)
 );
+CREATE TABLE IF NOT EXISTS microbench (
+  run_id TEXT NOT NULL REFERENCES runs(run_id),
+  probe TEXT NOT NULL,
+  param_json TEXT NOT NULL,
+  value REAL,
+  unit TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_micro_probe ON microbench(probe);

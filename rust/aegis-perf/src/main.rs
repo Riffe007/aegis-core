@@ -3,6 +3,7 @@
 //!
 //!     aegis-perf init
 //!     aegis-perf ingest RESULTS.jsonl --manifest M
+//!     aegis-perf ingest-microbench MB.jsonl --manifest M
 //!     aegis-perf winners [--arch 121]
 //!     aegis-perf report [--arch 121]
 //!     aegis-perf sweep [--impls tiled cublas] [--quick]
@@ -39,6 +40,14 @@ enum Cmd {
         #[arg(long)]
         temp_start: Option<f64>,
     },
+    /// Add microbench probe results (microbench/run_all.sh output).
+    IngestMicrobench {
+        results: PathBuf,
+        #[arg(long)]
+        manifest: Option<PathBuf>,
+        #[arg(long)]
+        run_id: Option<String>,
+    },
     /// Recompute the best kernel per (arch, shape).
     Winners {
         #[arg(long)]
@@ -69,6 +78,9 @@ fn main() -> Result<()> {
         Cmd::Init => db::cmd_init(&cli.db),
         Cmd::Ingest { results, manifest, run_id, temp_start } => {
             db::cmd_ingest(&cli.db, &results, manifest.as_deref(), run_id, temp_start)
+        }
+        Cmd::IngestMicrobench { results, manifest, run_id } => {
+            db::cmd_ingest_microbench(&cli.db, &results, manifest.as_deref(), run_id)
         }
         Cmd::Winners { arch } => db::cmd_winners(&cli.db, arch),
         Cmd::Report { arch } => db::cmd_report(&cli.db, arch),

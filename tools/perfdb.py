@@ -5,6 +5,7 @@
     perfdb.py ingest RESULTS.jsonl --manifest M  add one run's measurements
     perfdb.py winners                           recompute best kernel per (arch, shape)
     perfdb.py report [--arch 121]               % of cuBLAS per shape
+    perfdb.py ingest-microbench MB.jsonl --manifest M   add microbench probe results
 
 Schema is frozen for v1. Forge, Fabric, Custos and SACFormer add their own
 tables (plans, requests, train_runs) later; do not rename these columns.
@@ -75,6 +76,14 @@ CREATE TABLE IF NOT EXISTS winners (
   pct_of_cublas REAL,
   PRIMARY KEY (sm_arch, op, dtype, shape_bucket)
 );
+CREATE TABLE IF NOT EXISTS microbench (
+  run_id TEXT NOT NULL REFERENCES runs(run_id),
+  probe TEXT NOT NULL,
+  param_json TEXT NOT NULL,
+  value REAL,
+  unit TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_micro_probe ON microbench(probe);
 """
 
 
@@ -171,6 +180,30 @@ def cmd_ingest(args) -> None:
     con.close()
 
 
+def cmd_ingest_microbench(args) -> None:
+    """One run row (device metadata from the first probe line) + one microbench
+    row per line: (run_id, probe, param_json, value, unit)."""
+    rows = [json.loads(l) for l in Path(args.results).read_text().splitlines() if l.strip()]
+    if not rows:
+        sys.exit("no rows in microbench file")
+    manifest = json.loads(Path(args.manifest).read_text()) if args.manifest else {}
+    first = rows[0]
+    con = connect(args.db)
+    run_id = args.run_id or uuid.uuid4().hex[:12]
+    con.execute(
+        "INSERT INTO runs VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        (run_id, manifest.get("device_id", socket.gethostname()), first["sm_arch"],
+         first.get("device"), first.get("cuda_runtime"), first.get("cuda_driver"),
+         git_sha(), power_mode(), None, gpu_temp_c(),
+         manifest.get("measured_d2d_bw_gbps"), datetime.now(timezone.utc).isoformat()))
+    for r in rows:
+        con.execute("INSERT INTO microbench VALUES (?,?,?,?,?)",
+                    (run_id, r["probe"], json.dumps(r["param"], sort_keys=True), r["value"], r["unit"]))
+    con.commit()
+    print(f"run {run_id}: ingested {len(rows)} microbench rows")
+    con.close()
+
+
 def _latest_per_kernel_shape(con, arch: int | None):
     """Most recent measurement per (arch, kernel, shape); only checked+passing rows
     are eligible, except cuBLAS which is the reference itself."""
@@ -247,6 +280,11 @@ def main() -> None:
     p.add_argument("--run-id")
     p.add_argument("--temp-start", type=float)
     p.set_defaults(fn=cmd_ingest)
+    p = sub.add_parser("ingest-microbench")
+    p.add_argument("results")
+    p.add_argument("--manifest")
+    p.add_argument("--run-id")
+    p.set_defaults(fn=cmd_ingest_microbench)
     p = sub.add_parser("winners")
     p.add_argument("--arch", type=int)
     p.set_defaults(fn=cmd_winners)

@@ -50,6 +50,7 @@ device you measure.
 - `include/aegis/aegis.h`, `src/capi.cpp`: C ABI (`libaegis_capi.a` / `.so`)
 - `rust/aegis-sys`: bindgen bindings + safe wrapper over the C ABI
 - `rust/aegis-perf`: perf DB CLI (`init`, `ingest`, `winners`, `report`, `sweep`)
+- `microbench/`: one binary per hardware probe (PTX), SASS-proven timed loops; `run_all.sh`
 - `tools/tune.py`: autotuner; writes winners and `include/aegis/winners/sm_<arch>.h`
 - `tools/perfdb.py`, `tools/sweep.py`: deprecated Python perf DB and sweep driver
 - `tools/sass_dump.sh`: SASS, register usage, and instruction mix per kernel

@@ -77,6 +77,8 @@ foreach(kind static shared)
   target_compile_options(capi_test_${kind} PRIVATE -Wall -Wextra -Wpedantic -Werror)
 endforeach()
 
+add_subdirectory(microbench)
+
 add_executable(test_matmul tests/test_matmul.cu)
 target_link_libraries(test_matmul PRIVATE aegis)
 
