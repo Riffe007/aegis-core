@@ -431,3 +431,34 @@ cublaslt_best (fastest config per shape) moved by at most 4.8 points
   an hour apart. The large shapes (512x*, 1024³–4096³) are tied in both; the
   decode shapes flip. The tie rule (runner-up inside the winner's p10–p90)
   is sensitive to single slow windows in p90.
+
+### Step 2 rerun — ldmatrix x4 counters, 8 vs 16 warps/SM
+
+Same conditions; idle guard 0.5%. `profile_ldmatrix.sh 5` (`--clock-control
+none`), 5 profiled runs per point:
+
+| Counter (per SM unless noted) | 8 warps | 16 warps |
+|---|---|---|
+| shared-load bank conflicts | 0 | 0 |
+| wavefronts per LDSM.x4 | 4.00 | 4.00 |
+| LSU writeback active, % of active cycles | 99.94–99.96 | 99.98 |
+| LSU pipe inst issued, % of peak | 49.97–49.99 | 49.99 |
+| implied B/clk/SM (wavefronts x 128 B / active cycles) | 127.92–127.95 | 127.97 |
+| elapsed − active cycles (idle inside the kernel) | 9.6k–20.2k | 11.2k–16.1k |
+| elapsed cycles, max − min across SMs | 15–46 | 34–62 |
+| warps active, % of 48 | 16.7 | 33.3 |
+| stall mio_throttle / short_scoreboard / not_selected per issue | 1.54 / 5.38 / 0.08 | 11.34 / 4.42 / 0.68 |
+| probe's own reading in the profiled run | 127.99 (5/5) | 128.00 (5/5) |
+
+Without ncu, 15 runs each: 8 warps 128.0 in 15/15; 16 warps 128.0 in 13/15,
+120.0 and 106.4 once each.
+
+**Cause: unexplained.** Same picture as the first pass, now with no anomaly
+inside any profiled run: the LSU path is saturated at 128 B/clk/SM at both
+points, 16 warps only add mio_throttle queueing, and the idle-inside-kernel
+gap seen once before (212k cycles) did not recur in 10 profiled runs. The low
+readings appear only unprofiled and only at 16 warps so far (3 of 30 runs at
+16 warps across both sessions, 0 of 30 at 8 warps; with this few events the
+difference is not significant). The 16-warp kernel runs twice as long
+(8.4M vs 4.2M cycles), so a fixed rate of outside interruptions would hit it
+twice as often; that remains a hypothesis.
