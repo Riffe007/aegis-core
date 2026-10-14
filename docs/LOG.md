@@ -761,3 +761,35 @@ larger per-warp tile. **One concrete change to test:** a config with a larger
 warp tile, e.g. BM=128, BN=256, 2x4 warps (64x64 per warp), accepting 1 block
 per SM, and compare instructions executed, tensor-pipe active % and L2 sectors
 against the table above.
+
+## 2026-10-15 — warp-tile hypothesis (64x64 warp tiles)
+
+The hypothesis is in the previous entry (Nsight diagnosis, step 3); there is
+no `docs/analysis/gemm-large.md` in the repo.
+
+### 1–2. New configs, correctness, registers
+
+Added `mma_pipe_128x256x32_2x4_s{2,3}` and `mma_pipe_256x128x32_4x2_s{2,3}`:
+8 warps with a 64x64 warp tile (MI = 4 x NI = 8: 32 MMAs per k16 step against
+4 + 4 ldmatrix.x4; the winner's 64x32 tile: 16 against 4 + 2). Padding kept
+(pad8). **s4 does not fit on sm_121**: a pad8 stage is 27,136 B / 29,184 B, so
+s4 needs 108,544 / 116,736 B > the 101,376 B per-block opt-in (without padding
+a stage is 24,576 B and s4 would need 98,304 B: one argument for the swizzle
+experiment).
+
+| Config | regs sm_121 | regs sm_87 | dyn smem | spills / local | ctest (5 odd shapes) |
+|---|---|---|---|---|---|
+| 128x256x32_2x4_s2 | 166 | 211–214 | 54,272 B | 0 / 0 | pass |
+| 128x256x32_2x4_s3 | 166 | 211–214 | 81,408 B | 0 / 0 | pass |
+| 256x128x32_4x2_s2 | 166 | 211–214 | 58,368 B | 0 / 0 | pass |
+| 256x128x32_4x2_s3 | 166 | 211–214 | 87,552 B | 0 / 0 | pass |
+
+(sm_87 values from the gate: four kernels at 211, 212, 213, 214; the gate does
+not map them to names.) 129/129 ctest, sm87_gate 49 kernels pass.
+
+`__launch_bounds__`: not needed. 166 registers x 256 threads allows one block
+per SM already (and shared memory allows one or two), and nothing spills.
+Making the 1-block bound explicit (`__launch_bounds__(THREADS, 1)`) for the
+tier was tried and reverted: it changed register allocation for **every**
+existing config (winner 122 → 132, 64x64 configs 64–95 → 100–102), i.e. it
+would have silently changed kernels that have tune data.
