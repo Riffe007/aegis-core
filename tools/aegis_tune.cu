@@ -108,6 +108,8 @@ int main(int argc, char** argv) {
                a.seed, shapes.size(), candidates.size());
   const auto t0 = std::chrono::steady_clock::now();
   aegis::bench::Harness h;
+  std::fprintf(stderr, "aegis_tune: event timer resolution %.0f ns (min event spacing %.0f ns)\n",
+               h.timer().tick_ns, h.timer().min_delta_ns);
   int timed = 0;
   std::vector<std::string> skipped;
 

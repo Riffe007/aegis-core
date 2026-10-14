@@ -9,6 +9,9 @@
 //   - warmup launches are not timed
 //   - before every timed rep, L2 is flushed by writing a buffer 2x the L2 size
 //   - each rep is bracketed by its own cudaEvent pair; median/p10/p90 reported
+//   - the event timer's resolution is measured once at startup (smallest step
+//     between distinct event deltas over 1000 samples) and recorded as
+//     timer_res_ns
 //
 // The harness is benchmark code: it aborts the process on CUDA/cuBLAS errors.
 // The library path (aegis::matmul, the C ABI) never does.
@@ -55,6 +58,11 @@ struct Timing {
   double median_us = 0, p10_us = 0, p90_us = 0;
 };
 
+struct TimerResolution {
+  double tick_ns = 0;       // smallest step between distinct deltas: the resolution
+  double min_delta_ns = 0;  // smallest nonzero delta: event spacing, not resolution
+};
+
 // Linear interpolation between order statistics.
 double percentile(std::vector<float> v, double p);
 
@@ -68,6 +76,8 @@ class Harness {
   const cudaDeviceProp& prop() const { return prop_; }
   cudaStream_t stream() const { return stream_; }
   cublasHandle_t cublas() const { return cublas_; }
+  // cudaEvent timer resolution (measured in the constructor).
+  const TimerResolution& timer() const { return timer_; }
 
   // Launch `e` (nullptr = cuBLAS) on p into p.C, asynchronously. Aborts on error.
   void launch(const gemm::KernelEntry* e, Problem& p);
@@ -89,6 +99,10 @@ class Harness {
   cublasHandle_t cublas_ = nullptr;
   void* flush_ = nullptr;
   size_t flush_bytes_ = 0;
+  TimerResolution timer_{};
 };
+
+// Event pairs around `samples` spin kernels of increasing length. Aborts on error.
+TimerResolution measure_timer_resolution(cudaStream_t stream, int samples = 1000);
 
 }  // namespace aegis::bench

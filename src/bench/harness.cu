@@ -53,6 +53,47 @@ Problem::~Problem() {
   cudaFree(A);
 }
 
+namespace {
+__global__ void spin_kernel(long long cycles) {
+  const long long t0 = clock64();
+  while (clock64() - t0 < cycles) {
+  }
+}
+}  // namespace
+
+// Event pairs around spin kernels of 0..~8 us, so the deltas cross many tick
+// boundaries. The tick is the smallest step between distinct deltas. The
+// smallest nonzero delta itself is NOT the tick: on GB10 it is the minimum
+// event-to-event spacing (~0.7 us with nothing between the events, ~2.2 us
+// around a kernel), while distinct deltas step by 32 ns. The coarse 2.048 us
+// steps seen in protocol v1 medians come from recording the start event right
+// behind the L2-flush memset, not from the timer.
+TimerResolution measure_timer_resolution(cudaStream_t stream, int samples) {
+  std::vector<cudaEvent_t> ev(2 * size_t(samples));
+  for (auto& e : ev) AEGIS_CUDA_CHECK(cudaEventCreate(&e));
+  for (int i = 0; i < samples; ++i) {
+    AEGIS_CUDA_CHECK(cudaEventRecord(ev[2 * i], stream));
+    spin_kernel<<<1, 1, 0, stream>>>(static_cast<long long>(i) * 16);
+    AEGIS_CUDA_CHECK(cudaGetLastError());
+    AEGIS_CUDA_CHECK(cudaEventRecord(ev[2 * i + 1], stream));
+  }
+  AEGIS_CUDA_CHECK(cudaStreamSynchronize(stream));
+  std::vector<long long> ns;
+  for (int i = 0; i < samples; ++i) {
+    float ms = 0;
+    AEGIS_CUDA_CHECK(cudaEventElapsedTime(&ms, ev[2 * i], ev[2 * i + 1]));
+    if (ms > 0) ns.push_back(std::llround(double(ms) * 1e6));
+  }
+  for (auto& e : ev) cudaEventDestroy(e);
+  std::sort(ns.begin(), ns.end());
+  ns.erase(std::unique(ns.begin(), ns.end()), ns.end());
+  TimerResolution r;
+  if (!ns.empty()) r.min_delta_ns = double(ns.front());
+  for (size_t i = 1; i < ns.size(); ++i)
+    r.tick_ns = (r.tick_ns == 0) ? double(ns[i] - ns[i - 1]) : std::min(r.tick_ns, double(ns[i] - ns[i - 1]));
+  return r;
+}
+
 double percentile(std::vector<float> v, double p) {
   std::sort(v.begin(), v.end());
   const double idx = p * (v.size() - 1);
@@ -73,6 +114,7 @@ Harness::Harness() {
   // L2 flush buffer: 2x L2 so nothing from the previous rep survives.
   flush_bytes_ = std::max<size_t>(size_t(prop_.l2CacheSize) * 2, 1 << 20);
   AEGIS_CUDA_CHECK(cudaMalloc(&flush_, flush_bytes_));
+  timer_ = measure_timer_resolution(stream_);
 }
 
 Harness::~Harness() {
@@ -161,12 +203,13 @@ std::string Harness::json_row(const char* impl, const gemm::KernelEntry* e, cons
         "\"tflops\":%.4f,\"gbps\":%.3f,\"reps\":%d,"
         "\"checked\":%s,\"pass\":%s,\"max_abs_err\":%.6g,\"rel_err\":%.6g,"
         "\"regs\":%d,\"smem_bytes\":%zu,\"local_bytes\":%zu,"
-        "\"device\":\"%s\",\"sm_arch\":%d%d,\"cuda_runtime\":%d,\"cuda_driver\":%d%s}",
+        "\"device\":\"%s\",\"sm_arch\":%d%d,\"cuda_runtime\":%d,\"cuda_driver\":%d,"
+        "\"timer_res_ns\":%.1f%s}",
         impl, config, M, N, K, t.median_us, t.p10_us, t.p90_us, tflops, gbps, t.reps,
         c.checked ? "true" : "false", c.pass ? "true" : "false", c.max_abs_err, c.rel_err,
         e ? attrs.numRegs : -1, e ? attrs.sharedSizeBytes : size_t(0),
         e ? attrs.localSizeBytes : size_t(0), prop_.name, prop_.major, prop_.minor, runtime_,
-        driver_, extra.c_str());
+        driver_, timer_.tick_ns, extra.c_str());
   };
   std::string s(size_t(print(nullptr, 0)), '\0');
   print(s.data(), s.size() + 1);
