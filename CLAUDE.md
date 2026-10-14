@@ -30,9 +30,9 @@ exports only `aegis_*`; changing a signature there means bumping
 ## Build and run
 
 ```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release   # arch defaults to the local GPU ("native")
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DAEGIS_SM87_GATE=ON  # arch: local GPU ("native"); + sm_87 compile gate
 cmake --build build -j                            # kernels, bench, C ABI (.a/.so), microbench
-ctest --test-dir build --output-on-failure        # every impl on odd shapes, matmul dispatch, C ABI
+ctest --test-dir build --output-on-failure        # every impl on odd shapes, matmul dispatch, C ABI, sm87_gate
 ./build/aegis_manifest > results/manifest-$(hostname).json
 
 # Rust (needs the CMake build first: aegis-sys links build/libaegis_capi.so)
@@ -185,7 +185,8 @@ only to compare with old rows (`--protocol 1`).
 
 - **Spark first (2026-10-14).** All Core work happens on the DGX Spark
   (sm_121) until v1 is complete; the Jetson (sm_87) port comes after. Until
-  then sm_87 is a compile-only gate (no runs, no sm_87 numbers), and the
+  then sm_87 is a compile-only gate (no runs, no sm_87 numbers: CMake option
+  `AEGIS_SM87_GATE`, ctest `sm87_gate`, on in the pre-commit hook), and the
   Jetson items in the milestone list wait.
 
 ## Architecture notes you must respect

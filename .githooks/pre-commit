@@ -17,7 +17,13 @@ if [[ ! -d build ]]; then
   echo "pre-commit: no build/ directory; run cmake -S . -B build -DCMAKE_BUILD_TYPE=Release" >&2
   exit 1
 fi
-echo "pre-commit: building and running ctest..." >&2
+# The sm_87 compile gate (CMake option AEGIS_SM87_GATE, ctest sm87_gate) is
+# part of every commit; switch it on in build/ if it is not.
+if ! grep -q "^AEGIS_SM87_GATE:BOOL=ON" build/CMakeCache.txt 2>/dev/null; then
+  echo "pre-commit: enabling the sm_87 compile gate in build/" >&2
+  cmake -S . -B build -DAEGIS_SM87_GATE=ON >/dev/null
+fi
+echo "pre-commit: building and running ctest (incl. sm87_gate)..." >&2
 if ! cmake --build build -j >/tmp/aegis-precommit-build.log 2>&1; then
   grep -E "error|Error" /tmp/aegis-precommit-build.log | head -20 >&2
   echo "pre-commit: build failed; commit refused (full log: /tmp/aegis-precommit-build.log)" >&2

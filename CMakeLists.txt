@@ -119,3 +119,31 @@ endforeach()
 add_test(NAME matmul_dispatch COMMAND test_matmul)
 add_test(NAME capi_static COMMAND capi_test_static)
 add_test(NAME capi_shared COMMAND capi_test_shared)
+
+# sm_87 compile gate (Jetson Orin; CLAUDE.md Decisions: compile only, nothing
+# runs for sm_87 until the Jetson port). Every source with kernels is compiled
+# for sm_87 SASS as an object library that is never linked or run; the
+# sm87_gate test fails if any sm_87 kernel spills or uses local memory
+# (STACK/LOCAL > 0), uses more than 48 KB of static shared memory (only dynamic
+# smem can be opted in), or if any object is missing its sm_87 code. A source
+# that does not compile for sm_87 fails the build. The pre-commit hook turns
+# this on.
+option(AEGIS_SM87_GATE "Also compile every kernel for sm_87 (compile only) and test its resources" OFF)
+if(AEGIS_SM87_GATE)
+  set(AEGIS_SM87_SOURCES
+    src/gemm/naive.cu src/gemm/tiled.cu src/gemm/regblock.cu src/gemm/mma.cu src/gemm/mma_pipe.cu
+    src/gemm/registry.cu src/matmul.cu src/bench/harness.cu
+    microbench/ptr_chase.cu microbench/mma_latency.cu microbench/mma_throughput.cu
+    microbench/ldmatrix.cu microbench/smem_banks.cu microbench/cp_async.cu microbench/dram_bw.cu
+    microbench/launch_overhead.cu
+    tools/aegis_manifest.cu)
+  add_library(aegis_sm87_gate OBJECT ${AEGIS_SM87_SOURCES})
+  set_target_properties(aegis_sm87_gate PROPERTIES CUDA_ARCHITECTURES 87-real)
+  target_include_directories(aegis_sm87_gate PRIVATE include src microbench)
+  target_link_libraries(aegis_sm87_gate PRIVATE CUDA::cudart CUDA::cublas CUDA::cublasLt CUDA::cuda_driver)
+  target_compile_options(aegis_sm87_gate PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xptxas=-warn-spills>)
+  file(GENERATE OUTPUT ${CMAKE_BINARY_DIR}/sm87_gate_objects.txt
+       CONTENT "$<JOIN:$<TARGET_OBJECTS:aegis_sm87_gate>,\n>\n")
+  add_test(NAME sm87_gate
+           COMMAND ${CMAKE_SOURCE_DIR}/tools/sm87_gate.sh ${CMAKE_BINARY_DIR}/sm87_gate_objects.txt)
+endif()

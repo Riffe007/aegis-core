@@ -673,3 +673,22 @@ each row. Effect: the decode points that exceeded the copy roof are now under
 the read roof — 1x4864x896 cublaslt_best 101.3% → 93.1%, cublas 100.9% →
 92.7%; 16x4864x896 cublaslt_best 100.0% → 91.8%. The M = 1/16 winner points
 drop by ~8% of roof (e.g. 1x896x896 63.1% → 58.0%).
+
+### 2. sm_87 compile gate
+
+CMake option `AEGIS_SM87_GATE` compiles every source with kernels (the GEMM
+tiers, registry, matmul, harness, all microbench probes, aegis_manifest; 17
+objects) for `sm_87-real` as an object library that is never linked or run.
+ctest `sm87_gate` (`tools/sm87_gate.sh`, cuobjdump -res-usage) fails on any
+sm_87 kernel with STACK or LOCAL > 0 (spill / local memory), static shared
+memory > 48 KB, or an object without sm_87 code; a source that does not
+compile for sm_87 fails the build. The pre-commit hook enables the option.
+Nothing runs on sm_87.
+
+Result now: **45 sm_87 kernels, all pass**: no spills, no local memory, all
+shared memory dynamic or ≤ 48 KB static, most registers sm_87. Negative checks:
+a kernel built with `-maxrregcount=24` → `FAIL spill/local (STACK:9208)`; an
+sm_121-only object → `FAIL no sm_87 code`; 52 KB of static smem → ptxas
+compile error ("uses too much shared data"), i.e. a failed build. No CUDA
+12.x issue to fix: CUDA 13.0's nvcc compiles everything for sm_87 as is (the
+JetPack 12.x toolchain itself is untested until the port).
