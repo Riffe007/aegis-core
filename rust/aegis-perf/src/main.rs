@@ -7,9 +7,12 @@
 //!     aegis-perf winners [--arch 121]
 //!     aegis-perf report [--arch 121]
 //!     aegis-perf sweep [--impls tiled cublas] [--quick]
+//!     aegis-perf tune [--shapes shapes/default.txt] [--seed S]
+//!     aegis-perf emit-header [--arch 121]
 mod db;
 mod pyjson;
 mod sweep;
+mod tune;
 
 use std::path::PathBuf;
 
@@ -58,6 +61,32 @@ enum Cmd {
         #[arg(long)]
         arch: Option<i64>,
     },
+    /// Autotune: build/aegis_tune over a shapes file, ingest, recompute winners, print the table.
+    Tune {
+        #[arg(long, default_value = "shapes/default.txt")]
+        shapes: PathBuf,
+        /// Config-order shuffle seed (default: random, logged by aegis_tune).
+        #[arg(long)]
+        seed: Option<u64>,
+        /// Comma-separated impl name prefixes (default: aegis_tune's).
+        #[arg(long)]
+        prefix: Option<String>,
+        #[arg(long, default_value = "build")]
+        build_dir: PathBuf,
+        #[arg(long, default_value = "results")]
+        results_dir: PathBuf,
+    },
+    /// Winners for an arch -> include/aegis/winners/sm_<arch>.h (commit it).
+    EmitHeader {
+        /// Default: sm_arch from results/manifest-<host>.json.
+        #[arg(long)]
+        arch: Option<i64>,
+        /// Output path (default include/aegis/winners/sm_<arch>.h).
+        #[arg(long)]
+        out: Option<PathBuf>,
+        #[arg(long, default_value = "results")]
+        results_dir: PathBuf,
+    },
     /// Run every registered impl over the shape set, then ingest and recompute winners.
     Sweep {
         #[arg(long, num_args = 1..)]
@@ -84,6 +113,17 @@ fn main() -> Result<()> {
         }
         Cmd::Winners { arch } => db::cmd_winners(&cli.db, arch),
         Cmd::Report { arch } => db::cmd_report(&cli.db, arch),
+        Cmd::Tune { shapes, seed, prefix, build_dir, results_dir } => tune::cmd_tune(&tune::TuneArgs {
+            db: &cli.db,
+            build: &build_dir,
+            results: &results_dir,
+            shapes: &shapes,
+            seed,
+            prefix,
+        }),
+        Cmd::EmitHeader { arch, out, results_dir } => {
+            tune::cmd_emit_header(&cli.db, arch, &results_dir, out.as_deref())
+        }
         Cmd::Sweep { impls, quick, build_dir, results_dir } => {
             sweep::cmd_sweep(&cli.db, &build_dir, &results_dir, impls, quick)
         }
