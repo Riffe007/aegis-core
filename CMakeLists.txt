@@ -103,6 +103,8 @@ set(AEGIS_IMPLS
   mma_pipe_128x64x32_2x2_s2 mma_pipe_128x64x32_2x2_s3 mma_pipe_128x64x32_2x2_s4
   mma_pipe_64x128x32_2x4_s2 mma_pipe_64x128x32_2x4_s3 mma_pipe_64x128x32_2x4_s4
   mma_pipe_64x64x32_2x2_s2 mma_pipe_64x64x32_2x2_s3 mma_pipe_64x64x32_2x2_s4
+  mma_pipe_128x256x32_2x4_s2 mma_pipe_128x256x32_2x4_s3
+  mma_pipe_256x128x32_4x2_s2 mma_pipe_256x128x32_4x2_s3
 )
 foreach(impl ${AEGIS_IMPLS})
   # 127x129x65: scalar fallback. 200x136x72: 16-byte path with partial edge tiles.

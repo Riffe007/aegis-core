@@ -98,6 +98,14 @@ inline constexpr MmaPipeConfig MMA_PIPE_CONFIGS[] = {
     {64, 64, 32, 2, 2, 2},
     {64, 64, 32, 2, 2, 3},
     {64, 64, 32, 2, 2, 4},
+    // 64x64 warp tiles (8 warps, 1 block per SM): MI=4 x NI=8 = 32 MMAs per k16
+    // step against 4 + 4 ldmatrix.x4. s4 is left out: with the pad8 layout one
+    // stage is 27,136 B (128x256) / 29,184 B (256x128), so s4 needs 108,544 /
+    // 116,736 B, over the 101,376 B per-block opt-in limit of sm_121.
+    {128, 256, 32, 2, 4, 2},
+    {128, 256, 32, 2, 4, 3},
+    {256, 128, 32, 4, 2, 2},
+    {256, 128, 32, 4, 2, 3},
 };
 std::span<const KernelEntry> mma_pipe_entries();
 
