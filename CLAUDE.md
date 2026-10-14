@@ -50,7 +50,8 @@ tools/sass_dump.sh                                # SASS + register usage per ke
 microbench/run_all.sh                             # hardware probes -> perf DB microbench table
 ```
 
-Run every `aegis-perf` and `tools/` command from the repo root (paths such as
+Once per clone: `git config core.hooksPath .githooks` (pre-commit builds and runs
+ctest; a failing test refuses the commit). Run every `aegis-perf` and `tools/` command from the repo root (paths such as
 `results/` and `build/` are relative). Always build natively on the device you
 are measuring. Do not cross-compile.
 

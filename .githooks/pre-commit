@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# AEGIS pre-commit: the build must be current and ctest must pass.
+# Enable once per clone:  git config core.hooksPath .githooks
+set -euo pipefail
+ROOT="$(git rev-parse --show-toplevel)"
+cd "$ROOT"
+
+if [[ ! -d build ]]; then
+  echo "pre-commit: no build/ directory; run cmake -S . -B build -DCMAKE_BUILD_TYPE=Release" >&2
+  exit 1
+fi
+echo "pre-commit: building and running ctest..." >&2
+cmake --build build -j >/dev/null
+if ! ctest --test-dir build --output-on-failure -j4 >/tmp/aegis-precommit-ctest.log 2>&1; then
+  tail -40 /tmp/aegis-precommit-ctest.log >&2
+  echo "pre-commit: ctest failed; commit refused (full log: /tmp/aegis-precommit-ctest.log)" >&2
+  exit 1
+fi
+grep -E "tests passed" /tmp/aegis-precommit-ctest.log >&2

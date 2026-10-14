@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cmake *)",
+      "Bash(ctest *)",
+      "Bash(cargo *)",
+      "Bash(cuobjdump *)",
+      "Bash(ncu *)",
+      "Bash(git *)",
+      "Bash(./build/*)",
+      "Bash(build/*)",
+      "Bash(microbench/run_all.sh *)",
+      "Bash(tools/sass_dump.sh *)"
+    ]
+  }
+}
