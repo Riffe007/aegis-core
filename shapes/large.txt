@@ -1,0 +1,3 @@
+# Large square shapes (warp-tile experiment).
+2048 2048 2048
+4096 4096 4096

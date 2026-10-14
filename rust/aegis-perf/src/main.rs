@@ -91,6 +91,10 @@ enum Cmd {
         /// Run even if the idle guard finds the GPU busy (> 2% utilization); rows are marked.
         #[arg(long)]
         allow_busy: bool,
+        /// Also run the paired tie test of the fastest config against this impl
+        /// (e.g. the previous winner), when it is not already the runner-up.
+        #[arg(long)]
+        pair_with: Option<String>,
         #[arg(long, default_value = "build")]
         build_dir: PathBuf,
         #[arg(long, default_value = "results")]
@@ -163,7 +167,7 @@ fn main() -> Result<()> {
         Cmd::Report { arch, protocol, cache, include_busy, baseline } => {
             db::cmd_report(&cli.db, arch, &db::Selection { protocol, cache, include_busy }, baseline.as_deref())
         }
-        Cmd::Tune { shapes, seed, prefix, allow_busy, build_dir, results_dir } => tune::cmd_tune(&tune::TuneArgs {
+        Cmd::Tune { shapes, seed, prefix, allow_busy, pair_with, build_dir, results_dir } => tune::cmd_tune(&tune::TuneArgs {
             db: &cli.db,
             build: &build_dir,
             results: &results_dir,
@@ -171,6 +175,7 @@ fn main() -> Result<()> {
             seed,
             prefix,
             allow_busy,
+            pair_with,
         }),
         Cmd::EmitHeader { arch, out, results_dir } => {
             tune::cmd_emit_header(&cli.db, arch, &results_dir, out.as_deref())

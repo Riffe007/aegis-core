@@ -2,7 +2,7 @@
 //
 //   aegis_tune --shapes shapes/default.txt [--seed S] [--prefix regblock_,mma_,mma_pipe_]
 //              [--reps 20] [--cublas-reps 50] [--warmup 3] [--data-seed 42] [--protocol 2]
-//              [--warm-top 2] [--allow-busy] [--no-paired]
+//              [--warm-top 2] [--allow-busy] [--no-paired] [--pair-with IMPL]
 //
 // For each shape (from a file, "M N K" per line, # comments) it allocates the
 // problem once, then runs the baselines (cuBLAS; cublaslt_best: the fastest
@@ -54,6 +54,7 @@ struct Args {
   int warm_top = 2;  // warm rows for cuBLAS and the N fastest cold configs per shape
   bool allow_busy = false;
   bool paired = true;  // --no-paired skips the paired tie tests
+  std::string pair_with;  // --pair-with IMPL: also pair the fastest config with IMPL
 };
 
 std::vector<std::string> split(const std::string& s, char sep) {
@@ -83,6 +84,7 @@ Args parse(int argc, char** argv) {
     else if (k == "--warm-top") a.warm_top = std::stoi(next());
     else if (k == "--allow-busy") a.allow_busy = true;
     else if (k == "--no-paired") a.paired = false;
+    else if (k == "--pair-with") a.pair_with = next();
     else { std::fprintf(stderr, "unknown arg %s\n", k.c_str()); std::exit(2); }
   }
   if (a.shapes.empty()) { std::fprintf(stderr, "--shapes FILE is required\n"); std::exit(2); }
@@ -234,6 +236,10 @@ int main(int argc, char** argv) {
       };
       if (ours.size() >= 2) pair_row(*ours[0], *ours[1], "runner_up");
       if (!ours.empty() && ltd) pair_row(*ours[0], *ltd, "cublaslt_best");
+      if (!a.pair_with.empty() && !ours.empty())  // e.g. the previous winner
+        for (const Done* d : ours)
+          if (d->name == a.pair_with && d != ours[0] && (ours.size() < 2 || d != ours[1]))
+            pair_row(*ours[0], *d, "reference");
     }
     if (a.protocol == 2 && a.warm_top > 0) {
       std::vector<Done> warm;

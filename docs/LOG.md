@@ -791,5 +791,38 @@ not map them to names.) 129/129 ctest, sm87_gate 49 kernels pass.
 per SM already (and shared memory allows one or two), and nothing spills.
 Making the 1-block bound explicit (`__launch_bounds__(THREADS, 1)`) for the
 tier was tried and reverted: it changed register allocation for **every**
-existing config (winner 122 → 132, 64x64 configs 64–95 → 100–102), i.e. it
-would have silently changed kernels that have tune data.
+existing config, i.e. it
+would have silently changed kernels that have tune data. (On sm_121: winner
+122 → 132; `64x64x32_2x2_s4` 64 → 100.)
+
+### 3. Tune at 2048³ and 4096³ (run `2b10fd68f576`)
+
+`aegis-perf tune --shapes shapes/large.txt --pair-with mma_pipe_128x128x32_2x4_s2`
+(new `--pair-with`: an extra paired test of the fastest config against a named
+impl, here the previous winner). Idle guard 1.8% mean (9% max), no
+`--allow-busy`. Cold medians, µs (p10–p90):
+
+| Config | 2048³ | 4096³ |
+|---|---|---|
+| cublaslt_best | 196.0 (193.9–251.8) | 1422.7 (1410.8–1820.9) |
+| **128x256x32_2x4_s3** (new) | 284.2 (282.8–337.0) | **2236.7** (2207.6–2655.6) |
+| 128x256x32_2x4_s2 (new) | 296.0 | 2373.8 |
+| 256x128x32_4x2_s3 (new) | 285.7 | 2377.2 |
+| 256x128x32_4x2_s2 (new) | 295.4 | 2663.4 |
+| **128x128x32_2x4_s2** (old winner) | **275.8** (274.4–373.0) | 2487.5 (2433.6–3086.4) |
+
+Paired tests (ratio = B / A per pair, 95% CI, 30 pairs):
+
+| Shape | A (fastest) | B | Ratio [CI] |
+|---|---|---|---|
+| 2048³ | 128x128_s2 (old winner) | 128x256_s3 (best new) | 1.022 [1.018, 1.026] |
+| 2048³ | 128x128_s2 | cublaslt_best | 0.689 [0.686, 0.691] |
+| 4096³ | 128x256_s3 (new winner) | 128x256_s2 | 1.061 [1.055, 1.067] |
+| 4096³ | 128x256_s3 | 128x128_s2 (old winner) | **1.121 [1.109, 1.129]** |
+| 4096³ | 128x256_s3 | cublaslt_best | 0.662 [0.657, 0.665] |
+
+**4096³: the 64x64-warp-tile config wins, 10.8% faster than the old winner**
+(old/new 1.121 per paired windows); cublaslt_best/ours goes from 0.580–0.590
+(previous runs) to 0.662: 66% of cublaslt_best by paired ratio (63.6% by
+medians). **2048³: no gain; the old winner stays**, the best new config is
+2.2% slower. `winners/sm_121.h` regenerated (4096³ → `mma_pipe_128x256x32_2x4_s3`).
