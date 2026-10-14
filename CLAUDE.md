@@ -96,8 +96,8 @@ artifacts/          SASS dumps per arch, microbench SASS proofs (gitignored)
    inline PTX, confirm with `tools/sass_dump.sh` that the expected instructions
    (HMMA, LDSM, LDGSTS) appear and that register count did not spill.
 6. **Benchmark hygiene.** Pause background training jobs before a sweep. The
-   harness flushes L2 between reps and reports median/p10/p90. Do not reduce
-   reps to make a sweep faster without saying so.
+   harness controls cache state and reports median/p10/p90 (see Benchmark
+   policy). Do not reduce reps to make a sweep faster without saying so.
 7. **Do not change public signatures** in `gemm.h` without updating every impl
    and the bench dispatch in the same commit. `aegis.h` is a versioned ABI:
    additions bump the minor version, any incompatible change the major.
@@ -122,6 +122,31 @@ artifacts/          SASS dumps per arch, microbench SASS proofs (gitignored)
    within 2x), then fewer registers, then less smem. The `winners` table
    records `tied`, `tie_set` and `pick_reason`; `emit-header` writes them as
    comments. Never hand-edit a winner.
+
+## Benchmark policy
+
+The timing protocol lives in `src/bench/harness.{h,cu}` (one implementation,
+shared by `bench_gemm` and `aegis_tune`). Protocol v2 is the default; v1 exists
+only to compare with old rows (`--protocol 1`).
+
+- **What v2 measures: steady-state throughput.** N back-to-back launches are
+  replayed from one CUDA Graph per timed window; N is calibrated so a window
+  lasts >= max(1 ms, 500 timer ticks). Per-launch time = window / N;
+  median/p10/p90 across >= 20 windows. Every row records `protocol_version`,
+  `batch_n`, `timer_res_ns`, `cache_mode`, `buffer_sets`.
+- **What v2 does not measure: single-launch latency.** Launch overhead, the
+  CPU submission path, first-launch and cold-start costs belong to the
+  launch-overhead probe (`microbench/`, planned), never to this harness.
+  Do not compare a v2 per-launch time with an end-to-end latency.
+- **Cache state is explicit.** `cold` (ranks configs, the default):
+  launches rotate through K = max(2, ceil(3 x L2 / footprint)) buffer sets
+  inside the window, L2 is flushed before each window and nothing but the
+  launches runs inside it. `warm`: one buffer set, no flush. Winners are picked
+  on cold; warm is recorded for them. Never mix cold and warm rows in one
+  comparison.
+- **Timer.** The event timer's resolution is measured at startup (32 ns on
+  GB10). v1 rows are quantized to 2.048 us steps by the memset in front of each
+  start event; do not rank shapes under ~50 us on v1 rows.
 
 ## Architecture notes you must respect
 
