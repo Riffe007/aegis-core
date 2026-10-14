@@ -7,3 +7,15 @@ rust/target/
 
 # Any build directory (build/, build-dev/, ...)
 build*/
+cmake-build-*/
+out/
+
+# Build products, wherever they land
+*.o
+*.a
+*.so
+*.so.*
+*.cubin
+*.fatbin
+*.ncu-rep
+*.nsys-rep

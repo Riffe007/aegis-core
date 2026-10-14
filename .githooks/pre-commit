@@ -13,6 +13,18 @@ if [[ -n "$py" ]]; then
   exit 1
 fi
 
+# No staged file over 5 MB (build output in e799a4f had to be stripped from history).
+big=""
+while IFS= read -r -d '' f; do
+  size="$(git cat-file -s ":$f")"
+  if (( size > 5 * 1024 * 1024 )); then big+="  $f ($size bytes)"$'\n'; fi
+done < <(git diff --cached --name-only --diff-filter=ACMR -z)
+if [[ -n "$big" ]]; then
+  echo "pre-commit: staged files over 5 MB are not allowed:" >&2
+  printf '%s' "$big" >&2
+  exit 1
+fi
+
 if [[ ! -d build ]]; then
   echo "pre-commit: no build/ directory; run cmake -S . -B build -DCMAKE_BUILD_TYPE=Release" >&2
   exit 1
