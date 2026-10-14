@@ -5,8 +5,8 @@
 //!     aegis-perf ingest-microbench MB.jsonl --manifest M
 //!     aegis-perf winners [--arch 121]
 //!     aegis-perf report [--arch 121]
-//!     aegis-perf sweep [--impls tiled cublas] [--quick]
-//!     aegis-perf tune [--shapes shapes/default.txt] [--seed S]
+//!     aegis-perf sweep [--impls tiled cublas] [--quick] [--allow-busy]
+//!     aegis-perf tune [--shapes shapes/default.txt] [--seed S] [--allow-busy]
 //!     aegis-perf emit-header [--arch 121]
 //!     aegis-perf roofline --arch 121 [--out results/roofline-sm121.svg]
 mod db;
@@ -72,6 +72,9 @@ enum Cmd {
         /// Comma-separated impl name prefixes (default: aegis_tune's).
         #[arg(long)]
         prefix: Option<String>,
+        /// Run even if the idle guard finds the GPU busy (> 2% utilization); rows are marked.
+        #[arg(long)]
+        allow_busy: bool,
         #[arg(long, default_value = "build")]
         build_dir: PathBuf,
         #[arg(long, default_value = "results")]
@@ -103,6 +106,9 @@ enum Cmd {
         /// 3 shapes, for iterating.
         #[arg(long)]
         quick: bool,
+        /// Run even if the idle guard finds the GPU busy (> 2% utilization); rows are marked.
+        #[arg(long)]
+        allow_busy: bool,
         #[arg(long, default_value = "build")]
         build_dir: PathBuf,
         #[arg(long, default_value = "results")]
@@ -122,13 +128,14 @@ fn main() -> Result<()> {
         }
         Cmd::Winners { arch } => db::cmd_winners(&cli.db, arch),
         Cmd::Report { arch } => db::cmd_report(&cli.db, arch),
-        Cmd::Tune { shapes, seed, prefix, build_dir, results_dir } => tune::cmd_tune(&tune::TuneArgs {
+        Cmd::Tune { shapes, seed, prefix, allow_busy, build_dir, results_dir } => tune::cmd_tune(&tune::TuneArgs {
             db: &cli.db,
             build: &build_dir,
             results: &results_dir,
             shapes: &shapes,
             seed,
             prefix,
+            allow_busy,
         }),
         Cmd::EmitHeader { arch, out, results_dir } => {
             tune::cmd_emit_header(&cli.db, arch, &results_dir, out.as_deref())
@@ -137,8 +144,8 @@ fn main() -> Result<()> {
             let out = out.unwrap_or_else(|| PathBuf::from(format!("results/roofline-sm{arch}.svg")));
             roofline::cmd_roofline(&cli.db, arch, &out)
         }
-        Cmd::Sweep { impls, quick, build_dir, results_dir } => {
-            sweep::cmd_sweep(&cli.db, &build_dir, &results_dir, impls, quick)
+        Cmd::Sweep { impls, quick, allow_busy, build_dir, results_dir } => {
+            sweep::cmd_sweep(&cli.db, &build_dir, &results_dir, impls, quick, allow_busy)
         }
     }
 }

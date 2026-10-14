@@ -3,6 +3,11 @@
 //   bench_gemm --impl tiled --m 4096 --n 4096 --k 4096 [--reps 20] [--warmup 3]
 //              [--protocol 2] [--cache cold|warm] [--check] [--seed 42]
 //   bench_gemm --list                  registered impls as JSON lines
+//   bench_gemm --idle-check [--allow-busy]   the idle guard alone (aegis-perf sweep
+//                                      runs it once before the sweep); exit 3 = busy
+//
+// --allow-busy --idle-util-pct U (passed by aegis-perf sweep after a busy idle
+// check) adds ,"idle_util_pct":U,"allow_busy":true to the row.
 //
 // The timing protocol and JSON row live in src/bench/harness.{h,cu}, shared
 // with aegis_tune. --check exits 1 if max_abs_err / max|ref| exceeds the
@@ -24,6 +29,8 @@ struct Args {
   std::string cache = "cold";
   bool check = false;
   bool list = false;
+  bool idle_check = false, allow_busy = false;
+  double idle_util_pct = -1;  // < 0: not recorded
   unsigned seed = 42;
 };
 
@@ -46,6 +53,9 @@ Args parse(int argc, char** argv) {
     else if (k == "--seed") a.seed = static_cast<unsigned>(std::atoi(next()));
     else if (k == "--check") a.check = true;
     else if (k == "--list") a.list = true;
+    else if (k == "--idle-check") a.idle_check = true;
+    else if (k == "--allow-busy") a.allow_busy = true;
+    else if (k == "--idle-util-pct") a.idle_util_pct = std::atof(next());
     else { std::fprintf(stderr, "unknown arg %s\n", k.c_str()); std::exit(2); }
   }
   if (a.reps < 0) a.reps = a.protocol == 1 ? 50 : 20;
@@ -69,6 +79,12 @@ int main(int argc, char** argv) {
       std::printf("{\"impl\":\"%s\",\"config\":%s}\n", e.name, e.config);
     return 0;
   }
+  if (a.idle_check) {
+    const aegis::bench::IdleSample s = aegis::bench::idle_guard(a.allow_busy);  // exits 3 if busy
+    std::printf("{\"ok\":%s,\"mean_pct\":%.2f,\"max_pct\":%.0f,\"samples\":%d}\n",
+                s.ok ? "true" : "false", s.mean_pct, s.max_pct, s.samples);
+    return 0;
+  }
   // Resolved once, before timing, so lookup cost never lands in a timed rep.
   const aegis::gemm::KernelEntry* entry = aegis::gemm::find(a.impl);
   if (!entry && a.impl != "cublas") {
@@ -86,7 +102,14 @@ int main(int argc, char** argv) {
   opt.warmup = a.warmup;
   opt.reps = a.reps;
   const aegis::bench::Timing t = h.time(entry, p, opt);
-  std::printf("%s\n", h.json_row(a.impl.c_str(), entry, p, c, t).c_str());
+  std::string extra;
+  if (a.idle_util_pct >= 0) {
+    char buf[96];
+    std::snprintf(buf, sizeof buf, ",\"idle_util_pct\":%.1f,\"allow_busy\":%s", a.idle_util_pct,
+                  a.allow_busy ? "true" : "false");
+    extra = buf;
+  }
+  std::printf("%s\n", h.json_row(a.impl.c_str(), entry, p, c, t, extra).c_str());
 
   if (c.checked && !c.pass) {
     std::fprintf(stderr, "FAIL: %s %dx%dx%d rel_err=%.3g > %.1e\n",

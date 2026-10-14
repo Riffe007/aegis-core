@@ -1,12 +1,16 @@
-// The AEGIS timing protocol (see harness.h). Moved verbatim from
-// bench/bench_gemm.cu; bench_gemm's JSON output is unchanged (checked by diff).
+// The AEGIS timing protocol (see harness.h), protocol v1 and v2, the timer
+// resolution probe and the NVML idle guard.
 #include "harness.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <random>
+#include <thread>
+
+#include <nvml.h>
 
 #include "aegis/common.cuh"
 
@@ -364,6 +368,67 @@ std::string Harness::json_row(const char* impl, const gemm::KernelEntry* e, cons
   };
   std::string s(size_t(print(nullptr, 0)), '\0');
   print(s.data(), s.size() + 1);
+  return s;
+}
+
+}  // namespace aegis::bench
+
+namespace aegis::bench {
+
+IdleSample sample_gpu_utilization(double seconds, int interval_ms) {
+  IdleSample s;
+  if (nvmlReturn_t r = nvmlInit_v2(); r != NVML_SUCCESS) {
+    s.error = std::string("nvmlInit: ") + nvmlErrorString(r);
+    return s;
+  }
+  nvmlDevice_t dev{};
+  int cuda_dev = 0;
+  char bus[64] = "";
+  nvmlReturn_t r = NVML_ERROR_UNKNOWN;
+  if (cudaGetDevice(&cuda_dev) == cudaSuccess &&
+      cudaDeviceGetPCIBusId(bus, sizeof bus, cuda_dev) == cudaSuccess)
+    r = nvmlDeviceGetHandleByPciBusId_v2(bus, &dev);
+  if (r != NVML_SUCCESS) r = nvmlDeviceGetHandleByIndex_v2(0, &dev);  // single-GPU fallback
+  if (r != NVML_SUCCESS) {
+    s.error = std::string("nvmlDeviceGetHandle: ") + nvmlErrorString(r);
+    nvmlShutdown();
+    return s;
+  }
+  const int n = std::max(1, int(seconds * 1000 / interval_ms));
+  double sum = 0;
+  for (int i = 0; i < n; ++i) {
+    nvmlUtilization_t u{};
+    if (r = nvmlDeviceGetUtilizationRates(dev, &u); r != NVML_SUCCESS) {
+      s.error = std::string("nvmlDeviceGetUtilizationRates: ") + nvmlErrorString(r);
+      nvmlShutdown();
+      return s;
+    }
+    sum += u.gpu;
+    s.max_pct = std::max(s.max_pct, double(u.gpu));
+    ++s.samples;
+    std::this_thread::sleep_for(std::chrono::milliseconds(interval_ms));
+  }
+  s.mean_pct = sum / s.samples;
+  s.ok = true;
+  nvmlShutdown();
+  return s;
+}
+
+IdleSample idle_guard(bool allow_busy, double max_pct) {
+  const IdleSample s = sample_gpu_utilization();
+  if (s.ok)
+    std::fprintf(stderr, "idle guard: GPU utilization mean %.1f%%, max %.0f%% over %d samples (limit %.0f%%)\n",
+                 s.mean_pct, s.max_pct, s.samples, max_pct);
+  else
+    std::fprintf(stderr, "idle guard: cannot read GPU utilization (%s)\n", s.error.c_str());
+  const bool busy = !s.ok || s.mean_pct > max_pct;
+  if (busy && !allow_busy) {
+    std::fprintf(stderr,
+                 "idle guard: refusing to benchmark a busy GPU. Stop other GPU work (remote desktop "
+                 "included; benchmark over SSH) or pass --allow-busy, which marks every row.\n");
+    std::exit(3);
+  }
+  if (busy) std::fprintf(stderr, "idle guard: --allow-busy given; rows are marked allow_busy\n");
   return s;
 }
 

@@ -2,7 +2,7 @@
 //
 //   aegis_tune --shapes shapes/default.txt [--seed S] [--prefix regblock_,mma_,mma_pipe_]
 //              [--reps 20] [--cublas-reps 50] [--warmup 3] [--data-seed 42] [--protocol 2]
-//              [--warm-top 2]
+//              [--warm-top 2] [--allow-busy]
 //
 // For each shape (from a file, "M N K" per line, # comments) it allocates the
 // problem once, then runs cuBLAS and every registered config whose name starts
@@ -15,8 +15,12 @@
 // (recorded for winners, not used to rank). Configs failing the check are
 // not timed and not emitted; they are listed on stderr.
 //
+// Idle guard: before anything else, GPU utilization is sampled for 2 s (NVML);
+// above 2% the tuner refuses to start unless --allow-busy is given.
+//
 // stdout: one JSON row per timed config, bench_gemm's schema plus
-//   ,"tune":{"seed":S,"shape_seed":s,"order":i}
+//   ,"idle_util_pct":U,"allow_busy":B,"tune":{"seed":S,"shape_seed":s,"order":i}
+// (allow_busy is true when the guard found the GPU busy and --allow-busy let it run).
 // One CUDA context, one stream, one cuBLAS handle for the whole run.
 #include <algorithm>
 #include <chrono>
@@ -42,6 +46,7 @@ struct Args {
   unsigned data_seed = 42;
   int protocol = 2;
   int warm_top = 2;  // warm rows for cuBLAS and the N fastest cold configs per shape
+  bool allow_busy = false;
 };
 
 std::vector<std::string> split(const std::string& s, char sep) {
@@ -69,6 +74,7 @@ Args parse(int argc, char** argv) {
     else if (k == "--data-seed") a.data_seed = static_cast<unsigned>(std::stoul(next()));
     else if (k == "--protocol") a.protocol = std::stoi(next());
     else if (k == "--warm-top") a.warm_top = std::stoi(next());
+    else if (k == "--allow-busy") a.allow_busy = true;
     else { std::fprintf(stderr, "unknown arg %s\n", k.c_str()); std::exit(2); }
   }
   if (a.shapes.empty()) { std::fprintf(stderr, "--shapes FILE is required\n"); std::exit(2); }
@@ -106,6 +112,12 @@ std::vector<Shape> read_shapes(const std::string& path) {
 int main(int argc, char** argv) {
   const Args a = parse(argc, argv);
   const std::vector<Shape> shapes = read_shapes(a.shapes);
+  const aegis::bench::IdleSample idle = aegis::bench::idle_guard(a.allow_busy);
+  const bool busy = !idle.ok || idle.mean_pct > aegis::bench::kIdleMaxPct;
+  char util[32] = "null";
+  if (idle.ok) std::snprintf(util, sizeof util, "%.1f", idle.mean_pct);
+  const std::string idle_json =
+      std::string(",\"idle_util_pct\":") + util + ",\"allow_busy\":" + (busy ? "true" : "false");
 
   // Candidates: nullptr = cuBLAS (the reference row), then matching configs.
   std::vector<const aegis::gemm::KernelEntry*> candidates = {nullptr};
@@ -141,7 +153,7 @@ int main(int argc, char** argv) {
       opt.warmup = a.warmup;
       opt.reps = d.e ? a.reps : a.cublas_reps;
       const aegis::bench::Timing t = h.time(d.e, p, opt);
-      const std::string extra = ",\"tune\":{\"seed\":" + std::to_string(a.seed) +
+      const std::string extra = idle_json + ",\"tune\":{\"seed\":" + std::to_string(a.seed) +
                                 ",\"shape_seed\":" + std::to_string(shape_seed) +
                                 ",\"order\":" + std::to_string(d.order) + "}";
       std::printf("%s\n", h.json_row(name, d.e, p, d.c, t, extra).c_str());

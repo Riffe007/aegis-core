@@ -147,6 +147,13 @@ only to compare with old rows (`--protocol 1`).
 - **Timer.** The event timer's resolution is measured at startup (32 ns on
   GB10). v1 rows are quantized to 2.048 us steps by the memset in front of each
   start event; do not rank shapes under ~50 us on v1 rows.
+- **Benchmark over SSH, remote desktop off.** A remote-desktop session
+  (gnome-remote-desktop) encodes video on the GPU and shares L2 and DRAM with
+  the benchmark; disconnect it before a sweep, tune or microbench run.
+- **Idle guard.** `aegis-perf sweep` and `tune` (and `aegis_tune`) sample NVML
+  GPU utilization for 2 s first and refuse to start above 2% mean.
+  `--allow-busy` overrides and marks every row (`allow_busy`, `idle_util_pct`);
+  marked rows are not evidence for a performance claim.
 
 ## Architecture notes you must respect
 

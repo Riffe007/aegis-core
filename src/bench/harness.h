@@ -170,6 +170,22 @@ class Harness {
   TimerResolution timer_{};
 };
 
+// GPU utilization over a sampling period, from NVML (device matched to the
+// current CUDA device by PCI bus id).
+struct IdleSample {
+  bool ok = false;     // NVML answered; if false, `error` says why
+  double mean_pct = 0, max_pct = 0;
+  int samples = 0;
+  std::string error;
+};
+IdleSample sample_gpu_utilization(double seconds = 2.0, int interval_ms = 100);
+
+// Idle guard, run before any sweep or tune: samples utilization for 2 s and
+// exits the process (status 3) if the mean is above `max_pct` (or NVML cannot
+// tell) unless allow_busy. Returns the sample; logs it on stderr.
+inline constexpr double kIdleMaxPct = 2.0;
+IdleSample idle_guard(bool allow_busy, double max_pct = kIdleMaxPct);
+
 // Event pairs around `samples` spin kernels of increasing length. Aborts on error.
 TimerResolution measure_timer_resolution(cudaStream_t stream, int samples = 1000);
 

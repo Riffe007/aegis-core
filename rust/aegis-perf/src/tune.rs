@@ -23,6 +23,7 @@ pub struct TuneArgs<'a> {
     pub shapes: &'a Path,
     pub seed: Option<u64>,
     pub prefix: Option<String>,
+    pub allow_busy: bool,
 }
 
 pub fn cmd_tune(a: &TuneArgs) -> Result<()> {
@@ -47,6 +48,9 @@ pub fn cmd_tune(a: &TuneArgs) -> Result<()> {
     }
     if let Some(p) = &a.prefix {
         cmd.args(["--prefix", p]);
+    }
+    if a.allow_busy {
+        cmd.arg("--allow-busy");
     }
     let t0 = Instant::now();
     let out = cmd

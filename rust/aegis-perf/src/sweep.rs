@@ -29,7 +29,7 @@ pub fn quick_shapes() -> Vec<(i64, i64, i64)> {
     vec![(512, 512, 512), (1, 896, 896), (1024, 1024, 1024)]
 }
 
-/// Reps: cuBLAS 50; naive 5 reps and skipped above 2*2048^3
+/// Reps (timed windows under protocol v2): cuBLAS 50; naive 5 and skipped above 2*2048^3
 /// FLOPs; every other registered impl 20 reps.
 pub struct Spec {
     pub reps: u32,
@@ -55,12 +55,41 @@ pub fn default_impls(bench: &Path) -> Result<Vec<String>> {
     Ok(impls)
 }
 
-fn run_one(bench: &Path, impl_: &str, m: i64, n: i64, k: i64, reps: u32) -> Result<Option<(Value, String)>> {
-    let p = Command::new(bench)
-        .args(["--impl", impl_, "--m", &m.to_string(), "--n", &n.to_string(), "--k", &k.to_string(),
-               "--reps", &reps.to_string(), "--warmup", "3", "--check"])
-        .output()
-        .context("run bench_gemm")?;
+/// The idle guard (bench_gemm --idle-check): Ok(None) when idle, Ok(Some(mean %))
+/// when busy and allowed, Err when busy and not allowed.
+pub fn idle_guard(bench: &Path, allow_busy: bool) -> Result<Option<f64>> {
+    let mut cmd = Command::new(bench);
+    cmd.arg("--idle-check");
+    if allow_busy {
+        cmd.arg("--allow-busy");
+    }
+    let out = cmd.stderr(std::process::Stdio::inherit()).output().context("run bench_gemm --idle-check")?;
+    if !out.status.success() {
+        bail!("idle guard refused to start (GPU busy); stop other GPU work or pass --allow-busy");
+    }
+    let v: Value = serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim())?;
+    let mean = v["mean_pct"].as_f64().unwrap_or(f64::NAN);
+    let busy = v["ok"].as_bool() != Some(true) || mean > IDLE_MAX_PCT;
+    Ok(busy.then_some(mean))
+}
+
+/// Mean GPU utilization (%) above which the idle guard refuses (src/bench/harness.h kIdleMaxPct).
+pub const IDLE_MAX_PCT: f64 = 2.0;
+
+fn run_one(
+    bench: &Path,
+    impl_: &str,
+    (m, n, k): (i64, i64, i64),
+    reps: u32,
+    busy: Option<f64>,
+) -> Result<Option<(Value, String)>> {
+    let mut cmd = Command::new(bench);
+    cmd.args(["--impl", impl_, "--m", &m.to_string(), "--n", &n.to_string(), "--k", &k.to_string(),
+              "--reps", &reps.to_string(), "--warmup", "3", "--check"]);
+    if let Some(u) = busy {
+        cmd.args(["--allow-busy", "--idle-util-pct", &format!("{u:.1}")]);
+    }
+    let p = cmd.output().context("run bench_gemm")?;
     let stdout = String::from_utf8_lossy(&p.stdout);
     let Some(line) = stdout.trim().lines().last().filter(|l| !l.is_empty()) else {
         eprintln!("  ! {impl_} {m}x{n}x{k}: no output\n{}", String::from_utf8_lossy(&p.stderr));
@@ -76,7 +105,14 @@ fn run_one(bench: &Path, impl_: &str, m: i64, n: i64, k: i64, reps: u32) -> Resu
     Ok(Some((row, line.to_string())))
 }
 
-pub fn cmd_sweep(db: &Path, build: &Path, results: &Path, impls: Option<Vec<String>>, quick: bool) -> Result<()> {
+pub fn cmd_sweep(
+    db: &Path,
+    build: &Path,
+    results: &Path,
+    impls: Option<Vec<String>>,
+    quick: bool,
+    allow_busy: bool,
+) -> Result<()> {
     let bench = build.join("bench_gemm");
     if !bench.exists() {
         bail!("{} not found; run cmake --build build first", bench.display());
@@ -101,6 +137,7 @@ pub fn cmd_sweep(db: &Path, build: &Path, results: &Path, impls: Option<Vec<Stri
         None => registered,
     };
 
+    let busy = idle_guard(&bench, allow_busy)?;
     let shapes = if quick { quick_shapes() } else { [square_shapes(), qwen_shapes()].concat() };
     let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
     let out = results.join(format!("{host}-{stamp}.jsonl"));
@@ -112,7 +149,7 @@ pub fn cmd_sweep(db: &Path, build: &Path, results: &Path, impls: Option<Vec<Stri
             if s.max_flops.is_some_and(|cap| 2 * m * n * k > cap) {
                 continue;
             }
-            if let Some((row, line)) = run_one(&bench, impl_, m, n, k, s.reps)? {
+            if let Some((row, line)) = run_one(&bench, impl_, (m, n, k), s.reps, busy)? {
                 writeln!(f, "{line}")?;
                 if row["pass"].as_bool() != Some(true) {
                     failures += 1;
