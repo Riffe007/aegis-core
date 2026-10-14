@@ -81,8 +81,9 @@ artifacts/          SASS dumps per arch, microbench SASS proofs (gitignored)
 2. **Every kernel passes `--check` against cuBLAS before it is benchmarked.**
    Tolerance: max_abs_err / max|ref| <= 4e-3 (about 4 FP16 ulps). Odd shapes
    (non-multiples of the tile) must pass too; add them to `tests` in CMakeLists.
-3. **The baseline is cuBLAS, not naive.** Report results as % of cuBLAS on the
-   same shape and device.
+3. **The baseline is cuBLAS, not naive.** Report results as % of
+   `cublaslt_best` (protocol v2; % of plain `cublas` alongside) on the same
+   shape, device and cache mode.
 4. **One impl per file, registered in one place.** Every launchable impl is an
    entry in `aegis::gemm::registry()` (`src/gemm/registry.cu`); `bench_gemm`
    dispatches through it and `bench_gemm --list` prints it. A templated tier
@@ -154,6 +155,11 @@ only to compare with old rows (`--protocol 1`).
   GPU utilization for 2 s first and refuse to start above 2% mean.
   `--allow-busy` overrides and marks every row (`allow_busy`, `idle_util_pct`);
   marked rows are not evidence for a performance claim.
+- **Baselines.** `cublas` (cublasGemmEx, default algorithm) and
+  `cublaslt_best`: up to 8 cuBLASLt heuristic algorithms, each checked against
+  cuBLAS and timed under the same protocol; the fastest passing one is the row
+  (which algorithm: the row's `lt` field). v2 reports and winners quote %
+  of `cublaslt_best`; `pct_of_cublas` stays alongside.
 
 ## Architecture notes you must respect
 

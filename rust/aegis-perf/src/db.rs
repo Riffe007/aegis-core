@@ -47,14 +47,15 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("measurements", "idle_util_pct", "REAL"),
     ("winners", "protocol_version", "INTEGER NOT NULL DEFAULT 1"),
     ("winners", "warm_median_us", "REAL"),
+    ("winners", "pct_of_cublaslt_best", "REAL"),
 ];
 
 /// Reference implementations: always eligible (they are what --check compares
 /// against), never winners.
-const BASELINES: &str = "'cublas'";
+const BASELINES: &str = "'cublas', 'cublaslt_best'";
 
 pub fn is_baseline(impl_: &str) -> bool {
-    impl_ == "cublas"
+    impl_ == "cublas" || impl_ == "cublaslt_best"
 }
 
 /// Which measurements a winners / report query reads.
@@ -480,6 +481,7 @@ pub fn cmd_winners(db: &Path, arch: Option<i64>) -> Result<()> {
     for (key, rs) in &groups {
         let (arch, op, dtype, m, nn, k) = key;
         let cublas = rs.iter().find(|r| r.impl_ == "cublas");
+        let lt_best = rs.iter().find(|r| r.impl_ == "cublaslt_best");
         let ours: Vec<&Latest> = rs.iter().copied().filter(|r| !is_baseline(&r.impl_)).collect();
         let tie = tie_set(&ours);
         let Some(&fastest) = tie.first() else { continue };
@@ -512,14 +514,15 @@ pub fn cmd_winners(db: &Path, arch: Option<i64>) -> Result<()> {
             (pick, format!("tie-break: {by}"))
         };
         let pct = cublas.map(|c| c.median_us / pick.median_us * 100.0);
+        let pct_lt = lt_best.map(|c| c.median_us / pick.median_us * 100.0);
         let set_json = serde_json::to_string(&tie.iter().map(|r| r.impl_.as_str()).collect::<Vec<_>>())?;
         con.execute(
             "INSERT OR REPLACE INTO winners (sm_arch, op, dtype, shape_bucket, kernel_id, run_id, median_us, \
-             pct_of_cublas, tied, tie_set, pick_reason, protocol_version, warm_median_us) \
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+             pct_of_cublas, tied, tie_set, pick_reason, protocol_version, warm_median_us, pct_of_cublaslt_best) \
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             params![arch, op, dtype, shape_bucket(*m, *nn, *k), pick.kernel_id, pick.run_id, pick.median_us, pct,
                     (tie.len() > 1) as i64, set_json, reason, sel.protocol,
-                    warm_of(&pick.kernel_id, (*arch, dtype.as_str(), *m, *nn, *k))?],
+                    warm_of(&pick.kernel_id, (*arch, dtype.as_str(), *m, *nn, *k))?, pct_lt],
         )?;
         n += 1;
     }
@@ -531,20 +534,27 @@ pub fn cmd_winners(db: &Path, arch: Option<i64>) -> Result<()> {
 }
 
 /// The report text (format unchanged since the Python perfdb).
-pub fn report_text(con: &Connection, arch: Option<i64>, sel: &Selection) -> Result<String> {
+/// The baseline a report's % cells divide by: cublaslt_best for protocol v2
+/// rows (v1 runs never measured it), cuBLAS for v1.
+pub fn default_baseline(sel: &Selection) -> &'static str {
+    if sel.protocol >= 2 { "cublaslt_best" } else { "cublas" }
+}
+
+pub fn report_text(con: &Connection, arch: Option<i64>, sel: &Selection, baseline: &str) -> Result<String> {
     let rows = latest_per_kernel_shape(con, arch, sel)?;
     // table[(arch, m, n, k)][impl] = row; later rows overwrite (Python dict).
     let mut table: HashMap<(i64, i64, i64, i64), HashMap<String, &Latest>> = HashMap::new();
     for r in &rows {
         table.entry((r.sm_arch, r.m, r.n, r.k)).or_default().insert(r.impl_.clone(), r);
     }
-    let mut impls: Vec<String> = rows.iter().filter(|r| r.impl_ != "cublas").map(|r| r.impl_.clone()).collect();
+    let mut impls: Vec<String> = rows.iter().filter(|r| r.impl_ != baseline).map(|r| r.impl_.clone()).collect();
     impls.sort();
     impls.dedup();
     let widths: Vec<usize> = impls.iter().map(|i| i.len().max(11)).collect();
 
     let mut out = String::new();
-    let mut hdr = format!("{:>5} {:>6} {:>6} {:>6} {:>10} {:>7} ", "arch", "M", "N", "K", "cuBLAS us", "TFLOPS");
+    let base_label = if baseline == "cublas" { "cuBLAS us" } else { "base us" };
+    let mut hdr = format!("{:>5} {:>6} {:>6} {:>6} {:>10} {:>7} ", "arch", "M", "N", "K", base_label, "TFLOPS");
     hdr += &impls.iter().zip(&widths).map(|(i, w)| format!("{i:>w$}")).collect::<Vec<_>>().join(" ");
     writeln!(out, "{hdr}")?;
     writeln!(out, "{}", "-".repeat(hdr.chars().count()))?;
@@ -552,7 +562,7 @@ pub fn report_text(con: &Connection, arch: Option<i64>, sel: &Selection) -> Resu
     keys.sort();
     for key in keys {
         let byimpl = &table[&key];
-        let cb = byimpl.get("cublas");
+        let cb = byimpl.get(baseline);
         let cells: Vec<String> = impls
             .iter()
             .zip(&widths)
@@ -569,16 +579,20 @@ pub fn report_text(con: &Connection, arch: Option<i64>, sel: &Selection) -> Resu
         let (a, m, n, k) = key;
         writeln!(out, "{a:>5} {m:>6} {n:>6} {k:>6} {cbs} {}", cells.join(" "))?;
     }
-    writeln!(out, "\nCells are % of cuBLAS speed (100% = parity, >100% = faster than cuBLAS).")?;
+    if baseline == "cublas" {
+        writeln!(out, "\nCells are % of cuBLAS speed (100% = parity, >100% = faster than cuBLAS).")?;
+    } else {
+        writeln!(out, "\nCells are % of {baseline} speed (100% = parity, >100% = faster); base us is its median.")?;
+    }
     let cache = if sel.protocol >= 2 { format!(", cache_mode={}", sel.cache) } else { String::new() };
     let busy = if sel.include_busy { "including" } else { "excluding" };
     writeln!(out, "Rows: timing protocol v{}{cache}, {busy} --allow-busy rows.", sel.protocol)?;
     Ok(out)
 }
 
-pub fn cmd_report(db: &Path, arch: Option<i64>, sel: &Selection) -> Result<()> {
+pub fn cmd_report(db: &Path, arch: Option<i64>, sel: &Selection, baseline: Option<&str>) -> Result<()> {
     let con = connect(db)?;
-    print!("{}", report_text(&con, arch, sel)?);
+    print!("{}", report_text(&con, arch, sel, baseline.unwrap_or(default_baseline(sel)))?);
     Ok(())
 }
 

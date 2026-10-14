@@ -145,6 +145,9 @@ Harness::Harness() {
   constexpr size_t kCublasWorkspace = size_t(32) << 20;
   AEGIS_CUDA_CHECK(cudaMalloc(&cublas_ws_, kCublasWorkspace));
   AEGIS_CUBLAS_CHECK(cublasSetWorkspace(cublas_, cublas_ws_, kCublasWorkspace));
+  AEGIS_CUBLAS_CHECK(cublasLtCreate(&lt_));
+  lt_ws_bytes_ = kCublasWorkspace;
+  AEGIS_CUDA_CHECK(cudaMalloc(&lt_ws_, lt_ws_bytes_));
   // L2 flush buffer: 2x L2 so nothing from the previous rep survives.
   flush_bytes_ = std::max<size_t>(size_t(prop_.l2CacheSize) * 2, 1 << 20);
   AEGIS_CUDA_CHECK(cudaMalloc(&flush_, flush_bytes_));
@@ -155,16 +158,27 @@ Harness::~Harness() {
   cudaFree(flush_);
   cublasDestroy(cublas_);
   cudaFree(cublas_ws_);
+  cudaFree(lt_ws_);
+  cublasLtDestroy(lt_);
   cudaStreamDestroy(stream_);
 }
 
-void Harness::launch(const gemm::KernelEntry* e, Problem& p, int set) {
+void Harness::launch(const Impl& e, Problem& p, int set) {
   const BufferSet s = p.set(set);
-  if (e) AEGIS_CUDA_CHECK(e->launch(s.A, s.B, s.C, p.M, p.N, p.K, stream_));
-  else cublas_gemm(cublas_, s.A, s.B, s.C, p.M, p.N, p.K);
+  if (e.e) {
+    AEGIS_CUDA_CHECK(e.e->launch(s.A, s.B, s.C, p.M, p.N, p.K, stream_));
+  } else if (e.plan) {
+    const LtPlan& lp = *e.plan;
+    const LtAlgo& al = lp.algos[size_t(e.lt)];
+    const float alpha = 1.f, beta = 0.f;
+    AEGIS_CUBLAS_CHECK(cublasLtMatmul(lt_, lp.op, &alpha, s.B, lp.a, s.A, lp.b, &beta, s.C, lp.c, s.C,
+                                      lp.c, &al.algo, lt_ws_, al.workspace, stream_));
+  } else {
+    cublas_gemm(cublas_, s.A, s.B, s.C, p.M, p.N, p.K);
+  }
 }
 
-void Harness::run_once(const gemm::KernelEntry* e, Problem& p) {
+void Harness::run_once(const Impl& e, Problem& p) {
   launch(e, p);
   AEGIS_CUDA_CHECK(cudaStreamSynchronize(stream_));
 }
@@ -191,7 +205,7 @@ Check Harness::check(Problem& p) {
   return c;
 }
 
-Timing Harness::time(const gemm::KernelEntry* e, Problem& p, const TimingOptions& o) {
+Timing Harness::time(const Impl& e, Problem& p, const TimingOptions& o) {
   if (o.protocol == 1) return time_v1(e, p, o);
   if (o.protocol == 2) return time_v2(e, p, o);
   std::fprintf(stderr, "unknown timing protocol %d\n", o.protocol);
@@ -202,7 +216,7 @@ void Harness::flush_l2(int value) {
   AEGIS_CUDA_CHECK(cudaMemsetAsync(flush_, value & 0xff, flush_bytes_, stream_));
 }
 
-Timing Harness::time_v1(const gemm::KernelEntry* e, Problem& p, const TimingOptions& o) {
+Timing Harness::time_v1(const Impl& e, Problem& p, const TimingOptions& o) {
   const int reps = o.reps;
   for (int i = 0; i < o.warmup; ++i) launch(e, p);
   std::vector<cudaEvent_t> starts(reps), stops(reps);
@@ -237,7 +251,7 @@ int Harness::cold_sets(const Problem& p) const {
   return std::max(2, int(std::ceil(l2x3 / double(p.footprint_bytes()))));
 }
 
-cudaGraphExec_t Harness::capture(const gemm::KernelEntry* e, Problem& p, long long n, int sets) {
+cudaGraphExec_t Harness::capture(const Impl& e, Problem& p, long long n, int sets) {
   cudaGraph_t graph = nullptr;
   AEGIS_CUDA_CHECK(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeThreadLocal));
   for (long long i = 0; i < n; ++i) launch(e, p, int(i % sets));
@@ -265,7 +279,7 @@ float Harness::timed_window(cudaGraphExec_t g, bool flush) {
   return ms;
 }
 
-Timing Harness::time_v2(const gemm::KernelEntry* e, Problem& p, const TimingOptions& o) {
+Timing Harness::time_v2(const Impl& e, Problem& p, const TimingOptions& o) {
   const double target_ms =
       std::max(o.min_window_ms, o.min_window_ticks * timer_.tick_ns * 1e-6);
   // Cache state. cold: launch i uses buffer set i mod K, with K sets covering
@@ -335,7 +349,7 @@ Timing Harness::time_v2(const gemm::KernelEntry* e, Problem& p, const TimingOpti
   return t;
 }
 
-std::string Harness::json_row(const char* impl, const gemm::KernelEntry* e, const Problem& p,
+std::string Harness::json_row(const char* impl, const Impl& impl_e, const Problem& p,
                               const Check& c, const Timing& t, const std::string& extra) const {
   const int M = p.M, N = p.N, K = p.K;
   const double flops = 2.0 * M * N * K;
@@ -343,7 +357,12 @@ std::string Harness::json_row(const char* impl, const gemm::KernelEntry* e, cons
   const double bytes = sizeof(__half) * (double(M) * K + double(K) * N + double(M) * N);
   const double tflops = flops / (t.median_us * 1e-6) / 1e12;
   const double gbps = bytes / (t.median_us * 1e-6) / 1e9;
-  const char* config = e ? e->config : R"({"algo":"CUBLAS_GEMM_DEFAULT"})";
+  const gemm::KernelEntry* e = impl_e.e;
+  // Baseline configs are constant, so their kernel ids are stable across shapes;
+  // the cuBLASLt algorithm actually picked goes into the row's "lt" field.
+  const char* config = e ? e->config
+                       : impl_e.plan ? R"({"algo":"cublasLt heuristic, fastest passing of top 8"})"
+                                     : R"({"algo":"CUBLAS_GEMM_DEFAULT"})";
   cudaFuncAttributes attrs{};
   if (e) AEGIS_CUDA_CHECK(e->attrs(&attrs));
   auto print = [&](char* buf, size_t n) {
@@ -430,6 +449,83 @@ IdleSample idle_guard(bool allow_busy, double max_pct) {
   }
   if (busy) std::fprintf(stderr, "idle guard: --allow-busy given; rows are marked allow_busy\n");
   return s;
+}
+
+}  // namespace aegis::bench
+
+namespace aegis::bench {
+
+LtPlan::LtPlan(cublasLtHandle_t lt, int M, int N, int K, size_t max_workspace, int max_algos) {
+  // Column-major view of row-major C = A*B: C^T (N x M) = B^T (N x K) * A^T (K x M).
+  AEGIS_CUBLAS_CHECK(cublasLtMatmulDescCreate(&op, CUBLAS_COMPUTE_32F, CUDA_R_32F));
+  AEGIS_CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&a, CUDA_R_16F, N, K, N));
+  AEGIS_CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&b, CUDA_R_16F, K, M, K));
+  AEGIS_CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&c, CUDA_R_16F, N, M, N));
+  cublasLtMatmulPreference_t pref = nullptr;
+  AEGIS_CUBLAS_CHECK(cublasLtMatmulPreferenceCreate(&pref));
+  AEGIS_CUBLAS_CHECK(cublasLtMatmulPreferenceSetAttribute(
+      pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &max_workspace, sizeof max_workspace));
+  cublasLtMatmulHeuristicResult_t res[kLtMaxAlgos] = {};
+  max_algos = std::min(max_algos, kLtMaxAlgos);
+  int returned = 0;
+  AEGIS_CUBLAS_CHECK(cublasLtMatmulAlgoGetHeuristic(lt, op, a, b, c, c, pref, max_algos, res,
+                                                    &returned));
+  cublasLtMatmulPreferenceDestroy(pref);
+  for (int i = 0; i < returned; ++i) {
+    if (res[i].state != CUBLAS_STATUS_SUCCESS) continue;
+    LtAlgo al;
+    al.algo = res[i].algo;
+    al.workspace = res[i].workspaceSize;
+    al.rank = i;
+    size_t written = 0;
+    cublasLtMatmulAlgoConfigGetAttribute(&al.algo, CUBLASLT_ALGO_CONFIG_ID, &al.id, sizeof al.id, &written);
+    cublasLtMatmulAlgoConfigGetAttribute(&al.algo, CUBLASLT_ALGO_CONFIG_TILE_ID, &al.tile, sizeof al.tile,
+                                         &written);
+    cublasLtMatmulAlgoConfigGetAttribute(&al.algo, CUBLASLT_ALGO_CONFIG_STAGES_ID, &al.stages,
+                                         sizeof al.stages, &written);
+    cublasLtMatmulAlgoConfigGetAttribute(&al.algo, CUBLASLT_ALGO_CONFIG_SPLITK_NUM, &al.splitk,
+                                         sizeof al.splitk, &written);
+    algos.push_back(al);
+  }
+}
+
+LtPlan::~LtPlan() {
+  cublasLtMatrixLayoutDestroy(c);
+  cublasLtMatrixLayoutDestroy(b);
+  cublasLtMatrixLayoutDestroy(a);
+  cublasLtMatmulDescDestroy(op);
+}
+
+LtBest Harness::cublaslt_best(Problem& p, const TimingOptions& o) {
+  LtBest r;
+  r.plan = std::make_unique<LtPlan>(lt_, p.M, p.N, p.K, lt_ws_bytes_, kLtMaxAlgos);
+  r.candidates = int(r.plan->algos.size());
+  for (int i = 0; i < r.candidates; ++i) {
+    const Impl impl(r.plan.get(), i);
+    run_once(impl, p);
+    const Check c = check(p);
+    if (!c.pass) continue;  // never a baseline that fails the tolerance
+    ++r.passed;
+    const Timing t = time(impl, p, o);
+    if (r.best < 0 || t.median_us < r.timing.median_us) {
+      r.best = i;
+      r.check = c;
+      r.timing = t;
+    }
+  }
+  if (r.best >= 0) run_once(r.impl(), p);  // p.C holds the reported algorithm's result
+  return r;
+}
+
+std::string Harness::lt_json(const LtBest& b) {
+  if (b.best < 0) return "";
+  const LtAlgo& al = b.plan->algos[size_t(b.best)];
+  char buf[256];
+  std::snprintf(buf, sizeof buf,
+                ",\"lt\":{\"heuristic_rank\":%d,\"algo_id\":%d,\"tile_id\":%d,\"stages_id\":%d,"
+                "\"splitk\":%d,\"workspace\":%zu,\"candidates\":%d,\"passed\":%d}",
+                al.rank, al.id, al.tile, al.stages, al.splitk, al.workspace, b.candidates, b.passed);
+  return buf;
 }
 
 }  // namespace aegis::bench

@@ -2,6 +2,7 @@
 //
 //   bench_gemm --impl tiled --m 4096 --n 4096 --k 4096 [--reps 20] [--warmup 3]
 //              [--protocol 2] [--cache cold|warm] [--check] [--seed 42]
+//   bench_gemm --impl cublaslt_best ...  fastest passing cuBLASLt heuristic algorithm (of 8)
 //   bench_gemm --list                  registered impls as JSON lines
 //   bench_gemm --idle-check [--allow-busy]   the idle guard alone (aegis-perf sweep
 //                                      runs it once before the sweep); exit 3 = busy
@@ -87,21 +88,19 @@ int main(int argc, char** argv) {
   }
   // Resolved once, before timing, so lookup cost never lands in a timed rep.
   const aegis::gemm::KernelEntry* entry = aegis::gemm::find(a.impl);
-  if (!entry && a.impl != "cublas") {
+  const bool lt_best = a.impl == aegis::bench::kLtBestImpl;
+  if (!entry && a.impl != "cublas" && !lt_best) {
     std::fprintf(stderr, "unknown impl '%s'\n", a.impl.c_str());
     return 2;
   }
 
   aegis::bench::Harness h;
   aegis::bench::Problem p(a.M, a.N, a.K, a.seed);
-  h.run_once(entry, p);
-  const aegis::bench::Check c = a.check ? h.check(p) : aegis::bench::Check{};
   aegis::bench::TimingOptions opt;
   opt.protocol = a.protocol;
   opt.cache = a.cache == "warm" ? aegis::bench::CacheMode::Warm : aegis::bench::CacheMode::Cold;
   opt.warmup = a.warmup;
   opt.reps = a.reps;
-  const aegis::bench::Timing t = h.time(entry, p, opt);
   std::string extra;
   if (a.idle_util_pct >= 0) {
     char buf[96];
@@ -109,6 +108,24 @@ int main(int argc, char** argv) {
                   a.allow_busy ? "true" : "false");
     extra = buf;
   }
+
+  // cublaslt_best: every heuristic algorithm is run, checked and timed; the
+  // fastest passing one is the row (always checked).
+  if (lt_best) {
+    const aegis::bench::LtBest b = h.cublaslt_best(p, opt);
+    if (b.best < 0) {
+      std::fprintf(stderr, "FAIL: no cuBLASLt algorithm passed (%d candidates) for %dx%dx%d\n",
+                   b.candidates, a.M, a.N, a.K);
+      return 1;
+    }
+    std::printf("%s\n",
+                h.json_row(a.impl.c_str(), b.impl(), p, b.check, b.timing, extra + h.lt_json(b)).c_str());
+    return 0;
+  }
+
+  h.run_once(entry, p);
+  const aegis::bench::Check c = a.check ? h.check(p) : aegis::bench::Check{};
+  const aegis::bench::Timing t = h.time(entry, p, opt);
   std::printf("%s\n", h.json_row(a.impl.c_str(), entry, p, c, t, extra).c_str());
 
   if (c.checked && !c.pass) {

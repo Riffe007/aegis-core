@@ -5,7 +5,8 @@
 //              [--warm-top 2] [--allow-busy]
 //
 // For each shape (from a file, "M N K" per line, # comments) it allocates the
-// problem once, then runs cuBLAS and every registered config whose name starts
+// problem once, then runs the baselines (cuBLAS; cublaslt_best: the fastest
+// passing of up to 8 cuBLASLt heuristic algorithms) and every registered config whose name starts
 // with one of the prefixes, in an order shuffled per shape (seeded; the seed is
 // logged) so neither ordering nor thermal drift favours a config. Each config
 // gets the bench_gemm protocol (src/bench/harness.h): untimed run, --check
@@ -119,13 +120,14 @@ int main(int argc, char** argv) {
   const std::string idle_json =
       std::string(",\"idle_util_pct\":") + util + ",\"allow_busy\":" + (busy ? "true" : "false");
 
-  // Candidates: nullptr = cuBLAS (the reference row), then matching configs.
-  std::vector<const aegis::gemm::KernelEntry*> candidates = {nullptr};
+  // Candidates: the two baselines (cuBLAS, cublaslt_best), then matching configs.
+  struct Cand { const aegis::gemm::KernelEntry* e; bool lt; };
+  std::vector<Cand> candidates = {{nullptr, false}, {nullptr, true}};
   for (const auto& e : aegis::gemm::registry())
     for (const auto& p : a.prefixes)
-      if (std::string(e.name).rfind(p, 0) == 0) { candidates.push_back(&e); break; }
+      if (std::string(e.name).rfind(p, 0) == 0) { candidates.push_back({&e, false}); break; }
 
-  std::fprintf(stderr, "aegis_tune: seed %llu, %zu shapes x %zu candidates (incl. cuBLAS)\n",
+  std::fprintf(stderr, "aegis_tune: seed %llu, %zu shapes x %zu candidates (incl. cuBLAS, cublaslt_best)\n",
                a.seed, shapes.size(), candidates.size());
   const auto t0 = std::chrono::steady_clock::now();
   aegis::bench::Harness h;
@@ -137,56 +139,75 @@ int main(int argc, char** argv) {
   for (size_t si = 0; si < shapes.size(); ++si) {
     const Shape s = shapes[si];
     const unsigned long long shape_seed = a.seed + si;
-    std::vector<const aegis::gemm::KernelEntry*> order = candidates;
+    std::vector<Cand> order = candidates;
     std::shuffle(order.begin(), order.end(), std::mt19937_64(shape_seed));
     aegis::bench::Problem p(s.M, s.N, s.K, a.data_seed);
+    aegis::bench::LtBest lt;  // this shape's cublaslt_best, reused for its warm row
 
-    // Pass 1, cold (ranks the configs). Pass 2, warm: cuBLAS and the
+    // Pass 1, cold (ranks the configs). Pass 2, warm: the baselines and the
     // --warm-top fastest cold configs (the winner and its tie candidate).
-    struct Done { const aegis::gemm::KernelEntry* e; aegis::bench::Check c; double cold_us; size_t order; };
+    struct Done {
+      const char* name;
+      aegis::bench::Impl impl;
+      bool ours;
+      aegis::bench::Check c;
+      double cold_us;
+      size_t order;
+    };
     std::vector<Done> done;
-    auto measure = [&](const Done& d, aegis::bench::CacheMode cache) {
-      const char* name = d.e ? d.e->name : "cublas";
+    auto options = [&](bool ours, aegis::bench::CacheMode cache) {
       aegis::bench::TimingOptions opt;
       opt.protocol = a.protocol;
       opt.cache = cache;
       opt.warmup = a.warmup;
-      opt.reps = d.e ? a.reps : a.cublas_reps;
-      const aegis::bench::Timing t = h.time(d.e, p, opt);
-      const std::string extra = idle_json + ",\"tune\":{\"seed\":" + std::to_string(a.seed) +
+      opt.reps = ours ? a.reps : a.cublas_reps;
+      return opt;
+    };
+    auto emit = [&](const Done& d, const aegis::bench::Timing& t, aegis::bench::CacheMode cache) {
+      const std::string extra = idle_json + (d.impl.plan ? h.lt_json(lt) : "") +
+                                ",\"tune\":{\"seed\":" + std::to_string(a.seed) +
                                 ",\"shape_seed\":" + std::to_string(shape_seed) +
                                 ",\"order\":" + std::to_string(d.order) + "}";
-      std::printf("%s\n", h.json_row(name, d.e, p, d.c, t, extra).c_str());
+      std::printf("%s\n", h.json_row(d.name, d.impl, p, d.c, t, extra).c_str());
       std::fflush(stdout);
       ++timed;
-      std::fprintf(stderr, "  %-28s %5dx%5dx%5d  %10.2f us  N=%-6lld %s\n", name, s.M, s.N, s.K,
+      std::fprintf(stderr, "  %-28s %5dx%5dx%5d  %10.2f us  N=%-6lld %s\n", d.name, s.M, s.N, s.K,
                    t.median_us, t.batch_n, a.protocol == 1 ? "v1" : aegis::bench::cache_mode_name(cache));
-      return t.median_us;
+    };
+    auto fail = [&](const char* name, double rel_err) {
+      char buf[256];
+      std::snprintf(buf, sizeof buf, "%s %dx%dx%d rel_err=%.3g", name, s.M, s.N, s.K, rel_err);
+      skipped.emplace_back(buf);
+      std::fprintf(stderr, "  SKIP %s (fails --check)\n", buf);
     };
 
     for (size_t oi = 0; oi < order.size(); ++oi) {
-      const aegis::gemm::KernelEntry* e = order[oi];
-      const char* name = e ? e->name : "cublas";
-      h.run_once(e, p);
-      const aegis::bench::Check c = h.check(p);
-      if (!c.pass) {
-        char buf[256];
-        std::snprintf(buf, sizeof buf, "%s %dx%dx%d rel_err=%.3g", name, s.M, s.N, s.K, c.rel_err);
-        skipped.emplace_back(buf);
-        std::fprintf(stderr, "  SKIP %s (fails --check)\n", buf);
+      const Cand cand = order[oi];
+      if (cand.lt) {  // checks and times each heuristic algorithm, keeps the fastest passing one
+        lt = h.cublaslt_best(p, options(false, aegis::bench::CacheMode::Cold));
+        if (lt.best < 0) { fail(aegis::bench::kLtBestImpl, -1); continue; }
+        Done d{aegis::bench::kLtBestImpl, lt.impl(), false, lt.check, lt.timing.median_us, oi};
+        emit(d, lt.timing, aegis::bench::CacheMode::Cold);
+        done.push_back(d);
         continue;
       }
-      Done d{e, c, 0, oi};
-      d.cold_us = measure(d, aegis::bench::CacheMode::Cold);
+      Done d{cand.e ? cand.e->name : "cublas", cand.e, cand.e != nullptr, {}, 0, oi};
+      h.run_once(d.impl, p);
+      d.c = h.check(p);
+      if (!d.c.pass) { fail(d.name, d.c.rel_err); continue; }
+      const aegis::bench::Timing t = h.time(d.impl, p, options(d.ours, aegis::bench::CacheMode::Cold));
+      d.cold_us = t.median_us;
+      emit(d, t, aegis::bench::CacheMode::Cold);
       done.push_back(d);
     }
     if (a.protocol == 2 && a.warm_top > 0) {
-      std::vector<Done> ours;
-      for (const Done& d : done) if (d.e) ours.push_back(d);
-      std::sort(ours.begin(), ours.end(), [](const Done& x, const Done& y) { return x.cold_us < y.cold_us; });
-      ours.resize(std::min(ours.size(), size_t(a.warm_top)));
-      for (const Done& d : done) if (!d.e) ours.insert(ours.begin(), d);  // cuBLAS first
-      for (const Done& d : ours) measure(d, aegis::bench::CacheMode::Warm);
+      std::vector<Done> warm;
+      for (const Done& d : done) if (d.ours) warm.push_back(d);
+      std::sort(warm.begin(), warm.end(), [](const Done& x, const Done& y) { return x.cold_us < y.cold_us; });
+      warm.resize(std::min(warm.size(), size_t(a.warm_top)));
+      for (const Done& d : done) if (!d.ours) warm.insert(warm.begin(), d);  // baselines first
+      for (const Done& d : warm)
+        emit(d, h.time(d.impl, p, options(d.ours, aegis::bench::CacheMode::Warm)), aegis::bench::CacheMode::Warm);
     }
   }
 

@@ -60,6 +60,7 @@ CREATE TABLE IF NOT EXISTS winners (
   pick_reason TEXT,                 -- "fastest", or which tie-break decided
   protocol_version INTEGER NOT NULL DEFAULT 1,  -- of the measurements it was picked from
   warm_median_us REAL,              -- the pick's cache_mode=warm median (v2), if measured
+  pct_of_cublaslt_best REAL,        -- cublaslt_best median / pick median x 100 (v2)
   PRIMARY KEY (sm_arch, op, dtype, shape_bucket)
 );
 CREATE TABLE IF NOT EXISTS microbench (

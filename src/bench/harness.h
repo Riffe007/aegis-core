@@ -36,10 +36,12 @@
 //
 // The harness is benchmark code: it aborts the process on CUDA/cuBLAS errors.
 // The library path (aegis::matmul, the C ABI) never does.
+#include <cublasLt.h>
 #include <cublas_v2.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -119,6 +121,51 @@ struct TimerResolution {
   double min_delta_ns = 0;  // smallest nonzero delta: event spacing, not resolution
 };
 
+// cuBLASLt plan for one shape: the operation, its layouts (row-major C = A*B
+// as column-major C^T = B^T * A^T, like cublas_gemm), and up to `max_algos`
+// heuristic algorithms that fit the workspace.
+struct LtAlgo {
+  cublasLtMatmulAlgo_t algo{};
+  size_t workspace = 0;
+  int rank = 0;  // position in the heuristic's list
+  int id = -1, tile = -1, stages = -1, splitk = -1;
+};
+
+class LtPlan {
+ public:
+  LtPlan(cublasLtHandle_t lt, int M, int N, int K, size_t max_workspace, int max_algos);
+  ~LtPlan();
+  LtPlan(const LtPlan&) = delete;
+  LtPlan& operator=(const LtPlan&) = delete;
+
+  cublasLtMatmulDesc_t op = nullptr;
+  cublasLtMatrixLayout_t a = nullptr, b = nullptr, c = nullptr;
+  std::vector<LtAlgo> algos;
+};
+
+// What a launch runs: a registered kernel, cuBLASLt algorithm `lt` of `plan`,
+// or (neither) cuBLAS.
+struct Impl {
+  const gemm::KernelEntry* e = nullptr;
+  const LtPlan* plan = nullptr;
+  int lt = -1;
+  Impl(const gemm::KernelEntry* k = nullptr) : e(k) {}  // NOLINT: implicit on purpose
+  Impl(const LtPlan* p, int i) : plan(p), lt(i) {}
+};
+
+// The cublaslt_best baseline: every heuristic algorithm is checked against
+// cuBLAS and timed under the same protocol; the fastest passing one is the row.
+inline constexpr const char* kLtBestImpl = "cublaslt_best";
+inline constexpr int kLtMaxAlgos = 8;
+struct LtBest {
+  std::unique_ptr<LtPlan> plan;
+  int best = -1;  // index into plan->algos; -1: no algorithm passed
+  int candidates = 0, passed = 0;
+  Check check;
+  Timing timing;
+  Impl impl() const { return Impl(plan.get(), best); }
+};
+
 // Linear interpolation between order statistics.
 double percentile(std::vector<float> v, double p);
 
@@ -135,27 +182,32 @@ class Harness {
   // cudaEvent timer resolution (measured in the constructor).
   const TimerResolution& timer() const { return timer_; }
 
-  // Launch `e` (nullptr = cuBLAS) on buffer set `set` of p, asynchronously.
+  // Launch `e` on buffer set `set` of p, asynchronously.
   // Aborts on error.
-  void launch(const gemm::KernelEntry* e, Problem& p, int set = 0);
+  void launch(const Impl& e, Problem& p, int set = 0);
   // The untimed run, synchronized.
-  void run_once(const gemm::KernelEntry* e, Problem& p);
+  void run_once(const Impl& e, Problem& p);
   // cuBLAS into p.Ref, compared with p.C (call after run_once).
   Check check(Problem& p);
-  Timing time(const gemm::KernelEntry* e, Problem& p, const TimingOptions& o);
+  Timing time(const Impl& e, Problem& p, const TimingOptions& o);
+  // cublaslt_best on p: run, check and time every heuristic algorithm under
+  // `o`; leaves the best one's result in p.C.
+  LtBest cublaslt_best(Problem& p, const TimingOptions& o);
+  // ,"lt":{...}: which algorithm cublaslt_best picked, for the row's extra.
+  static std::string lt_json(const LtBest& b);
 
   // One JSON row (no trailing newline). `extra` (e.g. ,"k":v) is appended
   // inside the object after the standard fields; bench_gemm passes "".
-  std::string json_row(const char* impl, const gemm::KernelEntry* e, const Problem& p,
+  std::string json_row(const char* impl, const Impl& e, const Problem& p,
                        const Check& c, const Timing& t, const std::string& extra = "") const;
 
  private:
-  Timing time_v1(const gemm::KernelEntry* e, Problem& p, const TimingOptions& o);
-  Timing time_v2(const gemm::KernelEntry* e, Problem& p, const TimingOptions& o);
+  Timing time_v1(const Impl& e, Problem& p, const TimingOptions& o);
+  Timing time_v2(const Impl& e, Problem& p, const TimingOptions& o);
 
   int cold_sets(const Problem& p) const;
   // N launches (launch i on set i mod `sets`) captured into one instantiated graph.
-  cudaGraphExec_t capture(const gemm::KernelEntry* e, Problem& p, long long n, int sets);
+  cudaGraphExec_t capture(const Impl& e, Problem& p, long long n, int sets);
   // Optionally flush L2, then one timed replay of `g`, synchronized; ms.
   float timed_window(cudaGraphExec_t g, bool flush);
   void flush_l2(int value);
@@ -165,6 +217,9 @@ class Harness {
   cudaStream_t stream_ = nullptr;
   cublasHandle_t cublas_ = nullptr;
   void* cublas_ws_ = nullptr;  // explicit workspace: no allocation during graph capture
+  cublasLtHandle_t lt_ = nullptr;
+  void* lt_ws_ = nullptr;
+  size_t lt_ws_bytes_ = 0;
   void* flush_ = nullptr;
   size_t flush_bytes_ = 0;
   TimerResolution timer_{};

@@ -46,7 +46,7 @@ target_link_libraries(aegis PUBLIC aegis_kernels CUDA::cudart CUDA::cublas)
 # The timing protocol (src/bench/harness.h), shared by bench_gemm and aegis_tune.
 add_library(aegis_bench_harness STATIC src/bench/harness.cu)
 target_include_directories(aegis_bench_harness PUBLIC src)
-target_link_libraries(aegis_bench_harness PUBLIC aegis_kernels CUDA::cudart CUDA::cublas
+target_link_libraries(aegis_bench_harness PUBLIC aegis_kernels CUDA::cudart CUDA::cublas CUDA::cublasLt
                                            PRIVATE CUDA::nvml)
 
 add_executable(bench_gemm bench/bench_gemm.cu)

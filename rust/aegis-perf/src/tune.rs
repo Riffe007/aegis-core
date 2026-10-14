@@ -89,8 +89,8 @@ pub fn run_table(jsonl: &str) -> Result<String> {
     let med = |r: &Value| r["median_us"].as_f64().unwrap_or(f64::INFINITY);
     let mut out = String::new();
     let hdr = format!(
-        "{:>5} {:>5} {:>5}  {:<30} {:>9}  {:<30} {:>6}  {:>9}",
-        "M", "N", "K", "winner", "% cuBLAS", "runner-up", "gap", "warm %"
+        "{:>5} {:>5} {:>5}  {:<30} {:>9} {:>9}  {:<30} {:>6}  {:>9}",
+        "M", "N", "K", "winner", "% cuBLAS", "% LtBest", "runner-up", "gap", "warm %"
     );
     writeln!(out, "{hdr}")?;
     writeln!(out, "{}", "-".repeat(hdr.len()))?;
@@ -99,12 +99,18 @@ pub fn run_table(jsonl: &str) -> Result<String> {
         let is_warm = |r: &&Value| r["cache_mode"] == "warm";
         let (warm, rs): (Vec<&Value>, Vec<&Value>) = rows[&key].iter().partition(is_warm);
         let cb = rs.iter().copied().find(|r| r["impl"] == "cublas");
-        let mut ok: Vec<&Value> = rs.iter().copied().filter(|r| r["impl"] != "cublas" && r["pass"] == true).collect();
+        let lt = rs.iter().copied().find(|r| r["impl"] == "cublaslt_best");
+        let is_base = |r: &Value| r["impl"] == "cublas" || r["impl"] == "cublaslt_best";
+        let mut ok: Vec<&Value> = rs.iter().copied().filter(|r| !is_base(r) && r["pass"] == true).collect();
         ok.sort_by(|a, b| med(a).total_cmp(&med(b)));
         let (m, n, k) = key;
         let Some(w) = ok.first() else {
             writeln!(out, "{m:>5} {n:>5} {k:>5}  {:<30}", "(no passing config)")?;
             continue;
+        };
+        let pct_lt = match lt {
+            Some(c) => format!("{:8.1}%", med(c) / med(w) * 100.0),
+            None => format!("{:>9}", "-"),
         };
         let pct = match cb {
             Some(c) => format!("{:8.1}%", med(c) / med(w) * 100.0),
@@ -117,13 +123,13 @@ pub fn run_table(jsonl: &str) -> Result<String> {
             None => ("-".to_string(), format!("{:>6}", "-")),
         };
         let warm_of = |i: &Value| warm.iter().find(|r| r["impl"] == *i).map(|r| med(r));
-        let warm_pct = match (warm_of(&Value::from("cublas")), warm_of(&w["impl"])) {
+        let warm_pct = match (warm_of(&Value::from("cublaslt_best")), warm_of(&w["impl"])) {
             (Some(c), Some(o)) => format!("{:8.1}%", c / o * 100.0),
             _ => format!("{:>9}", "-"),
         };
         writeln!(
             out,
-            "{m:>5} {n:>5} {k:>5}  {:<30} {pct}  {ru:<30} {gap}  {warm_pct}",
+            "{m:>5} {n:>5} {k:>5}  {:<30} {pct} {pct_lt}  {ru:<30} {gap}  {warm_pct}",
             w["impl"].as_str().unwrap_or("?")
         )?;
     }
@@ -131,7 +137,8 @@ pub fn run_table(jsonl: &str) -> Result<String> {
         out,
         "\n% cuBLAS: cuBLAS median / winner median (100% = parity). gap: how much slower the runner-up's median is than the winner's;\n\
          \"tied\": the runner-up's median is inside the winner's p10-p90 (this run only; the DB winner is picked by the tie-break).\n\
-         Ranked on cache_mode=cold rows. warm %: cuBLAS warm median / winner warm median (protocol v2)."
+         % LtBest: the same against cublaslt_best. Ranked on cache_mode=cold rows.\n\
+         warm %: cublaslt_best warm median / winner warm median (protocol v2)."
     )?;
     Ok(out)
 }
@@ -140,7 +147,8 @@ pub fn run_table(jsonl: &str) -> Result<String> {
 /// apart from line 1: generator name, host, time).
 pub fn header_text(con: &rusqlite::Connection, arch: i64, generated: &str) -> Result<(String, usize)> {
     let mut stmt = con.prepare(
-        "SELECT w.shape_bucket, k.impl, w.pct_of_cublas, w.tied, w.tie_set, w.pick_reason FROM winners w \
+        "SELECT w.shape_bucket, k.impl, w.pct_of_cublas, w.tied, w.tie_set, w.pick_reason, w.pct_of_cublaslt_best \
+         FROM winners w \
          JOIN kernels k USING(kernel_id) WHERE w.sm_arch = ? AND w.op = 'gemm' \
          AND w.dtype = 'f16f32f16'",
     )?;
@@ -153,18 +161,20 @@ pub fn header_text(con: &rusqlite::Connection, arch: i64, generated: &str) -> Re
             r.get::<_, i64>(3)?,
             r.get::<_, Option<String>>(4)?,
             r.get::<_, Option<String>>(5)?,
+            r.get::<_, Option<f64>>(6)?,
         ))
     })? {
-        let (bucket, impl_, pct, tied, tie_set, reason) = row?;
+        let (bucket, impl_, pct, tied, tie_set, reason, pct_lt) = row?;
         // Tie status: which configs the measurements could not separate, and why this one.
+        let lt_note = pct_lt.map(|p| format!(", {p:.1}% of cublaslt_best")).unwrap_or_default();
         let tie_note = if tied != 0 {
             let others: Vec<String> = serde_json::from_str::<Vec<String>>(tie_set.as_deref().unwrap_or("[]"))?
                 .into_iter()
                 .filter(|i| *i != impl_)
                 .collect();
-            format!("; TIED with {} ({})", others.join(", "), reason.unwrap_or_default())
+            format!("{lt_note}; TIED with {} ({})", others.join(", "), reason.unwrap_or_default())
         } else {
-            String::new()
+            lt_note
         };
         let dims: Vec<i64> = bucket.split('x').map(str::parse).collect::<Result<_, _>>().context("shape_bucket")?;
         let [m, n, k] = dims[..] else { bail!("bad shape_bucket {bucket}") };

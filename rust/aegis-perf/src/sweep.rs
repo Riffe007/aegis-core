@@ -38,16 +38,16 @@ pub struct Spec {
 
 pub fn spec(impl_: &str) -> Spec {
     match impl_ {
-        "cublas" => Spec { reps: 50, max_flops: None },
+        "cublas" | "cublaslt_best" => Spec { reps: 50, max_flops: None },
         "naive" => Spec { reps: 5, max_flops: Some(2 * 2048i64.pow(3)) },
         _ => Spec { reps: 20, max_flops: None },
     }
 }
 
-/// Default impl list: cuBLAS, then the registry in order.
+/// Default impl list: the baselines (cuBLAS, cublaslt_best), then the registry in order.
 pub fn default_impls(bench: &Path) -> Result<Vec<String>> {
     let out = Command::new(bench).arg("--list").output().context("run bench_gemm --list")?;
-    let mut impls = vec!["cublas".to_string()];
+    let mut impls = vec!["cublas".to_string(), "cublaslt_best".to_string()];
     for line in String::from_utf8_lossy(&out.stdout).lines().filter(|l| !l.trim().is_empty()) {
         let v: Value = serde_json::from_str(line)?;
         impls.push(v["impl"].as_str().context("--list row without impl")?.to_string());
