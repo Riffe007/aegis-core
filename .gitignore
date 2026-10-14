@@ -4,3 +4,6 @@ artifacts/
 __pycache__/
 *.db
 rust/target/
+
+# Any build directory (build/, build-dev/, ...)
+build*/
