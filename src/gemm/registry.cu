@@ -12,7 +12,7 @@ std::span<const KernelEntry> registry() {
         {"naive", CONFIG_naive, &launch_naive, &attrs_naive},
         {"tiled", CONFIG_tiled, &launch_tiled, &attrs_tiled},
     };
-    for (auto tier : {regblock_entries(), mma_entries()}) v.insert(v.end(), tier.begin(), tier.end());
+    for (auto tier : {regblock_entries(), mma_entries(), mma_pipe_entries()}) v.insert(v.end(), tier.begin(), tier.end());
     return v;
   }();
   return all;

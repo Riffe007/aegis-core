@@ -15,7 +15,7 @@ of cuBLAS on the same device and shape.
 | 1 | `tiled` | 32x32 shared-memory tiles | implemented |
 | 2 | `regblock_*` | register-blocked micro-tiles, 3 configs | implemented |
 | 3 | `mma_*` | tensor cores via `mma.sync` m16n8k16 + `ldmatrix`, 4 configs | implemented |
-| 4 | `mma_pipe` | tier 3 + multi-stage `cp.async` pipeline | planned |
+| 4 | `mma_pipe_*` | tier 3 + multi-stage `cp.async` pipeline, STAGES 2/3/4, 12 configs | implemented |
 | — | autotuner | per-arch winner selection over template configs | planned |
 
 Results: none published yet. Numbers appear here only after `tools/sweep.py`

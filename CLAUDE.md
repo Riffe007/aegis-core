@@ -89,7 +89,7 @@ artifacts/sass/     SASS dumps per arch (gitignored)
 - [x] Tier 1: shared-memory tiled (32x32)
 - [x] Tier 2: register-blocked (each thread computes a TMxTN micro-tile), templated on BM/BN/BK/TM/TN
 - [x] Tier 3: tensor-core `mma.sync` m16n8k16 + `ldmatrix`, templated on BM/BN/BK/warps
-- [ ] Tier 4: tier 3 + `cp.async` multi-stage pipeline (STAGES template param)
+- [x] Tier 4: tier 3 + `cp.async` multi-stage pipeline (STAGES template param)
 - [ ] Autotuner: enumerate template instantiations, time per shape, write `winners`
 - [ ] `aegis::matmul()` dispatch reading winners for the local arch
 - [ ] Decode GEMV (M=1..16), then INT8 weight-only variant

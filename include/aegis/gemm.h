@@ -78,4 +78,25 @@ inline constexpr MmaConfig MMA_CONFIGS[] = {
 };
 std::span<const KernelEntry> mma_entries();
 
+// ---------------------------------------------------------------------------
+// Tier 4: tier 3 + STAGES-deep cp.async (16 B, .cg) global->smem pipeline.
+// Name: mma_pipe_<BM>x<BN>x<BK>_<WM>x<WN>_s<STAGES>
+// ---------------------------------------------------------------------------
+struct MmaPipeConfig { int BM, BN, BK, WARPS_M, WARPS_N, STAGES; };
+inline constexpr MmaPipeConfig MMA_PIPE_CONFIGS[] = {
+    {128, 128, 32, 2, 4, 2},
+    {128, 128, 32, 2, 4, 3},
+    {128, 128, 32, 2, 4, 4},
+    {128, 64, 32, 2, 2, 2},
+    {128, 64, 32, 2, 2, 3},
+    {128, 64, 32, 2, 2, 4},
+    {64, 128, 32, 2, 4, 2},
+    {64, 128, 32, 2, 4, 3},
+    {64, 128, 32, 2, 4, 4},
+    {64, 64, 32, 2, 2, 2},
+    {64, 64, 32, 2, 2, 3},
+    {64, 64, 32, 2, 2, 4},
+};
+std::span<const KernelEntry> mma_pipe_entries();
+
 }  // namespace aegis::gemm

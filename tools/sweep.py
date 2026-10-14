@@ -33,6 +33,18 @@ IMPLS = {
     "mma_128x64x32_2x2": {"reps": 20},
     "mma_64x128x32_2x4": {"reps": 20},
     "mma_64x64x32_2x2": {"reps": 20},
+    "mma_pipe_128x128x32_2x4_s2": {"reps": 20},
+    "mma_pipe_128x128x32_2x4_s3": {"reps": 20},
+    "mma_pipe_128x128x32_2x4_s4": {"reps": 20},
+    "mma_pipe_128x64x32_2x2_s2": {"reps": 20},
+    "mma_pipe_128x64x32_2x2_s3": {"reps": 20},
+    "mma_pipe_128x64x32_2x2_s4": {"reps": 20},
+    "mma_pipe_64x128x32_2x4_s2": {"reps": 20},
+    "mma_pipe_64x128x32_2x4_s3": {"reps": 20},
+    "mma_pipe_64x128x32_2x4_s4": {"reps": 20},
+    "mma_pipe_64x64x32_2x2_s2": {"reps": 20},
+    "mma_pipe_64x64x32_2x2_s3": {"reps": 20},
+    "mma_pipe_64x64x32_2x2_s4": {"reps": 20},
 }
 
 # Square shapes for the roofline, plus Qwen2.5-0.5B projection shapes
