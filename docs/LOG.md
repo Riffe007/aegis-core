@@ -188,3 +188,48 @@ Without counters: 8 warps gives **exactly 128.0 B/clk/SM on every run**
 (the ceiling); 16 warps gives 99.1, 128.0, 119.1, 128.0, 109.2 across 5 runs.
 So the "drop" is intermittent variance above 8 warps, not a fixed
 property. **Cause: unexplained** until the counters are collected.
+
+## 2026-10-14 — timing protocol v2 (steps 1–6; re-tune pending)
+
+Commits 9e4e414 .. f681eda. Protocol v2 is the default in `src/bench/harness`;
+`--protocol 1` keeps the old loop for comparison.
+
+**Timer finding (step 1).** The cudaEvent timer resolves **32 ns** on GB10
+(smallest step between distinct deltas over 1000 event pairs around spin
+kernels). The 2.048 µs steps logged earlier are **not** the timer: they appear
+only when the start event is recorded right behind the L2-flush memset, as v1
+does every rep. Same spin kernels, 400 samples each: deltas on an exact
+2048 ns multiple — memset then event: 158/400; no memset: 0/400; memset +
+stream sync: 11/400. The spec's "smallest nonzero delta" measures event
+spacing instead (736 ns with nothing between the events, ~2.2 µs around a
+kernel), so the harness records the step (`timer_res_ns`) and logs the spacing.
+The earlier explanation of the 16x896x896 disagreement ("one 2.048 µs tick")
+still stands as a property of v1 rows, with this cause.
+
+**Steps 2–3.** N launches are captured in one CUDA Graph and N is calibrated
+until a window is >= max(1 ms, 500 ticks) = 1 ms. Cold: K = max(2, ceil(3 x L2
+/ footprint)) buffer sets rotated inside the window (16x896x896: K = 46;
+4096³: K = 2), L2 flushed before each window, outside it. Warm: one set.
+Development spot checks (not policy-compliant runs, not claims): cuBLAS
+16x896x896 is 24.6 µs per launch under v1, 11.0 µs v2 cold, 3.9 µs v2 warm; v1
+pays the flush, the memset-quantized start event and launch spacing on every
+rep. At 4096³ cold and warm agree (footprint 96 MiB > L2).
+
+**Step 5.** Idle guard (NVML, 2 s, 2% mean): idle GPU 0.0% passes; a
+loop of GEMM processes reads 5.2% and is refused (exit 3); a sustained GEMM
+reads 96%.
+
+**Step 6.** Migration on a copy of the live DB: 723 rows become protocol 1;
+`report --protocol 1` equals the pre-v2 report apart from its footer. Reports
+and winners now read v2 cold idle-GPU rows only.
+
+**Step 6b (added).** `cublaslt_best`: the fastest passing of up to 8
+cuBLASLt heuristic algorithms, timed under the same protocol. At 16x896x896 the
+heuristic's first pick is cuBLAS's own algorithm (rel_err 0 between them).
+
+**Step 7 not run.** This session is the local X desktop, not SSH, and
+gnome-remote-desktop holds a GPU context (Firefox is open too). The idle guard
+passes (0.0%), but the Benchmark policy asks for SSH with remote desktop off,
+and step 7 regenerates the committed winners header. A functional `aegis-perf
+tune --shapes shapes/quick.txt` against a scratch DB ran end to end in 7.5 s
+(aegis_tune wall); its numbers are not recorded.
