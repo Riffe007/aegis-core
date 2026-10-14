@@ -1,16 +1,19 @@
 cmake_minimum_required(VERSION 3.24)
+
+# Build for the GPU on this machine unless told otherwise.
+#   DGX Spark: 121   Jetson Orin Nano: 87
+# Must precede project(): enabling CUDA sets CMAKE_CUDA_ARCHITECTURES to the
+# compiler default (e.g. 75), after which a NOT DEFINED check never fires.
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+  set(CMAKE_CUDA_ARCHITECTURES native)
+endif()
+
 project(aegis_core LANGUAGES CXX CUDA)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 20)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
-
-# Build for the GPU on this machine unless told otherwise.
-#   DGX Spark: 121   Jetson Orin Nano: 87
-if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-  set(CMAKE_CUDA_ARCHITECTURES native)
-endif()
 
 find_package(CUDAToolkit REQUIRED)
 
@@ -28,6 +31,7 @@ add_executable(bench_gemm bench/bench_gemm.cu)
 target_link_libraries(bench_gemm PRIVATE aegis_kernels CUDA::cudart CUDA::cublas)
 
 add_executable(aegis_manifest tools/aegis_manifest.cu)
+target_include_directories(aegis_manifest PRIVATE include)
 target_link_libraries(aegis_manifest PRIVATE CUDA::cudart)
 
 # Correctness: every impl on shapes that are NOT multiples of any tile size.
