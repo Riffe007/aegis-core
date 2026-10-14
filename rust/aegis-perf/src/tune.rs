@@ -196,7 +196,7 @@ pub fn header_text(con: &rusqlite::Connection, arch: i64, generated: &str) -> Re
         let (bucket, impl_, pct, tied, tie_set, reason, pct_lt, method, ci_lo, ci_hi) = row?;
         // Paired tie test: runner-up / winner, 95% CI of the median ratio.
         let ci_note = match (method.as_deref(), ci_lo, ci_hi) {
-            (Some("paired"), Some(lo), Some(hi)) => format!(" [paired CI {lo:.3}-{hi:.3}]"),
+            (Some("paired" | "paired_swap"), Some(lo), Some(hi)) => format!(" [paired CI {lo:.3}-{hi:.3}]"),
             _ => String::new(),
         };
         // Tie status: which configs the measurements could not separate, and why this one.

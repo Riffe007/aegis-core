@@ -449,6 +449,11 @@ fn tie_set<'a>(ours: &[&'a Latest], paired: &PairedMap) -> TieCall<'a> {
         [] => TieCall { set: Vec::new(), ci: None, method: "none" },
         [w] => TieCall { set: vec![w], ci: None, method: "none" },
         [w, r, ..] => match paired_ci(paired, w, &r.impl_, &r.run_id) {
+            // CI entirely below 1.0: in paired windows the runner-up is
+            // faster, whatever the unpaired medians said; it wins outright.
+            Some((lo, hi)) if hi < 1.0 => {
+                TieCall { set: vec![r], ci: Some((1.0 / hi, 1.0 / lo)), method: "paired_swap" }
+            }
             Some((lo, hi)) => {
                 let set = if lo <= 1.0 && hi >= 1.0 { vec![w, r] } else { vec![w] };
                 TieCall { set, ci: Some((lo, hi)), method: "paired" }
@@ -561,7 +566,12 @@ pub fn cmd_winners(db: &Path, arch: Option<i64>) -> Result<()> {
         };
         let Some(&fastest) = tie.first() else { continue };
         let (pick, reason) = if tie.len() == 1 {
-            (fastest, "fastest".to_string())
+            let why = if call.method == "paired_swap" {
+                "fastest in the paired test (lower unpaired median: the runner-up)"
+            } else {
+                "fastest"
+            };
+            (fastest, why.to_string())
         } else {
             tied_n += 1;
             let support = |r: &Latest| {

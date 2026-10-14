@@ -507,3 +507,50 @@ one outlier, so its 4% is real run-to-run variation, not one bad run. The
 per-window band (single launch per window at this size) stays 8–22%, which
 keeps 4096³ tied. Mean of the six medians vs the previous session: cublas
 +1.8%, cublaslt_best +0.9%, winner +0.3%.
+
+## 2026-10-14 (night, later) — paired tie test, arch file, launch overhead
+
+Conditions as in the previous entry: local desktop session, Xorg, gnome-shell
+and Firefox (PID 8152) on the GPU, remote desktop stopped; idle guard
+0.7–1.0% mean before each run, no `--allow-busy`.
+
+### 1. Paired tie test
+
+`aegis_tune` now runs, per shape, 30 alternating cold windows (A, B, A, B…)
+of the fastest config vs the runner-up and vs cublaslt_best; ratio = B / A per
+pair; 10,000-resample percentile bootstrap of the median; tied = the 95% CI
+contains 1.0 (`winners.tie_method = 'paired'`, `ratio_ci_lo/hi`,
+`lt_ratio_ci_lo/hi`). Paired CIs are 0.5–2% wide where p10–p90 bands were
+10–30%.
+
+New case the rule had to cover: at 16x4864x896 in the full run the
+runner-up/fastest CI was [0.986, 0.994], entirely below 1.0 — in paired
+windows the config with the higher unpaired median was faster. Such a pair
+is now resolved for the runner-up (`tie_method = 'paired_swap'`).
+
+**Full re-tune `7ffc181804d7`** (350 rows, 28 paired tests): **0 of 14 shapes
+tied** (v2 band rule: 7/14 and 10/14 on the two earlier runs).
+
+**Decode shapes twice** (`8d7ae60c856b`, `6e1000a59892`), runner-up / winner CI:
+
+| Shape | Run 1 | Run 2 | Stable? |
+|---|---|---|---|
+| 1x896x896 | s4 vs s3 [1.176, 1.188] no | s4 vs s3 [1.176, 1.185] no | yes |
+| 1x896x4864 | s4 vs s3 [1.158, 1.166] no | s4 vs s3 [1.172, 1.185] no | yes |
+| 16x896x896 | s4 vs s3 [1.158, 1.170] no | s4 vs s3 [1.146, 1.155] no | yes |
+| 16x896x4864 | s4 vs s3 [1.156, 1.171] no | s4 vs s3 [1.153, 1.165] no | yes |
+| 1x4864x896 | 64x64_s4 vs 64x128_s4 [0.995, 1.006] **tied** | 64x128_s4 vs 64x64_s4 [0.995, 1.002] **tied** | yes (tied both) |
+| 16x4864x896 | 64x128_s4 vs 64x64_s4 [1.003, 1.012] no | 64x128_s4 vs 64x64_s4 [0.997, 1.006] **tied** | **no** |
+
+(s4/s3 = `mma_pipe_64x64x32_2x2_s4/_s3`; 64x128_s4 = `mma_pipe_64x128x32_2x4_s4`.)
+
+**Verdict: tie calls are stable on 5 of 6 decode shapes across the two
+runs** (on the earlier band rule, decode tie calls flipped on 3 of 6 between
+two runs). The one flip, 16x4864x896, is a real sub-1% difference sitting at
+the CI's resolution: the same two configs are compared both times and their
+ratio moves from 1.003–1.012 to 0.997–1.006. The full run also differed on
+1x4864x896 because its unpaired runner-up was a different config (`_s3`,
+[1.006, 1.016]); the paired test only compares the first two by unpaired
+median. Final DB state (latest rows: decode run 2 for the decode shapes, full
+run for the rest) regenerated `winners/sm_121.h`; 16x4864x896 and 1x4864x896
+are tied and resolved by the tie-break (less smem → `mma_pipe_64x64x32_2x2_s4`).

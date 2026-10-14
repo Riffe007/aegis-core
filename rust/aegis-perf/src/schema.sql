@@ -61,7 +61,7 @@ CREATE TABLE IF NOT EXISTS winners (
   protocol_version INTEGER NOT NULL DEFAULT 1,  -- of the measurements it was picked from
   warm_median_us REAL,              -- the pick's cache_mode=warm median (v2), if measured
   pct_of_cublaslt_best REAL,        -- cublaslt_best median / pick median x 100 (v2)
-  tie_method TEXT,                  -- 'paired' (bootstrap CI) or 'band' (p10-p90, no paired test)
+  tie_method TEXT,                  -- 'paired' (bootstrap CI), 'paired_swap' (CI < 1: runner-up won), 'band' (p10-p90)
   ratio_ci_lo REAL,                 -- paired: runner-up / fastest, 95% CI of the median ratio
   ratio_ci_hi REAL,
   lt_ratio_ci_lo REAL,              -- paired: cublaslt_best / fastest, 95% CI
