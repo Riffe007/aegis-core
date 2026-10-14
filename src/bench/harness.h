@@ -206,7 +206,9 @@ class Harness {
   Timing time(const Impl& e, Problem& p, const TimingOptions& o);
   // cublaslt_best on p: run, check and time every heuristic algorithm under
   // `o`; leaves the best one's result in p.C.
-  LtBest cublaslt_best(Problem& p, const TimingOptions& o);
+  // only_rank >= 0: run just the algorithm at that heuristic rank (no selection;
+  // for profiling one algorithm, e.g. under ncu where selection timings lie).
+  LtBest cublaslt_best(Problem& p, const TimingOptions& o, int only_rank = -1);
   // Paired tie test of b against a (see Paired); bootstrap seeded with `seed`.
   Paired paired(const Impl& a, const Impl& b, Problem& p, const TimingOptions& o,
                 int pairs = kPairedWindows, unsigned long long seed = 0,

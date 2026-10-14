@@ -693,3 +693,71 @@ sm_121-only object → `FAIL no sm_87 code`; 52 KB of static smem → ptxas
 compile error ("uses too much shared data"), i.e. a failed build. No CUDA
 12.x issue to fix: CUDA 13.0's nvcc compiles everything for sm_87 as is (the
 JetPack 12.x toolchain itself is untested until the port).
+
+### 3. Nsight Compute diagnosis, 2048³ and 4096³
+
+`tools/ncu_gemm.sh` (full section set; ncu defaults: clocks locked to base,
+caches flushed before each replay, so cold) on the winner
+`mma_pipe_128x128x32_2x4_s2`, the best s3 and s4 configs from tune
+`7ffc181804d7`, and cublaslt_best; `tools/ncu_summary.sh` tabulates
+(`artifacts/ncu/`, gitignored). Gotcha found on the way: cublaslt_best picks
+its algorithm by timing, and under ncu (serialized replays) it picked a
+different, slower CUTLASS kernel (705 µs at 2048³). `bench_gemm --lt-rank R` /
+`LT_RANK=R` now pins one heuristic rank; the tune's pick was rank 1
+(algo 67, `nvjet_sm121_hsh_*`) at both shapes, and that is what is profiled.
+
+| 2048³ | s2 (winner) | s3 128x128 | s4 128x128 | cublaslt_best |
+|---|---|---|---|---|
+| duration (µs, base clock) | 393 | 461 | 443 | **278** |
+| grid / block / regs | 256 / 256 / 122 | 256 / 256 / 122 | 256 / 256 / 122 | 192 / 256 / 255 |
+| dyn smem / blocks per SM (limit) | 37.9 KB / 2 (regs, smem) | 56.8 KB / 1 (smem) | 75.8 KB / 1 (smem) | 78.8 KB / 1 (regs, smem) |
+| waves per SM | 2.67 | 5.33 | 5.33 | 4.00 |
+| warps active, % of max | 30.5 | 17.9 | 17.0 | 16.5 |
+| tensor pipe active, % elapsed | 42.5 | 35.6 | 37.2 | **61.2** |
+| instructions executed | 23.4 M | 23.2 M | 22.8 M | **9.1 M** |
+| issue active, % | 14.8 | 12.3 | 12.6 | 8.1 |
+| L2 sectors / hit rate | 13.1 M / 95.3% | 13.1 M / 95.1% | 13.1 M / 95.1% | 7.9 M / 92.2% |
+| smem ld bank conflicts | 6,574 | 0 | 0 | 0 |
+| stalls per issue: long_scoreboard | **9.04** | 3.09 | 3.12 | 1.19 |
+| barrier | 2.90 | 1.68 | 1.13 | 0.04 |
+| wait | 3.49 | 3.51 | 3.51 | 0.78 |
+| math_pipe_throttle | 3.45 | 2.37 | 2.37 | **11.42** |
+
+| 4096³ | s2 (winner) | s3 128x64 | s4 128x128 | cublaslt_best |
+|---|---|---|---|---|
+| duration (ms, base clock) | 2.64 | 5.25 | 3.60 | **1.66** |
+| grid / block / regs | 1024 / 256 / 122 | 2048 / 128 / 120 | 1024 / 256 / 122 | 640 / 256 / 255 |
+| dyn smem / blocks per SM | 37.9 KB / 2 | 44.5 KB / 2 | 75.8 KB / 1 | 87.0 KB / 1 |
+| waves per SM | 10.67 | 21.33 | 21.33 | 13.33 |
+| warps active, % | 31.8 | 17.0 | 16.5 | 13.6 |
+| tensor pipe active, % | 49.6 | 29.3 | 36.2 | **80.3** |
+| instructions executed | 184 M | 245 M | 178 M | **64.5 M** |
+| L2 sectors / hit rate | 102.8 M / 87.5% | 153.0 M / 84.2% | 102.7 M / 78.3% | 56.7 M / 89.0% |
+| stalls: long_scoreboard / barrier / wait / math_pipe_throttle | 9.15 / 2.68 / 3.51 / 3.42 | 4.61 / 1.91 / 3.37 / 0.39 | 3.89 / 2.54 / 3.53 / 2.42 | 0.69 / 0.02 / 0.60 / **13.06** |
+
+What the counters say (no explanation beyond them):
+- cublaslt_best is **tensor-pipe bound**: tensor pipe 61% (2048³) and 80%
+  (4096³) active, the dominant stall is math_pipe_throttle (11–13 per issue),
+  almost no barrier or memory stalls, at 1 block of 8 warps per SM and 255
+  registers.
+- Ours keeps the tensor pipe 36–50% active and executes **2.6x (2048³) to
+  2.85x (4096³) more instructions** for the same FLOPs; its stalls are spread
+  over long_scoreboard, wait, barrier and math throttle instead of
+  concentrated on the tensor pipe.
+- Ours moves **1.7–1.8x more L2 sectors** than cublaslt_best (13.1 M vs 7.9 M;
+  102.8 M vs 56.7 M) for the same problem.
+- s3/s4 at 128x128 lose the second block per SM to shared memory (1 block, ~17%
+  warps active) and are slower than s2 although their long_scoreboard stalls
+  drop from ~9 to ~3; the 128x64 s3 at 4096³ executes the most instructions
+  (245 M) and moves the most L2 sectors (153 M).
+- 2048³ s2 runs 2.67 waves (the last wave 2/3 full); cublaslt_best runs
+  exactly 4.
+
+**Hypothesis (not tested):** the winner is issue/latency-limited by too little
+tensor work per instruction and per byte moved: its 64x32 warp tile does
+16 HMMA per k16 step against 6 ldmatrix.x4 plus address and cp.async work,
+where cublaslt_best's single 8-warp block with 255 registers implies a much
+larger per-warp tile. **One concrete change to test:** a config with a larger
+warp tile, e.g. BM=128, BN=256, 2x4 warps (64x64 per warp), accepting 1 block
+per SM, and compare instructions executed, tensor-pipe active % and L2 sectors
+against the table above.

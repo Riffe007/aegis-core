@@ -2,7 +2,8 @@
 //
 //   bench_gemm --impl tiled --m 4096 --n 4096 --k 4096 [--reps 20] [--warmup 3]
 //              [--protocol 2] [--cache cold|warm] [--check] [--seed 42]
-//   bench_gemm --impl cublaslt_best ...  fastest passing cuBLASLt heuristic algorithm (of 8)
+//   bench_gemm --impl cublaslt_best ...  fastest passing cuBLASLt heuristic algorithm (of 8);
+//              [--lt-rank R]           only the algorithm at heuristic rank R (no selection)
 //   bench_gemm --list                  registered impls as JSON lines
 //   bench_gemm --idle-check [--allow-busy]   the idle guard alone (aegis-perf sweep
 //                                      runs it once before the sweep); exit 3 = busy
@@ -32,6 +33,7 @@ struct Args {
   bool list = false;
   bool idle_check = false, allow_busy = false;
   double idle_util_pct = -1;  // < 0: not recorded
+  int lt_rank = -1;           // cublaslt_best: only this heuristic rank (no selection)
   unsigned seed = 42;
 };
 
@@ -57,6 +59,7 @@ Args parse(int argc, char** argv) {
     else if (k == "--idle-check") a.idle_check = true;
     else if (k == "--allow-busy") a.allow_busy = true;
     else if (k == "--idle-util-pct") a.idle_util_pct = std::atof(next());
+    else if (k == "--lt-rank") a.lt_rank = std::atoi(next());
     else { std::fprintf(stderr, "unknown arg %s\n", k.c_str()); std::exit(2); }
   }
   if (a.reps < 0) a.reps = a.protocol == 1 ? 50 : 20;
@@ -112,7 +115,7 @@ int main(int argc, char** argv) {
   // cublaslt_best: every heuristic algorithm is run, checked and timed; the
   // fastest passing one is the row (always checked).
   if (lt_best) {
-    const aegis::bench::LtBest b = h.cublaslt_best(p, opt);
+    const aegis::bench::LtBest b = h.cublaslt_best(p, opt, a.lt_rank);
     if (b.best < 0) {
       std::fprintf(stderr, "FAIL: no cuBLASLt algorithm passed (%d candidates) for %dx%dx%d\n",
                    b.candidates, a.M, a.N, a.K);

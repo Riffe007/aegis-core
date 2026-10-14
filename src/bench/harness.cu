@@ -667,11 +667,12 @@ LtPlan::~LtPlan() {
   cublasLtMatmulDescDestroy(op);
 }
 
-LtBest Harness::cublaslt_best(Problem& p, const TimingOptions& o) {
+LtBest Harness::cublaslt_best(Problem& p, const TimingOptions& o, int only_rank) {
   LtBest r;
   r.plan = std::make_unique<LtPlan>(lt_, p.M, p.N, p.K, lt_ws_bytes_, kLtMaxAlgos);
   r.candidates = int(r.plan->algos.size());
   for (int i = 0; i < r.candidates; ++i) {
+    if (only_rank >= 0 && r.plan->algos[size_t(i)].rank != only_rank) continue;
     const Impl impl(r.plan.get(), i);
     run_once(impl, p);
     const Check c = check(p);
