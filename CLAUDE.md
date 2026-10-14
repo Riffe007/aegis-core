@@ -168,6 +168,18 @@ only to compare with old rows (`--protocol 1`).
   (which algorithm: the row's `lt` field). v2 reports and winners quote %
   of `cublaslt_best`; `pct_of_cublas` stays alongside.
 
+## Decisions
+
+- **No driver-API launcher (2026-10-14).** The launch-overhead probe
+  (`microbench/launch_overhead.cu`, run `0de7ff68bb2f`) put runtime,
+  driver (`cuLaunchKernel`), CUDA Graph replay and `aegis::matmul` within
+  0.4 µs of each other at the median for the M = 1 winner (1x896x896:
+  13.89–14.38 µs host-to-completion, ~4.4–4.8 µs of it fixed overhead). A
+  driver-API launch path is rejected: it would save ~0.2 µs. Reducing the
+  fixed cost has to remove launches, not make them cheaper: multi-kernel CUDA
+  Graphs (a whole decode step per graph) or a persistent decode kernel. That
+  is a separate experiment, not started.
+
 ## Architecture notes you must respect
 
 - GB10 (sm_121) is consumer-lineage Blackwell. It does **not** have the sm_100
