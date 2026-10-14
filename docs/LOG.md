@@ -312,7 +312,8 @@ identical across the 5 runs at each point (ranges shown where they moved):
 | stall short_scoreboard per issue | 5.35–5.38 | 4.40–4.42 |
 | stall not_selected per issue | 0.08 | 0.66–0.68 |
 | issue active, % | 21.1 | 21.1 |
-| sm cycles elapsed, max − min across SMs | ≤ 21k of 4.2M | ≤ 23k of 8.4M (one run 211k) |
+| sm cycles elapsed, max − min across SMs | 15–40 | 12–45 |
+| sm cycles elapsed − active (idle inside the kernel) | 9.0k–21.1k of 4.2M | 11.0k–22.9k of 8.4M; one run 212.2k |
 
 The probe's own number (block 0's clock64 window), separately, 15 runs each
 without ncu: 8 warps 128.0 every run; 16 warps 128.0 in 14 runs, 120.0 once.
@@ -322,7 +323,10 @@ With remote desktop running (previous entry) 16 warps read 99–128.
 
 **Cause: unexplained.** No counter shows a throughput loss at 16 warps: no
 bank conflicts, ideal wavefronts, the LSU writeback path busy 99.98% of active
-cycles, active cycles proportional to the work in every profiled pass. The
+cycles, active cycles proportional to the work in every profiled pass, all
+SMs finishing within 45 cycles of each other. One 16-warp pass had every SM
+idle for 212k cycles (2.5%) inside the kernel, against 9–23k in the other
+nine: a gap where no SM was working, not a slower ldmatrix pipe. The
 extra warps only queue: mio_throttle stalls go from ~1.5 to 11.3 per issue at
 identical throughput, so 8 warps already saturate ldmatrix at 128 B/clk/SM.
 The intermittent low readings are seen only by the probe's clock64 window,
