@@ -381,3 +381,52 @@ launch and its p10–p90 band is 10–32% of the median. That band is why 4096³
 (and 2048³) stay "tied" in the winners table even though the medians repeat
 within 1–4%. Not investigated tonight: whether the per-launch variation is
 clock (power/thermal) or memory-system behaviour.
+
+## 2026-10-14 (night) — steps 1–4 repeated with Firefox closed
+
+**Conditions.** Local desktop session (gnome-terminal, not SSH); Xorg and
+gnome-shell present on the GPU; remote desktop stopped. Firefox's window was
+closed but its process (PID 8152, snap) was still running and still held a GPU
+graphics context. `RmProfilingAdminOnly: 0`. Idle guard before the run: 0.35%
+mean / 1% max; aegis_tune's own guard: 1.5% / 2%; no `--allow-busy`.
+
+### Step 1 — re-tune, run `992182b466e4`
+
+aegis_tune seed 2394767465, 350 rows, 0 failed `--check`, 26.0 s wall.
+`winners/sm_121.h` regenerated.
+
+| Shape | Winner | % of cublaslt_best, cold | % of cublaslt_best, warm | Tied |
+|---|---|---|---|---|
+| 1x896x896 | `mma_pipe_64x64x32_2x2_s4` | 81.6 | 39.2 | no |
+| 16x896x896 | `mma_pipe_64x64x32_2x2_s4` | 94.9 | 83.7 | no |
+| 1x4864x896 | `mma_pipe_64x128x32_2x4_s4` | 86.7 | 68.9 | tied |
+| 1x896x4864 | `mma_pipe_64x64x32_2x2_s4` | 74.3 | 40.7 ¹ | tied |
+| 16x4864x896 | `mma_pipe_64x128x32_2x4_s4` | 87.5 | 63.8 | tied |
+| 16x896x4864 | `mma_pipe_64x64x32_2x2_s4` | 71.8 | 19.0 | no |
+| 256x256x256 | `mma_pipe_64x64x32_2x2_s4` | 90.8 | 79.3 | no |
+| 512x512x512 | `mma_pipe_64x64x32_2x2_s4` | 81.3 | 63.7 | tied |
+| 512x896x896 | `mma_pipe_64x128x32_2x4_s3` | 74.0 | 64.8 | tied |
+| 512x4864x896 | `mma_64x128x32_2x4` | 63.0 | 67.1 | tied |
+| 512x896x4864 | `mma_pipe_64x128x32_2x4_s3` | 61.7 | 50.6 | tied |
+| 1024x1024x1024 | `mma_pipe_128x128x32_2x4_s2` | 76.0 | 67.5 | tied |
+| 2048x2048x2048 | `mma_pipe_128x128x32_2x4_s2` | 70.8 | 71.8 | tied |
+| 4096x4096x4096 | `mma_pipe_128x128x32_2x4_s2` | 58.7 | 61.2 | tied |
+
+¹ a baseline warm row is bimodal (median > 1.5 x p10); do not use the cell.
+Warm % has the caveats of the previous entry.
+
+Against the previous v2 run (`46372b6f92ba`, Firefox open): 12 of 14 winners
+identical; 1x4864x896 and 512x4864x896 changed, both tied shapes. Cold % of
+cublaslt_best moved by at most 3.4 points per shape (16x896x4864: 76.6 → 71.8).
+
+**Verdicts (unchanged by this rerun):**
+- **Decode >100% of cuBLAS — died.** Best decode shape 16x896x896 at 94.9% of
+  cublaslt_best; 16x4864x896 is 102.2% of plain cuBLAS but 87.5% of
+  cublaslt_best. No shape reaches parity with cublaslt_best.
+- **16x896x896 miss — died.** Winner `mma_pipe_64x64x32_2x2_s4` again (the
+  tune.py winner), 10.96 µs, now untied: `_s3` 12.65 µs is outside its p90
+  (12.11). The v1 aegis_tune pick (`mma_pipe_64x128x32_2x4_s4`) is 13.46 µs.
+- **11/14 tied — not a stable number.** v2 gives 7/14 and 10/14 on two runs
+  an hour apart. The large shapes (512x*, 1024³–4096³) are tied in both; the
+  decode shapes flip. The tie rule (runner-up inside the winner's p10–p90)
+  is sensitive to single slow windows in p90.
