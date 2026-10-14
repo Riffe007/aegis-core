@@ -288,10 +288,10 @@ shapes.
   v2. The v1 "8.9% gap = one tick" was quantization noise around a real gap.
   The shape is still marked tied, against `_s3` (12.73 µs, just inside the
   winner's p90 of 12.74).
-- **11/14 tied — partly survived: 7/14 under v2.** All four decode-family
-  shapes with N=896, K=896 and 4864 resolved except 1x896x4864 and
-  16x896x896; the ties that remain are 512x896x{896,4864}, 1024³, 2048³, 4096³
-  and those two, i.e. mostly large shapes where the winner's p90 tail is wide.
+- **11/14 tied — partly survived: 7/14 under v2.** Four of the six decode
+  shapes (M = 1, 16) now have a clear winner; 1x896x4864 and 16x896x896 stay
+  tied, as do 512x896x896, 512x896x4864, 1024³, 2048³ and 4096³, mostly large
+  shapes where the winner's per-window p90 tail is wide (see the 4096³ check).
 - **Overall level:** v1's 55–110% of cuBLAS becomes 59–96% of cublaslt_best.
 
 ### ldmatrix x4, 8 vs 16 warps/SM — counters (step 2)
