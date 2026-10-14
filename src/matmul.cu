@@ -68,12 +68,10 @@ cudaError_t cublas_fail(const char* what, cublasStatus_t s) {
   return cudaErrorUnknown;
 }
 
-// Same transposed-operand call as bench_gemm's reference. One handle per host
-// thread, created on first use and intentionally never destroyed (destroying
-// it at thread exit can race CUDA context teardown). A failed create is
-// retried on the next call.
-cudaError_t cublas_gemm(const __half* A, const __half* B, __half* C, int M, int N, int K,
-                        cudaStream_t stream) {
+// General cuBLAS call for GemmParams. Row-major C (M x N, ldc) is column-major
+// C^T (N x M, ldc) = op(B) * op(A): a row-major operand read as column-major is
+// already transposed (op N); a column-major one needs op T.
+cudaError_t cublas_gemm_general(const gemm::GemmParams& p, cudaStream_t stream) {
   thread_local cublasHandle_t h = nullptr;
   if (!h) {
     const cublasStatus_t s = cublasCreate(&h);
@@ -82,23 +80,38 @@ cudaError_t cublas_gemm(const __half* A, const __half* B, __half* C, int M, int 
       return cublas_fail("cublasCreate", s);
     }
   }
-  const float alpha = 1.f, beta = 0.f;
   cublasStatus_t s = cublasSetStream(h, stream);
   if (s != CUBLAS_STATUS_SUCCESS) return cublas_fail("cublasSetStream", s);
-  s = cublasGemmEx(h, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha, B, CUDA_R_16F, N, A,
-                   CUDA_R_16F, K, &beta, C, CUDA_R_16F, N, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
-  return s == CUBLAS_STATUS_SUCCESS ? cudaSuccess : cublas_fail("cublasGemmEx", s);
+  constexpr long long kIntMax = 2147483647;
+  if (p.lda > kIntMax || p.ldb > kIntMax || p.ldc > kIntMax) {
+    last_error = "cuBLAS fallback: leading dimension exceeds int";
+    return cudaErrorInvalidValue;
+  }
+  const cublasOperation_t op_b = p.layout_b == gemm::Layout::RowMajor ? CUBLAS_OP_N : CUBLAS_OP_T;
+  const cublasOperation_t op_a = p.layout_a == gemm::Layout::RowMajor ? CUBLAS_OP_N : CUBLAS_OP_T;
+  s = cublasGemmStridedBatchedEx(h, op_b, op_a, p.N, p.M, p.K, &p.alpha, p.B, CUDA_R_16F, int(p.ldb),
+                                 p.stride_b, p.A, CUDA_R_16F, int(p.lda), p.stride_a, &p.beta, p.C,
+                                 CUDA_R_16F, int(p.ldc), p.stride_c, p.batch, CUBLAS_COMPUTE_32F,
+                                 CUBLAS_GEMM_DEFAULT);
+  return s == CUBLAS_STATUS_SUCCESS ? cudaSuccess : cublas_fail("cublasGemmStridedBatchedEx", s);
 }
 
 }  // namespace
 
-cudaError_t matmul(const __half* A, const __half* B, __half* C, int M, int N, int K,
-                   cudaStream_t stream) {
-  if (const gemm::KernelEntry* e = select(M, N, K)) {
-    const cudaError_t err = e->launch(A, B, C, M, N, K, stream);
+cudaError_t matmul(const gemm::GemmParams& p, cudaStream_t stream) {
+  if (const cudaError_t e = gemm::validate(p); e != cudaSuccess)
+    return fail(e, "aegis::matmul: invalid GEMM parameters");
+  if (gemm::is_empty(p)) return cudaSuccess;
+  if (const gemm::KernelEntry* e = select(p.M, p.N, p.K); e && e->run) {
+    const cudaError_t err = e->run(p, stream);
     return err == cudaSuccess ? err : fail(err, std::string("launch ") + e->name);
   }
-  return cublas_gemm(A, B, C, M, N, K, stream);
+  return cublas_gemm_general(p, stream);
+}
+
+cudaError_t matmul(const __half* A, const __half* B, __half* C, int M, int N, int K,
+                   cudaStream_t stream) {
+  return matmul(gemm::row_major_params(A, B, C, M, N, K), stream);
 }
 
 const char* matmul_last_error() { return last_error.c_str(); }

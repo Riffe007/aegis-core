@@ -160,19 +160,66 @@ int aegis_copy_to_host(aegis_context* ctx, void* dst, const void* src, size_t by
   return copy(ctx, dst, src, bytes, cudaMemcpyDeviceToHost);
 }
 
-int aegis_gemm_f16(aegis_context* ctx, const void* A, const void* B, void* C, int M, int N,
-                   int K) {
-  if (!A || !B || !C || M <= 0 || N <= 0 || K <= 0)
-    return fail(AEGIS_ERR_INVALID_ARGUMENT, "aegis_gemm_f16: null operand or non-positive dimension");
+namespace {
+
+// Every GEMM entry point ends here: validate, run aegis::matmul, map errors.
+int run_gemm(aegis_context* ctx, const aegis::gemm::GemmParams& p, const char* fn) {
   if (int s = enter(ctx)) return s;
-  const cudaError_t e = aegis::matmul(static_cast<const __half*>(A), static_cast<const __half*>(B),
-                                      static_cast<__half*>(C), M, N, K, ctx->stream);
+  if (aegis::gemm::validate(p) != cudaSuccess)
+    return fail(AEGIS_ERR_INVALID_ARGUMENT,
+                std::string(fn) + ": negative size, too-small leading dimension, null operand, "
+                                  "bad layout or overlapping C batches");
+  if (aegis::gemm::is_empty(p)) return AEGIS_OK;
+  const cudaError_t e = aegis::matmul(p, ctx->stream);
   if (e == cudaSuccess) return AEGIS_OK;
   ctx->last_error = cudaGetErrorString(e);
   const std::string detail = aegis::matmul_last_error();
   if (e == cudaErrorMemoryAllocation) return fail(AEGIS_ERR_OUT_OF_MEMORY, detail);
   if (e == cudaErrorUnknown) return fail(AEGIS_ERR_CUDA, detail);  // cuBLAS failure
   return fail(AEGIS_ERR_LAUNCH_FAILED, detail);
+}
+
+bool to_layout(int l, aegis::gemm::Layout* out) {
+  if (l == AEGIS_ROW_MAJOR) *out = aegis::gemm::Layout::RowMajor;
+  else if (l == AEGIS_COL_MAJOR) *out = aegis::gemm::Layout::ColMajor;
+  else return false;
+  return true;
+}
+
+}  // namespace
+
+int aegis_gemm_f16(aegis_context* ctx, const void* A, const void* B, void* C, int M, int N,
+                   int K) {
+  return run_gemm(ctx,
+                  aegis::gemm::row_major_params(static_cast<const __half*>(A), static_cast<const __half*>(B),
+                                                static_cast<__half*>(C), M, N, K),
+                  "aegis_gemm_f16");
+}
+
+int aegis_gemm_f16_strided_batched(aegis_context* ctx, int layout_a, int layout_b, int M, int N, int K,
+                                   float alpha, const void* A, int64_t lda, int64_t stride_a, const void* B,
+                                   int64_t ldb, int64_t stride_b, float beta, void* C, int64_t ldc,
+                                   int64_t stride_c, int batch) {
+  aegis::gemm::GemmParams p;
+  if (!to_layout(layout_a, &p.layout_a) || !to_layout(layout_b, &p.layout_b))
+    return fail(AEGIS_ERR_INVALID_ARGUMENT, "aegis_gemm_f16_strided_batched: layout must be "
+                                            "AEGIS_ROW_MAJOR or AEGIS_COL_MAJOR");
+  p.A = static_cast<const __half*>(A);
+  p.B = static_cast<const __half*>(B);
+  p.C = static_cast<__half*>(C);
+  p.M = M; p.N = N; p.K = K;
+  p.lda = lda; p.ldb = ldb; p.ldc = ldc;
+  p.alpha = alpha; p.beta = beta;
+  p.batch = batch;
+  p.stride_a = stride_a; p.stride_b = stride_b; p.stride_c = stride_c;
+  return run_gemm(ctx, p, "aegis_gemm_f16_strided_batched");
+}
+
+int aegis_gemm_f16_ex(aegis_context* ctx, int layout_a, int layout_b, int M, int N, int K, float alpha,
+                      const void* A, int64_t lda, const void* B, int64_t ldb, float beta, void* C,
+                      int64_t ldc) {
+  return aegis_gemm_f16_strided_batched(ctx, layout_a, layout_b, M, N, K, alpha, A, lda, 0, B, ldb, 0,
+                                        beta, C, ldc, 0, 1);
 }
 
 int aegis_gemm_choice(aegis_context* ctx, int M, int N, int K, char* buf, size_t buf_len,

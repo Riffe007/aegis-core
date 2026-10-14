@@ -47,7 +47,7 @@ extern "C" {
 
 /* ABI version: bump the major on any incompatible change. */
 #define AEGIS_ABI_VERSION_MAJOR 1
-#define AEGIS_ABI_VERSION_MINOR 1
+#define AEGIS_ABI_VERSION_MINOR 2
 AEGIS_API int aegis_abi_version(void); /* major * 1000 + minor */
 
 /* Static description of a status code. Never NULL. */
@@ -82,12 +82,42 @@ AEGIS_API int aegis_copy_to_device(aegis_context* ctx, void* dst, const void* sr
 AEGIS_API int aegis_copy_to_host(aegis_context* ctx, void* dst, const void* src, size_t bytes);
 
 /* C[M,N] = A[M,K] * B[K,N]; row-major, FP16 in, FP32 accumulate, FP16 out.
+ * The packed row-major NN case of aegis_gemm_f16_ex (alpha 1, beta 0); since
+ * ABI 1.2, M, N or K == 0 is a no-op returning AEGIS_OK (was an error).
  * Runs the tuned winner for the device (aegis::matmul), else cuBLAS.
  * Asynchronous on the context's stream. A kernel that cannot be launched for
  * this shape (e.g. its grid exceeds device limits) returns
  * AEGIS_ERR_LAUNCH_FAILED; the context stays usable. */
 AEGIS_API int aegis_gemm_f16(aegis_context* ctx, const void* A, const void* B, void* C,
                              int M, int N, int K);
+
+/* ---- General GEMM (since ABI 1.2) -------------------------------------
+ * For each batch b < batch:
+ *   C_b = alpha * A_b * B_b + beta * C_b
+ *   A_b = A + b * stride_a: M x K, layout_a, leading dimension lda
+ *   B_b = B + b * stride_b: K x N, layout_b, leading dimension ldb
+ *   C_b = C + b * stride_c: M x N, row-major, leading dimension ldc (>= N)
+ * Layouts: AEGIS_ROW_MAJOR (X[r*ld + c], ld >= cols) or AEGIS_COL_MAJOR
+ * (X[r + c*ld], ld >= rows). Strides and leading dimensions are in elements.
+ * FP16 in, FP32 accumulate, FP16 out; NaN and Inf propagate. beta == 0: C is
+ * not read. Any alignment is accepted (misaligned operands take a slower path).
+ * M, N, K or batch == 0: no-op, AEGIS_OK, nothing launched, C untouched.
+ * Negative sizes, too-small leading dimensions, null pointers with nonzero
+ * sizes, overlapping C batches: AEGIS_ERR_INVALID_ARGUMENT.
+ * Asynchronous on the context's stream; runs the tuned winner for (M, N, K)
+ * (tuned on row-major NN) if one exists, else cuBLAS. */
+#define AEGIS_ROW_MAJOR 0
+#define AEGIS_COL_MAJOR 1
+
+AEGIS_API int aegis_gemm_f16_ex(aegis_context* ctx, int layout_a, int layout_b, int M, int N, int K,
+                                float alpha, const void* A, int64_t lda, const void* B, int64_t ldb,
+                                float beta, void* C, int64_t ldc);
+
+AEGIS_API int aegis_gemm_f16_strided_batched(aegis_context* ctx, int layout_a, int layout_b, int M,
+                                             int N, int K, float alpha, const void* A, int64_t lda,
+                                             int64_t stride_a, const void* B, int64_t ldb,
+                                             int64_t stride_b, float beta, void* C, int64_t ldc,
+                                             int64_t stride_c, int batch);
 
 /* Name of the implementation aegis_gemm_f16 would run for this shape, copied
  * NUL-terminated into buf. `needed` (optional) receives the size required,

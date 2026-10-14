@@ -68,7 +68,13 @@ static void test_errors(aegis_context* ctx) {
          "gemm with NULL operands");
   void* p = NULL;
   EXPECT(aegis_device_alloc(ctx, 64, &p) == AEGIS_OK && p, "alloc");
-  EXPECT(aegis_gemm_f16(ctx, p, p, p, 0, 4, 4) == AEGIS_ERR_INVALID_ARGUMENT, "gemm M=0");
+  EXPECT(aegis_gemm_f16(ctx, p, p, p, 0, 4, 4) == AEGIS_OK, "gemm M=0 is a no-op (ABI 1.2)");
+  EXPECT(aegis_gemm_f16(ctx, NULL, NULL, NULL, 4, 0, 4) == AEGIS_OK, "gemm N=0 with null operands is a no-op");
+  EXPECT(aegis_gemm_f16(ctx, p, p, p, -1, 4, 4) == AEGIS_ERR_INVALID_ARGUMENT, "gemm M<0");
+  EXPECT(aegis_gemm_f16_ex(ctx, 7, AEGIS_ROW_MAJOR, 4, 4, 4, 1.f, p, 4, p, 4, 0.f, p, 4) ==
+             AEGIS_ERR_INVALID_ARGUMENT, "bad layout");
+  EXPECT(aegis_gemm_f16_ex(ctx, AEGIS_ROW_MAJOR, AEGIS_ROW_MAJOR, 4, 4, 8, 1.f, p, 4, p, 4, 0.f, p, 4) ==
+             AEGIS_ERR_INVALID_ARGUMENT, "lda < K");
   EXPECT(aegis_gemm_f16(NULL, p, p, p, 4, 4, 4) == AEGIS_ERR_INVALID_ARGUMENT, "gemm ctx=NULL");
   EXPECT(aegis_device_free(ctx, p) == AEGIS_OK, "free");
   EXPECT(strcmp(aegis_status_string(AEGIS_ERR_CUDA), "unknown status") != 0, "status string");
@@ -169,6 +175,75 @@ static void test_gemm(aegis_context* ctx, int M, int N, int K) {
   free(hC);
 }
 
+
+/* aegis_gemm_f16_strided_batched / _ex against a double-precision CPU
+ * reference: one layout pair, padded leading dimensions, alpha/beta with C
+ * prefilled, `batch` batches. Tolerance: the Production-bar bound
+ * c*sqrt(K)*eps_fp16*max|A|*max|B|*|alpha| + eps_fp16*|beta|*max|C0|, c = 4. */
+static void test_gemm_general(aegis_context* ctx, int la, int lb, int M, int N, int K, float alpha,
+                              float beta, int batch) {
+  const int64_t lda = (la == AEGIS_ROW_MAJOR ? K : M) + 3, ldb = (lb == AEGIS_ROW_MAJOR ? N : K) + 5;
+  const int64_t ldc = N + 2;
+  const int64_t sa = lda * (la == AEGIS_ROW_MAJOR ? M : K) + 1, sb = ldb * (lb == AEGIS_ROW_MAJOR ? K : N) + 7;
+  const int64_t sc = ldc * M;
+  const size_t nA = (size_t)(sa * batch), nB = (size_t)(sb * batch), nC = (size_t)(sc * batch);
+  uint16_t* hA = malloc(nA * 2);
+  uint16_t* hB = malloc(nB * 2);
+  uint16_t* hC = malloc(nC * 2);
+  uint16_t* hC0 = malloc(nC * 2);
+  srand(7);
+  for (size_t i = 0; i < nA; ++i) hA[i] = f2h((float)rand() / RAND_MAX * 2.f - 1.f);
+  for (size_t i = 0; i < nB; ++i) hB[i] = f2h((float)rand() / RAND_MAX * 2.f - 1.f);
+  for (size_t i = 0; i < nC; ++i) hC0[i] = f2h((float)rand() / RAND_MAX * 2.f - 1.f);
+  void *dA = NULL, *dB = NULL, *dC = NULL;
+  int s = aegis_device_alloc(ctx, nA * 2, &dA);
+  if (s == AEGIS_OK) s = aegis_device_alloc(ctx, nB * 2, &dB);
+  if (s == AEGIS_OK) s = aegis_device_alloc(ctx, nC * 2, &dC);
+  if (s == AEGIS_OK) s = aegis_copy_to_device(ctx, dA, hA, nA * 2);
+  if (s == AEGIS_OK) s = aegis_copy_to_device(ctx, dB, hB, nB * 2);
+  if (s == AEGIS_OK) s = aegis_copy_to_device(ctx, dC, hC0, nC * 2);
+  if (s == AEGIS_OK)
+    s = batch == 1 ? aegis_gemm_f16_ex(ctx, la, lb, M, N, K, alpha, dA, lda, dB, ldb, beta, dC, ldc)
+                   : aegis_gemm_f16_strided_batched(ctx, la, lb, M, N, K, alpha, dA, lda, sa, dB, ldb, sb,
+                                                    beta, dC, ldc, sc, batch);
+  if (s == AEGIS_OK) s = aegis_copy_to_host(ctx, hC, dC, nC * 2);
+  EXPECT(s == AEGIS_OK, "gemm_general: %s (%s)", aegis_status_string(s), aegis_last_error_string());
+
+  const double eps = 9.765625e-4; /* 2^-10 */
+  double worst = 0;
+  for (int b = 0; s == AEGIS_OK && b < batch; ++b)
+    for (int i = 0; i < M; ++i)
+      for (int j = 0; j < N; ++j) {
+        double ref = 0;
+        for (int k = 0; k < K; ++k) {
+          const double a = h2f(hA[b * sa + (la == AEGIS_ROW_MAJOR ? i * lda + k : i + k * lda)]);
+          const double x = h2f(hB[b * sb + (lb == AEGIS_ROW_MAJOR ? k * ldb + j : k + j * ldb)]);
+          ref += a * x;
+        }
+        const size_t c = (size_t)(b * sc + i * ldc + j);
+        ref = alpha * ref + beta * h2f(hC0[c]);
+        const double tol = 4.0 * sqrt((double)K) * eps * fabs(alpha) + eps * fabs(beta) + 1e-7;
+        const double err = fabs(h2f(hC[c]) - ref);
+        if (err / tol > worst) worst = err / tol;
+      }
+  /* C padding (columns N..ldc-1) must be untouched. */
+  int pad_ok = 1;
+  for (int b = 0; b < batch; ++b)
+    for (int i = 0; i < M; ++i)
+      for (int64_t j = N; j < ldc; ++j) pad_ok &= hC[b * sc + i * ldc + j] == hC0[b * sc + i * ldc + j];
+  printf("%-4s gemm_general %s%s %3dx%3dx%3d batch %d alpha %.2f beta %.2f  err/tol=%.3f\n",
+         worst <= 1.0 && pad_ok ? "ok" : "FAIL", la == AEGIS_ROW_MAJOR ? "R" : "C",
+         lb == AEGIS_ROW_MAJOR ? "R" : "C", M, N, K, batch, alpha, beta, worst);
+  EXPECT(worst <= 1.0, "gemm_general err/tol %.3f", worst);
+  EXPECT(pad_ok, "gemm_general wrote C padding");
+  aegis_device_free(ctx, dA);
+  aegis_device_free(ctx, dB);
+  aegis_device_free(ctx, dC);
+  free(hA);
+  free(hB);
+  free(hC);
+  free(hC0);
+}
 int main(void) {
   aegis_context* ctx = NULL;
   const int s = aegis_create(&ctx, 0);
@@ -182,6 +257,10 @@ int main(void) {
   test_gemm(ctx, 127, 129, 65);  /* unaligned; also proves the process survived */
   test_gemm(ctx, 16, 896, 896);  /* tuned decode shape (if winners are compiled in) */
   test_gemm(ctx, 256, 256, 256);
+  for (int la = 0; la < 2; ++la)
+    for (int lb = 0; lb < 2; ++lb) test_gemm_general(ctx, la, lb, 37, 29, 45, 0.5f, -1.f, 1);
+  test_gemm_general(ctx, AEGIS_COL_MAJOR, AEGIS_ROW_MAJOR, 16, 896, 896, -1.5f, 0.f, 1); /* tuned shape */
+  test_gemm_general(ctx, AEGIS_ROW_MAJOR, AEGIS_COL_MAJOR, 33, 20, 70, 1.f, 1.f, 3);
   EXPECT(aegis_destroy(ctx) == AEGIS_OK, "destroy");
   if (failures) fprintf(stderr, "%d failure(s)\n", failures);
   else printf("capi_test: all checks passed\n");

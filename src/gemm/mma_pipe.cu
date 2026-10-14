@@ -12,9 +12,16 @@
 // commit_group per iteration even when there is nothing left to prefetch, so
 // the group count stays uniform for wait_group.
 //
-// Smem layout, padding and compute are tier 3's (mma_common.cuh). cp.async
-// needs 16 B-aligned sources, so the pipeline runs when K and N are multiples
-// of 8; other shapes take tier 3's synchronous loop with the scalar loader.
+// General GEMM (GemmParams: layouts, ld, alpha/beta, strided batch over
+// blockIdx.z). Paths, chosen per launch / per CTA:
+//   - vec (16 B-compatible pointers, ld and strides; vec16_ok): the pipeline.
+//     Interior CTAs (tile wholly inside M x N) copy unpredicated; boundary
+//     CTAs use row/column masks built once per CTA (OperandPlan). When K is
+//     not a multiple of BK only the last k-tile is copied with a k mask
+//     (cp.async zero-fill sizes).
+//   - otherwise (misaligned): tier 3's synchronous loop with the scalar,
+//     element-wise bounds-checked loader.
+// Smem layout per operand layout, padding and compute: mma_common.cuh.
 // PTX ISA citations for every instruction used: see mma_common.cuh.
 #include <array>
 #include <string>
@@ -28,74 +35,127 @@ namespace {
 
 using namespace mma_detail;
 
-template <class T, int STAGES>
-__global__ void __launch_bounds__(T::THREADS)
-gemm_mma_pipe_kernel(const __half* __restrict__ A, const __half* __restrict__ B,
-                     __half* __restrict__ C, int M, int N, int K, bool vec) {
-  static_assert(STAGES >= 2, "a pipeline needs at least two buffers");
-  extern __shared__ __align__(16) unsigned char smem_raw[];
-  __half* smem = reinterpret_cast<__half*>(smem_raw);
-  auto As = [&](int s) { return smem + s * T::STAGE_ELEMS; };
-  auto Bs = [&](int s) { return smem + s * T::STAGE_ELEMS + T::A_ELEMS; };
+template <class T, int STAGES, bool MASK>
+__device__ __forceinline__ void pipe_mainloop(__half* smem, const __half* A, const __half* B,
+                                              const KParams& p, int m0, int n0,
+                                              float (&acc)[T::MI][T::NI][4]) {
+  PlanA<T> pa;
+  PlanB<T> pb;
+  pa.init(A, p.lda, m0, p.M);
+  pb.init(B, p.ldb, n0, p.N);
+  const int KT = ceil_div(p.K, T::BK);
+  const bool k_tail = p.K % T::BK != 0;
+  const uint32_t s0 = smem_addr(smem);
 
-  const int m0 = blockIdx.y * T::BM, n0 = blockIdx.x * T::BN;
-  float acc[T::MI][T::NI][4] = {};
-
-  if (!vec) {  // unaligned shapes: tier 3's synchronous loop in buffer 0
-    for (int k0 = 0; k0 < K; k0 += T::BK) {
-      load_tile_sync<T>(As(0), Bs(0), A, B, M, N, K, m0, n0, k0, false);
-      __syncthreads();
-      compute_tile<T>(As(0), Bs(0), acc);
-      __syncthreads();
+  // Copy k-tile kt into stage s; the partial last k-tile (if any) is masked in k.
+  auto load = [&](int s, int kt) {
+    const uint32_t sa = s0 + uint32_t(s * T::STAGE_BYTES);
+    const uint32_t sb = sa + uint32_t(T::A_ELEMS * sizeof(__half));
+    const int k0 = kt * T::BK;
+    if (k_tail && kt == KT - 1) {
+      pa.template load_async<MASK, true>(sa, k0, p.K);
+      pb.template load_async<MASK, true>(sb, k0, p.K);
+    } else {
+      pa.template load_async<MASK, false>(sa, k0, p.K);
+      pb.template load_async<MASK, false>(sb, k0, p.K);
     }
-    store_tile<T>(C, M, N, m0, n0, acc);
-    return;
-  }
+    pa.advance();
+    pb.advance();
+  };
 
-  const int KT = ceil_div(K, T::BK);
 #pragma unroll
   for (int s = 0; s < STAGES - 1; ++s) {
-    if (s < KT) load_tile_async<T>(As(s), Bs(s), A, B, M, N, K, m0, n0, s * T::BK);
+    if (s < KT) load(s, s);
     cp_async_commit();
   }
-
   for (int kt = 0; kt < KT; ++kt) {
     cp_async_wait<STAGES - 2>();
     __syncthreads();
     const int pf = kt + STAGES - 1;
-    if (pf < KT) load_tile_async<T>(As(pf % STAGES), Bs(pf % STAGES), A, B, M, N, K, m0, n0, pf * T::BK);
+    if (pf < KT) load(pf % STAGES, pf);
     cp_async_commit();
-    compute_tile<T>(As(kt % STAGES), Bs(kt % STAGES), acc);
+    const __half* As = smem + (kt % STAGES) * T::STAGE_ELEMS;
+    compute_tile<T>(As, As + T::A_ELEMS, acc);
   }
   cp_async_wait<0>();  // no copy may outlive the block (all are empty by now)
-  store_tile<T>(C, M, N, m0, n0, acc);
 }
 
 template <class T, int STAGES>
-cudaError_t launch(const __half* A, const __half* B, __half* C, int M, int N, int K,
-                   cudaStream_t stream) {
+__global__ void __launch_bounds__(T::THREADS)
+gemm_mma_pipe_kernel(KParams p, bool vec, bool pairs) {
+  static_assert(STAGES >= 2, "a pipeline needs at least two buffers");
+  extern __shared__ __align__(16) unsigned char smem_raw[];
+  __half* smem = reinterpret_cast<__half*>(smem_raw);
+  const long long z = blockIdx.z;
+  const __half* A = p.A + z * p.sa;
+  const __half* B = p.B + z * p.sb;
+  __half* C = p.C + z * p.sc;
+  const int m0 = blockIdx.y * T::BM, n0 = blockIdx.x * T::BN;
+  float acc[T::MI][T::NI][4] = {};
+
+  if (!vec) {  // misaligned: synchronous, scalar, fully bounds-checked
+    __half* As = smem;
+    __half* Bs = smem + T::A_ELEMS;
+    for (int k0 = 0; k0 < p.K; k0 += T::BK) {
+      load_tile_scalar<T>(As, Bs, A, B, p, m0, n0, k0);
+      __syncthreads();
+      compute_tile<T>(As, Bs, acc);
+      __syncthreads();
+    }
+    store_tile<T, true>(C, p, m0, n0, pairs, acc);
+    return;
+  }
+  if (m0 + T::BM <= p.M && n0 + T::BN <= p.N) {  // interior CTA: unpredicated
+    pipe_mainloop<T, STAGES, false>(smem, A, B, p, m0, n0, acc);
+    store_tile<T, false>(C, p, m0, n0, pairs, acc);
+  } else {
+    pipe_mainloop<T, STAGES, true>(smem, A, B, p, m0, n0, acc);
+    store_tile<T, true>(C, p, m0, n0, pairs, acc);
+  }
+}
+
+template <class T, int STAGES>
+cudaError_t launch_layout(const GemmParams& gp, cudaStream_t stream) {
   constexpr size_t smem = T::STAGE_BYTES * STAGES;
   // Once per instantiation; a failure is returned on every call.
   static const cudaError_t configured = cudaFuncSetAttribute(
       gemm_mma_pipe_kernel<T, STAGES>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(smem));
   if (configured != cudaSuccess) return configured;
-  const bool vec = K % 8 == 0 && N % 8 == 0 && aligned16(A) && aligned16(B);
-  const dim3 grid(ceil_div(N, T::BN), ceil_div(M, T::BM));
-  gemm_mma_pipe_kernel<T, STAGES><<<grid, T::THREADS, smem, stream>>>(A, B, C, M, N, K, vec);
+  const dim3 grid(ceil_div(gp.N, T::BN), ceil_div(gp.M, T::BM), gp.batch);
+  gemm_mma_pipe_kernel<T, STAGES><<<grid, T::THREADS, smem, stream>>>(to_kparams(gp), vec16_ok(gp),
+                                                                       c_pairs_ok(gp));
   return cudaGetLastError();
 }
 
-template <class T, int STAGES>
+template <int BM, int BN, int BK, int WM, int WN, int STAGES>
+cudaError_t run(const GemmParams& p, cudaStream_t stream) {
+  if (const cudaError_t e = validate(p); e != cudaSuccess) return e;
+  if (is_empty(p)) return cudaSuccess;
+  constexpr Layout R = Layout::RowMajor, Cm = Layout::ColMajor;
+  if (p.layout_a == R && p.layout_b == R) return launch_layout<Tile<BM, BN, BK, WM, WN, R, R>, STAGES>(p, stream);
+  if (p.layout_a == R) return launch_layout<Tile<BM, BN, BK, WM, WN, R, Cm>, STAGES>(p, stream);
+  if (p.layout_b == R) return launch_layout<Tile<BM, BN, BK, WM, WN, Cm, R>, STAGES>(p, stream);
+  return launch_layout<Tile<BM, BN, BK, WM, WN, Cm, Cm>, STAGES>(p, stream);
+}
+
+template <int BM, int BN, int BK, int WM, int WN, int STAGES>
+cudaError_t launch(const __half* A, const __half* B, __half* C, int M, int N, int K,
+                   cudaStream_t stream) {
+  return run<BM, BN, BK, WM, WN, STAGES>(row_major_params(A, B, C, M, N, K), stream);
+}
+
+template <int BM, int BN, int BK, int WM, int WN, int STAGES>
 cudaError_t attrs(cudaFuncAttributes* a) {
+  using T = Tile<BM, BN, BK, WM, WN>;  // row-major NN: the tuned kernel
   const cudaError_t e = cudaFuncGetAttributes(a, gemm_mma_pipe_kernel<T, STAGES>);
   if (e == cudaSuccess) a->sharedSizeBytes += T::STAGE_BYTES * STAGES;  // report dynamic smem per block too
   return e;
 }
 
 constexpr size_t kN = std::size(MMA_PIPE_CONFIGS);
-template <size_t I>
-using TileOf = Tile<MMA_PIPE_CONFIGS[I].BM, MMA_PIPE_CONFIGS[I].BN, MMA_PIPE_CONFIGS[I].BK,
-                    MMA_PIPE_CONFIGS[I].WARPS_M, MMA_PIPE_CONFIGS[I].WARPS_N>;
+#define AEGIS_PIPE_ARGS(I)                                                               \
+  MMA_PIPE_CONFIGS[I].BM, MMA_PIPE_CONFIGS[I].BN, MMA_PIPE_CONFIGS[I].BK,                \
+      MMA_PIPE_CONFIGS[I].WARPS_M, MMA_PIPE_CONFIGS[I].WARPS_N, MMA_PIPE_CONFIGS[I].STAGES
 
 std::string name_of(const MmaPipeConfig& c) {
   return "mma_pipe_" + std::to_string(c.BM) + "x" + std::to_string(c.BN) + "x" +
@@ -115,11 +175,11 @@ std::span<const KernelEntry> make_entries(std::index_sequence<I...>) {
   static const std::array<std::string, kN> names{name_of(MMA_PIPE_CONFIGS[I])...};
   static const std::array<std::string, kN> configs{config_of(MMA_PIPE_CONFIGS[I])...};
   static const std::array<KernelEntry, kN> entries{KernelEntry{
-      names[I].c_str(), configs[I].c_str(),
-      &launch<TileOf<I>, MMA_PIPE_CONFIGS[I].STAGES>,
-      &attrs<TileOf<I>, MMA_PIPE_CONFIGS[I].STAGES>}...};
+      names[I].c_str(), configs[I].c_str(), &launch<AEGIS_PIPE_ARGS(I)>, &attrs<AEGIS_PIPE_ARGS(I)>,
+      &run<AEGIS_PIPE_ARGS(I)>}...};
   return entries;
 }
+#undef AEGIS_PIPE_ARGS
 
 }  // namespace
 

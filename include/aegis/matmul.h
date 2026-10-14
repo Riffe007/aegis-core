@@ -1,14 +1,18 @@
 #pragma once
 // aegis::matmul: one entry point that runs the tuned winner for this device.
 //
-//   C[M,N] = A[M,K] * B[K,N], row-major, FP16 in, FP32 accumulate, FP16 out.
+//   C[M,N] = A[M,K] * B[K,N], row-major, FP16 in, FP32 accumulate, FP16 out;
+//   or, general: matmul(GemmParams) (layouts, ld, alpha/beta, strided batch;
+//   see aegis/gemm.h). M, N, K or batch == 0: success, nothing launched.
 //
 // Selection, against the winners compiled in for the device's sm_arch
 // (include/aegis/winners/sm_<arch>.h, written by aegis-perf emit-header):
 //   1. exact (M, N, K) match;
 //   2. else the winner with the same N and K whose M is nearest in log2
 //      (ties go to the larger M);
-//   3. else cuBLAS (also if the winner's impl is no longer registered).
+//   3. else cuBLAS (also if the winner's impl is no longer registered or has
+//      no general entry).
+// Winners are tuned on row-major NN; other layouts run the same config.
 // Asynchronous on `stream`, like the per-impl launchers. Never exits the
 // process: returns cudaSuccess or the error (a launch-configuration error, or
 // cudaErrorUnknown when cuBLAS fails); matmul_last_error() describes the last
@@ -16,6 +20,8 @@
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+
+#include "aegis/gemm.h"
 
 namespace aegis {
 
@@ -28,6 +34,9 @@ struct Winner {
 
 cudaError_t matmul(const __half* A, const __half* B, __half* C, int M, int N, int K,
                    cudaStream_t stream = nullptr);
+
+// General form. Invalid parameters: cudaErrorInvalidValue (see gemm::validate).
+cudaError_t matmul(const gemm::GemmParams& p, cudaStream_t stream = nullptr);
 
 // Text of the last matmul() failure on this host thread ("" if none yet).
 const char* matmul_last_error();

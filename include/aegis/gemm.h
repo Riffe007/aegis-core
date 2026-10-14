@@ -2,7 +2,9 @@
 // AEGIS Core GEMM implementations.
 //
 // Convention for every impl:
-//   C[M,N] = A[M,K] * B[K,N], all row-major, FP16 in, FP32 accumulate, FP16 out.
+//   C[M,N] = A[M,K] * B[K,N], all row-major, FP16 in, FP32 accumulate, FP16 out
+//   for the legacy launch(); run() takes GemmParams (layouts, ld, alpha/beta,
+//   strided batch) for every production tier (0, 2, 3, 4).
 //
 // Each impl exposes:
 //   launch_<impl>(A, B, C, M, N, K, stream)   asynchronous, no sync; returns the
@@ -23,10 +25,55 @@
 
 namespace aegis::gemm {
 
+// ---------------------------------------------------------------------------
+// General GEMM parameters (Production bar: layouts, leading dimensions,
+// alpha/beta, strided batch). For batch b in [0, batch):
+//   C_b = alpha * A_b * B_b + beta * C_b
+//   A_b = A + b * stride_a, an M x K matrix, row- or column-major with lda;
+//   B_b = B + b * stride_b, K x N, row- or column-major with ldb;
+//   C_b = C + b * stride_c, M x N, row-major with ldc (ldc >= N).
+// Row-major X (R x C): X[r * ld + c], ld >= C. Column-major: X[r + c * ld], ld >= R.
+// FP16 in, FP32 accumulate, FP16 out. beta == 0: C is not read (it may hold
+// NaN). M, N, K or batch == 0: no-op, success, nothing launched (C untouched).
+// Negative sizes, too-small ld or null pointers with nonzero sizes:
+// cudaErrorInvalidValue.
+// ---------------------------------------------------------------------------
+enum class Layout : int { RowMajor = 0, ColMajor = 1 };
+
+struct GemmParams {
+  const __half* A = nullptr;
+  const __half* B = nullptr;
+  __half* C = nullptr;
+  int M = 0, N = 0, K = 0;
+  Layout layout_a = Layout::RowMajor, layout_b = Layout::RowMajor;
+  long long lda = 0, ldb = 0, ldc = 0;
+  float alpha = 1.f, beta = 0.f;
+  int batch = 1;
+  long long stride_a = 0, stride_b = 0, stride_c = 0;
+};
+
+// The legacy convention: everything row-major, packed, alpha 1, beta 0, one batch.
+inline GemmParams row_major_params(const __half* A, const __half* B, __half* C, int M, int N,
+                                   int K) {
+  GemmParams p;
+  p.A = A; p.B = B; p.C = C;
+  p.M = M; p.N = N; p.K = K;
+  p.lda = K; p.ldb = N; p.ldc = N;
+  return p;
+}
+
+// cudaSuccess if p is valid, else cudaErrorInvalidValue (see above).
+cudaError_t validate(const GemmParams& p);
+// True if the call is a no-op (some size is zero).
+inline bool is_empty(const GemmParams& p) {
+  return p.M == 0 || p.N == 0 || p.K == 0 || p.batch == 0;
+}
+
 // Tier 0: one thread per output, global memory only.
 cudaError_t launch_naive(const __half* A, const __half* B, __half* C,
                          int M, int N, int K, cudaStream_t stream);
 cudaError_t attrs_naive(cudaFuncAttributes* attrs);
+cudaError_t run_naive(const GemmParams& p, cudaStream_t stream);
 inline constexpr const char* CONFIG_naive = R"({"block":[16,16]})";
 
 // Tier 1: 32x32 shared-memory tiles, one output per thread.
@@ -41,12 +88,15 @@ inline constexpr const char* CONFIG_tiled = R"({"tile":32,"block":[32,32]})";
 using LaunchFn = cudaError_t (*)(const __half* A, const __half* B, __half* C,
                                  int M, int N, int K, cudaStream_t stream);
 using AttrsFn = cudaError_t (*)(cudaFuncAttributes* attrs);
+// General entry (layouts, ld, alpha/beta, batch). Validates p; asynchronous.
+using RunFn = cudaError_t (*)(const GemmParams& p, cudaStream_t stream);
 
 struct KernelEntry {
   const char* name;    // impl name: bench_gemm --impl, aegis_tune, perf DB
   const char* config;  // JSON; states every template parameter
   LaunchFn launch;
-  AttrsFn attrs;       // sharedSizeBytes includes dynamic smem per block
+  AttrsFn attrs;       // sharedSizeBytes includes dynamic smem per block (row-major NN kernel)
+  RunFn run;           // nullptr: legacy row-major-only impl (tier 1); launch() is then the only entry
 };
 
 // Every launchable impl, tiers 0 and up, in tier order. Defined in registry.cu.
