@@ -22,6 +22,8 @@ ctest --test-dir build --output-on-failure        # correctness on odd shapes, e
 ./build/aegis_manifest > results/manifest-$(hostname).json
 python3 tools/sweep.py                            # shape sweep -> results/*.jsonl -> perf DB
 python3 tools/perfdb.py report                    # % of cuBLAS per shape
+python3 tools/tune.py                             # every registered config x every shape -> winners
+python3 tools/tune.py --emit-header               # winners -> include/aegis/winners/sm_<arch>.h (commit it)
 tools/sass_dump.sh                                # SASS + register usage per kernel
 ```
 
@@ -90,8 +92,8 @@ artifacts/sass/     SASS dumps per arch (gitignored)
 - [x] Tier 2: register-blocked (each thread computes a TMxTN micro-tile), templated on BM/BN/BK/TM/TN
 - [x] Tier 3: tensor-core `mma.sync` m16n8k16 + `ldmatrix`, templated on BM/BN/BK/warps
 - [x] Tier 4: tier 3 + `cp.async` multi-stage pipeline (STAGES template param)
-- [ ] Autotuner: enumerate template instantiations, time per shape, write `winners`
-- [ ] `aegis::matmul()` dispatch reading winners for the local arch
+- [x] Autotuner: enumerate template instantiations, time per shape, write `winners`
+- [x] `aegis::matmul()` dispatch reading winners for the local arch
 - [ ] Decode GEMV (M=1..16), then INT8 weight-only variant
 - [ ] Fused RMSNorm and SwiGLU
 - [ ] Roofline plots and README results table on both archs

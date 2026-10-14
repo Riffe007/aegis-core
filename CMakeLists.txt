@@ -31,12 +31,24 @@ add_library(aegis_kernels STATIC
 target_include_directories(aegis_kernels PUBLIC include)
 set_target_properties(aegis_kernels PROPERTIES CUDA_SEPARABLE_COMPILATION OFF)
 
+# aegis::matmul: tuned-winner dispatch over the kernels, cuBLAS fallback.
+add_library(aegis STATIC src/matmul.cu)
+# matmul.cu pulls winners in with __has_include, which dependency scanning
+# misses when a header first appears; glob them so `tune.py --emit-header`
+# triggers a rebuild.
+file(GLOB AEGIS_WINNER_HEADERS CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/include/aegis/winners/*.h)
+set_source_files_properties(src/matmul.cu PROPERTIES OBJECT_DEPENDS "${AEGIS_WINNER_HEADERS}")
+target_link_libraries(aegis PUBLIC aegis_kernels CUDA::cudart CUDA::cublas)
+
 add_executable(bench_gemm bench/bench_gemm.cu)
 target_link_libraries(bench_gemm PRIVATE aegis_kernels CUDA::cudart CUDA::cublas)
 
 add_executable(aegis_manifest tools/aegis_manifest.cu)
 target_include_directories(aegis_manifest PRIVATE include)
 target_link_libraries(aegis_manifest PRIVATE CUDA::cudart)
+
+add_executable(test_matmul tests/test_matmul.cu)
+target_link_libraries(test_matmul PRIVATE aegis)
 
 # Correctness: every impl on shapes that are NOT multiples of any tile size.
 enable_testing()
@@ -61,3 +73,5 @@ foreach(impl ${AEGIS_IMPLS})
                                 --reps 1 --warmup 0 --check)
   endforeach()
 endforeach()
+
+add_test(NAME matmul_dispatch COMMAND test_matmul)
