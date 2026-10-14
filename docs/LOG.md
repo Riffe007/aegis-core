@@ -489,3 +489,21 @@ still produces bursts (6.8% mean / 68% max over 2 s, minutes later). Cause not
 established; the working hypothesis is still another GPU context evicting or
 time-slicing L2, now Xorg/gnome-shell/Firefox rather than remote desktop.
 Test: the same probe from a text console with `multi-user.target`.
+
+### Step 4 rerun — 4096³ run-to-run variance
+
+Same method (6 processes per impl, cold, 20 windows each), guard 0.0%, run
+`cff022fb7ae3` (`results/var4096-20261014-120300.jsonl`):
+
+| Impl | Medians (µs) | Run-to-run spread | Within-run p90−p10, % of median |
+|---|---|---|---|
+| cublas | 1486.9–1508.4 | 1.4% | 7.7–18.7 |
+| cublaslt_best | 1432.3–1449.7 | 1.2% | 10.5–18.4 |
+| mma_pipe_128x128x32_2x4_s2 | 2440.7–2541.7 | 4.0% | 17.7–21.9 |
+
+**Under 5% again for all three** (previous session: 0.7 / 1.0 / 3.9%). The
+winner's spread is now two clusters (2441–2445 and 2516–2542 µs) rather than
+one outlier, so its 4% is real run-to-run variation, not one bad run. The
+per-window band (single launch per window at this size) stays 8–22%, which
+keeps 4096³ tied. Medians are 1.5–2% higher than in the previous session for
+all three impls.
