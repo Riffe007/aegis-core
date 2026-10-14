@@ -33,7 +33,9 @@ namespace aegis::gemm {
 //   B_b = B + b * stride_b, K x N, row- or column-major with ldb;
 //   C_b = C + b * stride_c, M x N, row-major with ldc (ldc >= N).
 // Row-major X (R x C): X[r * ld + c], ld >= C. Column-major: X[r + c * ld], ld >= R.
-// FP16 in, FP32 accumulate, FP16 out. beta == 0: C is not read (it may hold
+// FP16 in, FP32 accumulate, FP16 out. alpha == 0: A*B does not contribute
+// (C = beta*C; NaN/Inf in A or B do not propagate), as in BLAS; otherwise
+// NaN and Inf propagate. beta == 0: C is not read (it may hold
 // NaN). M, N, K or batch == 0: no-op, success, nothing launched (C untouched).
 // Negative sizes, too-small ld or null pointers with nonzero sizes:
 // cudaErrorInvalidValue.

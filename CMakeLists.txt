@@ -56,6 +56,14 @@ target_link_libraries(bench_gemm PRIVATE aegis_bench_harness)
 add_executable(aegis_tune tools/aegis_tune.cu)
 target_link_libraries(aegis_tune PRIVATE aegis_bench_harness)
 
+# Randomized correctness fuzzer (Production bar): 2,000 cases in ctest, 50,000 in
+# the fuzz_nightly target.
+add_executable(aegis_fuzz tools/aegis_fuzz.cu)
+target_link_libraries(aegis_fuzz PRIVATE aegis_bench_harness aegis)
+add_custom_target(fuzz_nightly COMMAND aegis_fuzz --cases 50000 --seed 20261015
+                  DEPENDS aegis_fuzz USES_TERMINAL
+                  COMMENT "aegis_fuzz: 50,000 cases")
+
 add_executable(aegis_manifest tools/aegis_manifest.cu)
 target_link_libraries(aegis_manifest PRIVATE aegis)
 
@@ -121,6 +129,8 @@ endforeach()
 add_test(NAME matmul_dispatch COMMAND test_matmul)
 add_test(NAME capi_static COMMAND capi_test_static)
 add_test(NAME capi_shared COMMAND capi_test_shared)
+add_test(NAME fuzz_2000 COMMAND aegis_fuzz --cases 2000 --seed 1)
+add_test(NAME fuzz_selftest COMMAND aegis_fuzz --cases 200 --seed 3 --corrupt)
 
 # sm_87 compile gate (Jetson Orin; CLAUDE.md Decisions: compile only, nothing
 # runs for sm_87 until the Jetson port). Every source with kernels is compiled

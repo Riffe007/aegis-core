@@ -1,4 +1,5 @@
 // aegis::matmul dispatch. See include/aegis/matmul.h for the selection rules.
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <span>
@@ -96,12 +97,34 @@ cudaError_t cublas_gemm_general(const gemm::GemmParams& p, cudaStream_t stream) 
   return s == CUBLAS_STATUS_SUCCESS ? cudaSuccess : cublas_fail("cublasGemmStridedBatchedEx", s);
 }
 
+// alpha == 0: C = beta * C (beta == 0: C = 0 without reading C), as in BLAS.
+// cuBLAS/cuBLASLt do not apply this consistently (some algorithms propagate
+// NaN from A*B), so aegis::matmul handles it before any GEMM is chosen.
+__global__ void scale_c_kernel(__half* C, int M, int N, long long ldc, long long stride_c, float beta) {
+  __half* c = C + blockIdx.z * stride_c;
+  const long long total = (long long)M * N;
+  for (long long t = blockIdx.x * (long long)blockDim.x + threadIdx.x; t < total;
+       t += (long long)gridDim.x * blockDim.x) {
+    __half* q = c + (t / N) * ldc + t % N;
+    *q = __float2half(beta == 0.f ? 0.f : beta * __half2float(*q));
+  }
+}
+
+cudaError_t scale_c(const gemm::GemmParams& p, cudaStream_t stream) {
+  const long long total = (long long)p.M * p.N;
+  const int blocks = int(std::min<long long>((total + 255) / 256, 1024));
+  scale_c_kernel<<<dim3(blocks, 1, p.batch), 256, 0, stream>>>(p.C, p.M, p.N, p.ldc, p.stride_c, p.beta);
+  const cudaError_t e = cudaGetLastError();
+  return e == cudaSuccess ? e : fail(e, "aegis::matmul: scale C (alpha == 0)");
+}
+
 }  // namespace
 
 cudaError_t matmul(const gemm::GemmParams& p, cudaStream_t stream) {
   if (const cudaError_t e = gemm::validate(p); e != cudaSuccess)
     return fail(e, "aegis::matmul: invalid GEMM parameters");
   if (gemm::is_empty(p)) return cudaSuccess;
+  if (p.alpha == 0.f) return scale_c(p, stream);  // BLAS: A*B does not contribute
   if (const gemm::KernelEntry* e = select(p.M, p.N, p.K); e && e->run) {
     const cudaError_t err = e->run(p, stream);
     return err == cudaSuccess ? err : fail(err, std::string("launch ") + e->name);

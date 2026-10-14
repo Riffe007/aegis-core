@@ -310,7 +310,9 @@ __device__ __forceinline__ void store_tile(__half* C, const KParams& p, int m0, 
         const int row = wm + mi * 16 + lane / 4 + h * 8;
         const int col = wn + ni * 8 + (lane % 4) * 2;
         if (MASK && row >= p.M) continue;
-        float x = alpha * acc[mi][ni][2 * h], y = alpha * acc[mi][ni][2 * h + 1];
+        // alpha == 0: A*B does not contribute (BLAS), so NaN/Inf in A or B do not reach C.
+        float x = alpha == 0.f ? 0.f : alpha * acc[mi][ni][2 * h];
+        float y = alpha == 0.f ? 0.f : alpha * acc[mi][ni][2 * h + 1];
         __half* q = C + (long long)row * p.ldc + col;
         if (pairs && (!MASK || col + 1 < p.N)) {
           if (read_c) {

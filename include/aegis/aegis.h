@@ -99,7 +99,8 @@ AEGIS_API int aegis_gemm_f16(aegis_context* ctx, const void* A, const void* B, v
  *   C_b = C + b * stride_c: M x N, row-major, leading dimension ldc (>= N)
  * Layouts: AEGIS_ROW_MAJOR (X[r*ld + c], ld >= cols) or AEGIS_COL_MAJOR
  * (X[r + c*ld], ld >= rows). Strides and leading dimensions are in elements.
- * FP16 in, FP32 accumulate, FP16 out; NaN and Inf propagate. beta == 0: C is
+ * FP16 in, FP32 accumulate, FP16 out; NaN and Inf propagate, except that
+ * alpha == 0 makes A*B not contribute (C = beta*C), as in BLAS. beta == 0: C is
  * not read. Any alignment is accepted (misaligned operands take a slower path).
  * M, N, K or batch == 0: no-op, AEGIS_OK, nothing launched, C untouched.
  * Negative sizes, too-small leading dimensions, null pointers with nonzero

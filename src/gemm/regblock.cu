@@ -178,7 +178,7 @@ gemm_regblock_kernel(KParams p, bool vec) {
       const int col = n0 + (j / 4) * NSTRIDE + tx * 4 + j % 4;
       if (!interior && col >= p.N) continue;
       __half* q = C + (long long)row * p.ldc + col;
-      float out = p.alpha * acc[i][j];
+      float out = p.alpha == 0.f ? 0.f : p.alpha * acc[i][j];  // alpha == 0: A*B does not contribute
       if (read_c) out += p.beta * __half2float(*q);
       *q = __float2half(out);
     }

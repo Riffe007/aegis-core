@@ -73,11 +73,11 @@ void cpu_reference(const HostGemm& g, std::vector<double>& out) {
         arow[k] = __half2float(g.A[size_t(b * p.stride_a + (ra ? i * p.lda + k : i + k * p.lda))]);
       for (int j = 0; j < p.N; ++j) {
         double acc = 0;
-        for (int k = 0; k < p.K; ++k) {
+        for (int k = 0; p.alpha != 0.f && k < p.K; ++k) {  // alpha == 0: A*B is not needed
           const double x = __half2float(g.B[size_t(b * p.stride_b + (rb ? k * p.ldb + j : k + j * p.ldb))]);
           acc += arow[k] * x;
         }
-        double v = double(p.alpha) * acc;
+        double v = p.alpha == 0.f ? 0.0 : double(p.alpha) * acc;  // BLAS: alpha == 0 ignores A*B
         if (p.beta != 0.f) v += double(p.beta) * __half2float(g.C0[size_t(b * p.stride_c + i * p.ldc + j)]);
         out[(size_t(b) * p.M + i) * p.N + j] = v;
       }

@@ -23,7 +23,7 @@ __global__ void gemm_naive_kernel(KParams p) {
   float acc = 0.f;
   for (int k = 0; k < p.K; ++k)
     acc += __half2float(A[elem<LA>(row, k, p.lda)]) * __half2float(B[elem<LB>(k, col, p.ldb)]);
-  float out = p.alpha * acc;
+  float out = p.alpha == 0.f ? 0.f : p.alpha * acc;  // alpha == 0: A*B does not contribute (BLAS)
   if (p.beta != 0.f) out += p.beta * __half2float(*C);  // beta == 0: C is not read
   *C = __float2half(out);
 }
