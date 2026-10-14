@@ -51,6 +51,10 @@ target_link_libraries(aegis_bench_harness PUBLIC aegis_kernels CUDA::cudart CUDA
 add_executable(bench_gemm bench/bench_gemm.cu)
 target_link_libraries(bench_gemm PRIVATE aegis_bench_harness)
 
+# In-process autotuner over the registry (rows in bench_gemm's schema).
+add_executable(aegis_tune tools/aegis_tune.cu)
+target_link_libraries(aegis_tune PRIVATE aegis_bench_harness)
+
 add_executable(aegis_manifest tools/aegis_manifest.cu)
 target_link_libraries(aegis_manifest PRIVATE aegis)
 

@@ -1,0 +1,17 @@
+# M N K, one shape per line. Square shapes for the roofline, plus
+# Qwen2.5-0.5B projection shapes (hidden 896, MLP 4864) at decode (M=1, 16)
+# and prefill (M=512). Same set as the sweep.
+256 256 256
+512 512 512
+1024 1024 1024
+2048 2048 2048
+4096 4096 4096
+1 896 896
+1 4864 896
+1 896 4864
+16 896 896
+16 4864 896
+16 896 4864
+512 896 896
+512 4864 896
+512 896 4864
