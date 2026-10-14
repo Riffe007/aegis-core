@@ -13,7 +13,7 @@ if [[ -n "$py" ]]; then
   exit 1
 fi
 
-# No staged file over 5 MB (build output in e799a4f had to be stripped from history).
+# No staged file over 5 MB (build output in e799a4f, now 796e02a, had to be stripped from history).
 big=""
 while IFS= read -r -d '' f; do
   size="$(git cat-file -s ":$f")"

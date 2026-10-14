@@ -1031,7 +1031,7 @@ ctest `gpu_budget_*`: 17 GiB refused by default; 64 MiB budget: 32 MiB ok,
 `aegis-perf paired-ab` (new: alternating processes of two builds, ratio B/A per
 pair, 10,000-resample bootstrap of the median), `mma_pipe_128x256x32_2x4_s3`,
 4096³ row-major NN, cold, 30 pairs x 10 windows; A = baseline worktree
-(`e8d7e6b`, before Phase A), B = after (`c5b8f7d`). Idle guard 1.4–2.0%
+(`e8d7e6b`, before Phase A), B = after (`c5b8f7d`, now `b6d2b81` after the 2026-10-15 history rewrite). Idle guard 1.4–2.0%
 (desktop up, remote desktop off).
 
 | | Instructions (ncu) | Instructions / HMMA | Median (µs, cold v2) |
@@ -1124,3 +1124,89 @@ and `mma_pipe_256x128x32_4x2_s4` (98,304 B). Config JSON now carries
   first emit-header showed stale numbers and "TIED with" an empty partner (an
   impl tied with its own old row). Now keyed by impl: the newest measurement of
   a config supersedes older code versions.
+
+## 2026-10-15 — History rewrite: build-dev/ stripped
+
+`e799a4f` (Phase A 5) had committed `build-dev/` (415 files, ~184 MB of build
+output); `c5b8f7d` untracked it. Backup first: `git clone --mirror --no-local`
+to `~/backups/aegis-core-2026-10-14.git` (52.6 MiB pack, fsck clean). Then
+`git filter-repo --invert-paths --path build-dev/ --refs e799a4f^..main`
+(v2.47.0) and a force-push (lease on `6dacc55`). The partial range is
+deliberate: a whole-history run also strips the SSH commit signatures and so
+re-hashes all 72 commits, which would orphan every `runs.git_sha` in the perf
+DB and every hash cited here. With the range, everything before `e799a4f`
+keeps its hash and signature; the 7 rewritten commits (old -> new):
+
+| old | new | commit |
+|---|---|---|
+| e799a4f | 796e02a | Phase A 5 |
+| c5b8f7d | b6d2b81 | untrack build-dev/ |
+| ad8d0f4 | 2c6aabb | LOG: 4096³ before/after Phase A |
+| 56d0fe4 | b0bedd5 | aegis-perf library API |
+| 7fe7a84 | 4220a8c | LOG: Phase B a |
+| 6dacc55 | 16d33ec | Phase B b |
+| 0edacf2 | c776ae4 | pre-commit 5 MB check |
+
+Machine-readable full SHAs: `results/sha-remap.txt` (gitignored, next to the
+DB; the DB's two runs at `7fe7a84` are the only DB rows affected). Pack 52.6
+MiB -> 330 KiB. A fresh clone from GitHub (397 KiB) builds and passes ctest
+149/149. Guards: pre-commit rejects any staged file over 5 MB; `.gitignore`
+covers `build*/`, `cmake-build-*/`, `out/` and object, library and profile files.
+
+## 2026-10-15 — Paused here (Core)
+
+Core work stops here. State on sm_121 (winners header from runs `92ea023af8b5`
+and `41cc8ffb03fd`; paired, cold, v2), against the Production bar:
+
+| Shape | Winner | % cublaslt_best | Bar | Met |
+|---|---|---|---|---|
+| 1024³ | mma_pipe_128x64x32_2x2_s2 | 98.8% | >= 90% | yes |
+| 2048³ | mma_pipe_128x128x32_2x4_s3 | 83.6% | >= 90% | no |
+| 4096³ | mma_pipe_256x128x32_4x2_s4 | 71.0% | >= 90% | no |
+| 1x896x896 | mma_pipe_64x64x32_2x2_s4 | 84.0% | >= 100% (decode) | no |
+| 1x4864x896 | mma_pipe_64x64x32_2x2_s4 | 99.0% | >= 100% | no |
+| 1x896x4864 | mma_pipe_64x64x32_2x2_s4 | 74.9% | >= 100% | no |
+| 16x896x896 | mma_pipe_64x64x32_2x2_s4 | 96.2% | >= 100% | no |
+| 16x4864x896 | mma_pipe_64x64x32_2x2_s4 | 99.4% | >= 100% | no |
+| 16x896x4864 | mma_pipe_64x64x32_2x2_s4 | 72.7% | >= 100% | no |
+| 256³ | mma_pipe_64x64x32_2x2_s4 | 98.2% | >= 80% | yes |
+| 512³ | mma_pipe_64x64x32_2x2_s4 | 87.5% | >= 80% | yes |
+| 512x896x896 | mma_pipe_64x64x32_2x2_s4 | 90.1% | >= 80% | yes |
+| 512x896x4864 | mma_pipe_64x64x32_2x2_s4 | 82.6% | >= 80% | yes |
+| 512x4864x896 | mma_pipe_128x64x32_2x2_s2 | 79.3% | >= 80% | no |
+
+Below the 80% floor: 4096³, 1x896x4864, 16x896x4864, 512x4864x896. The
+"dispatch to cuBLASLt below 80%" rule is not implemented: `aegis::matmul`
+runs any tuned winner and falls back to plain cuBLAS only for untuned shapes.
+
+**Done.**
+- Phase A (hardening) complete:
+  - GemmParams API and ABI 1.2: layouts, ld, alpha/beta, batched.
+  - Exact predicated boundary loads with an interior fast path (4096³ tie,
+    no regression).
+  - K-scaled tolerance, c = 2.
+  - `aegis_fuzz`: 2,000 cases in ctest and 50,000 nightly, 0 failures;
+    NaN-poison over-read test.
+  - Clean under memcheck, racecheck, initcheck and synccheck.
+  - GPU budget and OOM guards.
+- Phase B:
+  - (a) Fragment double buffering: **rejected**. NOPs unchanged, +18
+    registers, 0.7% slower at 2048³.
+  - (b) XOR swizzle: **kept**. Fits s4 at 128x256 / 256x128; 2048³ 71.1 ->
+    83.6%, 4096³ 63.6 -> 71.0%.
+- Tooling: `aegis-perf paired-ab`; winners keyed by impl, so stale kernel_ids
+  are ignored.
+
+**Next, in order.**
+- a. **BK = 64 config**, to test the 8-wavefront cp.async hypothesis (A-tile
+  LDGSTS take 8 shared wavefronts instead of 4, one per 64 B row?). Cheap: new
+  config rows, ncu, tune.
+- b. **TMA loads** for the A/B tiles (`cp.async.bulk.tensor`, sm_121 only; PTX
+  ISA citation in CLAUDE.md). The shared kernel keeps cp.async for sm_87.
+- c. **Stream-K or persistent scheduling** for 2048³ wave quantization (2.67
+  waves today).
+- d. **Phase C: dedicated GEMV / split-K for decode** (M <= 16). This is the
+  path to 100%; mma tiles won't get there. 1x896x4864 and 16x896x4864 sit at
+  73–75%.
+- e. **Power-controls probe** (deferred). Needs a passwordless sudoers entry
+  for `nvidia-smi` and `cpupower`, which is not in place.
