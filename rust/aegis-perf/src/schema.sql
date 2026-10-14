@@ -56,6 +56,8 @@ CREATE TABLE IF NOT EXISTS microbench (
   probe TEXT NOT NULL,
   param_json TEXT NOT NULL,
   value REAL,
-  unit TEXT NOT NULL
+  unit TEXT NOT NULL,
+  superseded INTEGER NOT NULL DEFAULT 0,  -- 1 once a later run re-measured this probe
+  superseded_by TEXT                      -- run_id of that later run
 );
 CREATE INDEX IF NOT EXISTS idx_micro_probe ON microbench(probe);

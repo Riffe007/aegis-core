@@ -121,3 +121,70 @@ tune/emit-header, `bb09d12` roofline, `4ea8a2a` Python deleted.
 
 Open: timer quantization (above); 4096³ variance; the three microbench
 artifacts; no git remote.
+
+## 2026-10-13 (late) — error propagation, tie-break, microbench artifacts
+
+Commits: `7cf2cd5` library errors propagate (C ABI 1.1), `b199fdf` tie-aware
+winners, then this entry's commit (microbench v2 + superseded rows).
+
+### Error propagation
+Kernel host code and `aegis::matmul` return `cudaError_t`. The C ABI adds
+`AEGIS_ERR_LAUNCH_FAILED` and `aegis_last_error_string()`. Forced failure
+(M = 10^7, N = K = 896, tuned kernel, grid.y > 65535): status -6, detail
+"launch mma_pipe_128x128x32_2x4_s4: invalid argument" (CUDA 13 reports grid
+overflow as invalid argument). The process survives, the context stays usable,
+and later GEMMs are correct.
+
+### Tie-break (rule 11)
+11 of 14 sm_121 shapes are tied (runner-up median inside the winner's
+p10-p90), consistent with the 2.048 µs timer ticks and noisy p90 tails. An
+"every config inside the band" variant was rejected: a p90 of 3.5x median at
+512x4864x896 admitted configs 2x slower, and at 1024³ it picked one 14% slower.
+
+### Microbench artifacts (run `fb77bc085d64`; all 15 SASS proofs pass; the 136 rows of `55945fd9cbef` marked superseded, none deleted)
+
+**1. Pointer chase** (5 repeats per size, fresh permutation per repeat; ns median [p10-p90]):
+
+| size | cross_page | page_local_64k |
+|---|---|---|
+| 4–64 KiB | 14.6 | 14.6 |
+| 128 KiB | 145.9 [135–152] | 146.4 [140–148] |
+| 512 KiB | 262.0 [233–273] | 269.5 [258–275] |
+| 1 MiB | 360.9 [329–372] | 364.2 [349–393] |
+| 2 MiB | 427.7 [420–445] | 432.5 [426–441] |
+| 8 MiB | 426.7 [420–430] | 430.3 [428–436] |
+| 16 MiB | 431.6 [426–433] | 433.9 [429–436] |
+| 512 MiB | 434.8 [430–437] | 430.3 [427–433] |
+
+- The v1 anomalies were single-pass artifacts: 8 MiB is no longer faster than
+  4 MiB, there is no 16 MiB step, and 128 MiB is not faster than 64 MiB.
+- The two layouts agree within noise at every size, so TLB reach does not show up to 512 MiB.
+- **The 16 MiB step did not persist, so the conditional L2-partition test was
+  not run.**
+- **New open question:** no L2 plateau. Latency climbs from 146 ns
+  (128 KiB) to ~430 ns at 2 MiB and stays flat to 512 MiB, although L2 is
+  24 MiB. Not a clock-state effect: rerunning right after a heavy memory load
+  gives the same curve. **Confounder:** gnome-remote-desktop holds the GPU at
+  5–8% utilization (video clock 2099 MHz) while AEGIS is idle; it shares the
+  memory system and L2. Next: rerun with remote desktop disconnected, then a
+  per-SM pinned chase (near/far L2 test).
+
+**2. Bank conflicts** (ILP 4/8 independent loads, empty-loop subtracted, LDS.128 added):
+- Conflict-free 32-bit warp load: **1.28 cycles** (ILP 4, 8 warps/SM; v1 was
+  2.0); 1.6–2.1 at ILP 8 or 32 warps.
+- Refit, 32-bit: cycles = 0.03 + 1.11 x ways (ILP 8, 8 warps; r² 0.991);
+  slope 1.09–1.12 across variants.
+- LDS.128: conflict-free 3.4–4.3 cycles (4 phases); slope 4.5–4.6 cycles/way; r² ≥ 0.999.
+- Unexplained: 2-way (stride 2) costs the same as conflict-free in every
+  variant. From 4-way on, the curve is linear.
+- Caveat: subtracting the whole empty loop over-subtracts a little (loop
+  overhead overlaps the loads), hence negative intercepts in some fits.
+
+**3. ldmatrix x4, 8 vs 16 warps/SM.** ncu is blocked:
+`ERR_NVGPUCTRPERM` (`RmProfilingAdminOnly: 1`). Script ready:
+`sudo microbench/profile_ldmatrix.sh` (bank conflicts, wavefronts, LSU
+utilization, occupancy, stall reasons; CSV in `artifacts/microbench/`).
+Without counters: 8 warps gives **exactly 128.0 B/clk/SM on every run**
+(the ceiling); 16 warps gives 99.1, 128.0, 119.1, 128.0, 109.2 across 5 runs.
+So the "drop" is intermittent variance above 8 warps, not a fixed
+property. **Cause: unexplained** until the counters are collected.

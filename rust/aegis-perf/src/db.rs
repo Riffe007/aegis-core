@@ -34,6 +34,8 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("winners", "tied", "INTEGER NOT NULL DEFAULT 0"),
     ("winners", "tie_set", "TEXT"),
     ("winners", "pick_reason", "TEXT"),
+    ("microbench", "superseded", "INTEGER NOT NULL DEFAULT 0"),
+    ("microbench", "superseded_by", "TEXT"),
 ];
 
 fn migrate(con: &Connection) -> Result<()> {
@@ -242,15 +244,29 @@ pub fn cmd_ingest_microbench(db: &Path, results: &Path, manifest: Option<&Path>,
             SqlValue::Null, gpu_temp_c(), sql(manifest.get("measured_d2d_bw_gbps")), started_at,
         ],
     )?;
+    let mut probes: Vec<String> = Vec::new();
     for r in &rows {
+        let probe = get(r, "probe")?.as_str().unwrap_or_default().to_string();
         tx.execute(
-            "INSERT INTO microbench VALUES (?,?,?,?,?)",
-            params![run_id, sql(Some(get(r, "probe")?)), dumps_sorted(get(r, "param")?),
-                    sql(Some(get(r, "value")?)), sql(Some(get(r, "unit")?))],
+            "INSERT INTO microbench (run_id, probe, param_json, value, unit) VALUES (?,?,?,?,?)",
+            params![run_id, probe, dumps_sorted(get(r, "param")?), sql(Some(get(r, "value")?)), sql(Some(get(r, "unit")?))],
+        )?;
+        if !probes.contains(&probe) {
+            probes.push(probe);
+        }
+    }
+    // Older rows of a re-measured probe on the same arch are kept, marked superseded.
+    let mut superseded = 0;
+    for probe in &probes {
+        superseded += tx.execute(
+            "UPDATE microbench SET superseded = 1, superseded_by = ?1 \
+             WHERE probe = ?2 AND run_id <> ?1 AND superseded = 0 \
+               AND run_id IN (SELECT run_id FROM runs WHERE sm_arch = ?3)",
+            params![run_id, probe, sql(Some(get(first, "sm_arch")?))],
         )?;
     }
     tx.commit()?;
-    println!("run {run_id}: ingested {} microbench rows", rows.len());
+    println!("run {run_id}: ingested {} microbench rows; marked {superseded} older rows superseded", rows.len());
     Ok(())
 }
 

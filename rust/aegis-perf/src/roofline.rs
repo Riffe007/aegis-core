@@ -2,7 +2,7 @@
 //!
 //! Roofs come from measurements on the same device (CLAUDE.md rule 8):
 //! memory = latest measured_bw_gbps in `runs` (aegis_manifest D2D copy);
-//! compute = best `mma_throughput` TFLOPS in `microbench`.
+//! compute = best current (not superseded) `mma_throughput` TFLOPS in `microbench`.
 //! Points: per shape, cuBLAS and our winner (latest passing measurement), at
 //! compulsory arithmetic intensity 2MNK / (2 (MK + KN + MN)) FLOP/B.
 use std::path::Path;
@@ -31,7 +31,8 @@ fn roofs(con: &Connection, arch: i64) -> Result<(f64, f64)> {
     let peak: Option<f64> = con
         .query_row(
             "SELECT MAX(mb.value) FROM microbench mb JOIN runs r USING(run_id) \
-             WHERE r.sm_arch = ? AND mb.probe = 'mma_throughput' AND mb.unit = 'TFLOPS'",
+             WHERE r.sm_arch = ? AND mb.probe = 'mma_throughput' AND mb.unit = 'TFLOPS' \
+             AND mb.superseded = 0",
             [arch],
             |r| r.get(0),
         )

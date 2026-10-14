@@ -7,7 +7,10 @@
 // changing banks. Results are XOR-folded so no load is dead.
 // Timed loop: 8 LDSM per iteration.
 // Output: probe "ldmatrix_x4_throughput": bytes/clk/SM and GB/s (all SMs).
+// `mb_ldmatrix --warps N` runs only that point (for ncu; see profile_ldmatrix.sh).
 #include <cstdint>
+#include <cstring>
+#include <vector>
 
 #include "common.cuh"
 
@@ -40,7 +43,9 @@ extern "C" __global__ void mb_ldmatrix_x4(int iters, uint32_t* sink, long long* 
   if (blockIdx.x == 0 && threadIdx.x == 0) *cycles = t1 - t0;
 }
 
-int main() {
+int main(int argc, char** argv) {
+  std::vector<int> points = {1, 2, 4, 8, 16, 32};
+  if (argc == 3 && std::strcmp(argv[1], "--warps") == 0) points = {std::atoi(argv[2])};
   const mb::Device dev = mb::device();
   mb::prove("mb_ldmatrix_x4", {{"LDSM", kUnroll}});
   const int sms = dev.prop.multiProcessorCount;
@@ -49,7 +54,7 @@ int main() {
   MB_CHECK(cudaMalloc(&sink, size_t(sms) * 1024 * sizeof(uint32_t)));
   MB_CHECK(cudaMalloc(&dcycles, sizeof(long long)));
   const int iters = 1 << 14;
-  for (int warps : {1, 2, 4, 8, 16, 32}) {
+  for (int warps : points) {
     mb_ldmatrix_x4<<<sms, warps * 32>>>(16, sink, dcycles);
     const float ms = mb::time_ms([&] { mb_ldmatrix_x4<<<sms, warps * 32>>>(iters, sink, dcycles); });
     long long cycles = 0;
