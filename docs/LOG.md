@@ -876,3 +876,44 @@ The cublaslt_best kernel is `nvjet_sm121_hsh_mma_128x208x64_2_32x104x64_tmaAB_bz
 after every HMMA (e.g. `HMMA.16816.F32 R124, R148, R156, R124 ; NOP ;
 HMMA.16816.F32 R120, R140, R156, R120 ; NOP ; ...`), 0.875 NOPs per HMMA
 executed in both configs.
+
+### 5. Verdict on the warp-tile hypothesis
+
+The hypothesis: the winner is limited by too little tensor work per
+instruction and per byte; a larger warp tile (64x64) would cut instructions,
+raise tensor-pipe busy % and cut L2 traffic.
+
+**Partly held, at 4096³ only.**
+- **Speed:** 4096³ +12.1% throughput (old/new 1.121 [1.109, 1.129], paired);
+  cublaslt_best/ours 0.58–0.59 → 0.662. **2048³: no gain** (the best 64x64
+  config is 2.2% slower, 1.022 [1.018, 1.026]); with 1 block per SM it runs
+  128 tiles on 48 SMs = 2.67 waves, and tensor-pipe busy drops 42.5% → 40.4%.
+- **Per byte — held:** L2 sectors −24% at both sizes (102.8 M → 77.6 M;
+  13.1 M → 10.0 M); long_scoreboard stalls 9.15 → 0.95, barrier 2.68 → 0.68.
+- **Per instruction — did not hold:** LDSM per HMMA fell exactly as predicted
+  (12.58 M → 8.39 M), but total instructions did not move (183.6 M → 184.8 M;
+  5.5 per HMMA vs cublaslt_best's 1.9). The saved ldmatrix were replaced by
+  more integer address work and shared loads (IMAD +3.5 M, LEA +1.6 M,
+  IADD3 +2.0 M, LDS +3.1 M). Tensor-pipe busy rose only 49.6% → 53.0%
+  (cublaslt_best 80%).
+
+**Top limiter now: instruction overhead around the HMMAs, i.e. issue, not
+memory.** Per HMMA the kernel executes 0.875 NOP and ~2 per-thread integer
+instructions (IMAD, LEA, ISETP, IADD3, SHF, MOV); the dominant stall is `wait`
+(3.85 per issue, fixed-latency dependency waits), then math_pipe_throttle
+(2.53); memory stalls are now small. cublaslt_best runs the same HMMA.16816
+back to back without NOPs, does its address arithmetic on the uniform
+datapath (UIMAD/UIADD3/UISETP) and loads tiles with TMA (UTMALDG), so its
+tensor pipe, not issue, is the limit (math_pipe_throttle 13 per issue).
+
+Hypotheses for the next experiments (none tested):
+1. The NOP after every HMMA is a scheduling artifact of the operand order in
+   `compute_tile` (consecutive HMMAs share B and vary A in our SASS; nvjet's
+   share A and vary B). Test: reorder the MI/NI loops and compare NOP count.
+2. Per-thread address math: precompute smem/global offsets per stage so the
+   loop body is mostly LDSM + HMMA. Test: instructions per HMMA.
+3. TMA: nvjet uses `UTMALDG` on sm_121, so the tensor-copy path exists on this
+   chip (CLAUDE.md only rules out tcgen05/TMEM/UMMA). Verify
+   `cp.async.bulk.tensor` against the PTX ISA for sm_120/sm_121 before use.
+4. 2048³: wave quantization with 1 block per SM (2.67 waves); a split-K or
+   persistent schedule, or a 192-tile grid like cublaslt_best's, would test it.
