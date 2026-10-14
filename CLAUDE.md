@@ -112,6 +112,10 @@ artifacts/          SASS dumps per arch, microbench SASS proofs (gitignored)
    refuses any `*.py` file. Kernel ids keep their canonical config
    serialization (`rust/aegis-perf/src/pyjson.rs`) so existing perf DBs stay
    valid.
+10. **The library never exits the process.** Kernel host code (`launch_*`,
+   `attrs_*`) and `aegis::matmul` return `cudaError_t`; the C ABI returns
+   `AEGIS_ERR_*` and sets `aegis_last_error_string()`. Only bench, test and
+   tool binaries may abort (`AEGIS_CUDA_CHECK`).
 
 ## Architecture notes you must respect
 

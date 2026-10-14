@@ -43,18 +43,16 @@ __global__ void gemm_tiled_kernel(const __half* __restrict__ A,
 
 }  // namespace
 
-void launch_tiled(const __half* A, const __half* B, __half* C, int M, int N,
-                  int K, cudaStream_t stream) {
+cudaError_t launch_tiled(const __half* A, const __half* B, __half* C, int M, int N,
+                         int K, cudaStream_t stream) {
   const dim3 block(TILE, TILE);
   const dim3 grid(ceil_div(N, TILE), ceil_div(M, TILE));
   gemm_tiled_kernel<<<grid, block, 0, stream>>>(A, B, C, M, N, K);
-  AEGIS_CUDA_CHECK(cudaGetLastError());
+  return cudaGetLastError();  // launch-configuration errors; never exits
 }
 
-cudaFuncAttributes attrs_tiled() {
-  cudaFuncAttributes a{};
-  AEGIS_CUDA_CHECK(cudaFuncGetAttributes(&a, gemm_tiled_kernel));
-  return a;
+cudaError_t attrs_tiled(cudaFuncAttributes* attrs) {
+  return cudaFuncGetAttributes(attrs, gemm_tiled_kernel);
 }
 
 }  // namespace aegis::gemm

@@ -48,27 +48,23 @@ gemm_mma_kernel(const __half* __restrict__ A, const __half* __restrict__ B,
 }
 
 template <class T>
-void launch(const __half* A, const __half* B, __half* C, int M, int N, int K,
-            cudaStream_t stream) {
-  static const bool configured = [] {
-    AEGIS_CUDA_CHECK(cudaFuncSetAttribute(gemm_mma_kernel<T>,
-                                          cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                          int(T::STAGE_BYTES)));
-    return true;
-  }();
-  (void)configured;
+cudaError_t launch(const __half* A, const __half* B, __half* C, int M, int N, int K,
+                   cudaStream_t stream) {
+  // Once per instantiation; a failure is returned on every call.
+  static const cudaError_t configured = cudaFuncSetAttribute(
+      gemm_mma_kernel<T>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(T::STAGE_BYTES));
+  if (configured != cudaSuccess) return configured;
   const bool vec = K % 8 == 0 && N % 8 == 0 && aligned16(A) && aligned16(B);
   const dim3 grid(ceil_div(N, T::BN), ceil_div(M, T::BM));
   gemm_mma_kernel<T><<<grid, T::THREADS, T::STAGE_BYTES, stream>>>(A, B, C, M, N, K, vec);
-  AEGIS_CUDA_CHECK(cudaGetLastError());
+  return cudaGetLastError();
 }
 
 template <class T>
-cudaFuncAttributes attrs() {
-  cudaFuncAttributes a{};
-  AEGIS_CUDA_CHECK(cudaFuncGetAttributes(&a, gemm_mma_kernel<T>));
-  a.sharedSizeBytes += T::STAGE_BYTES;  // report dynamic smem per block too
-  return a;
+cudaError_t attrs(cudaFuncAttributes* a) {
+  const cudaError_t e = cudaFuncGetAttributes(a, gemm_mma_kernel<T>);
+  if (e == cudaSuccess) a->sharedSizeBytes += T::STAGE_BYTES;  // report dynamic smem per block too
+  return e;
 }
 
 constexpr size_t kN = std::size(MMA_CONFIGS);

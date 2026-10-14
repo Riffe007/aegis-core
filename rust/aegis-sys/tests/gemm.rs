@@ -28,7 +28,8 @@ fn f16_value(h: u16) -> f64 {
 
 #[test]
 fn abi_and_manifest() {
-    assert_eq!(abi_version(), 1000);
+    use aegis_sys::ffi::{AEGIS_ABI_VERSION_MAJOR, AEGIS_ABI_VERSION_MINOR};
+    assert_eq!(abi_version() as u32, AEGIS_ABI_VERSION_MAJOR * 1000 + AEGIS_ABI_VERSION_MINOR);
     let json = device_manifest(0).expect("manifest");
     assert!(json.contains("\"measured_d2d_bw_gbps\""), "{json}");
     assert!(device_manifest(-1).is_err());

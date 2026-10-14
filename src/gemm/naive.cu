@@ -24,18 +24,16 @@ __global__ void gemm_naive_kernel(const __half* __restrict__ A,
 
 }  // namespace
 
-void launch_naive(const __half* A, const __half* B, __half* C, int M, int N,
-                  int K, cudaStream_t stream) {
+cudaError_t launch_naive(const __half* A, const __half* B, __half* C, int M, int N,
+                         int K, cudaStream_t stream) {
   const dim3 block(16, 16);
   const dim3 grid(ceil_div(N, block.x), ceil_div(M, block.y));
   gemm_naive_kernel<<<grid, block, 0, stream>>>(A, B, C, M, N, K);
-  AEGIS_CUDA_CHECK(cudaGetLastError());
+  return cudaGetLastError();  // launch-configuration errors; never exits
 }
 
-cudaFuncAttributes attrs_naive() {
-  cudaFuncAttributes a{};
-  AEGIS_CUDA_CHECK(cudaFuncGetAttributes(&a, gemm_naive_kernel));
-  return a;
+cudaError_t attrs_naive(cudaFuncAttributes* attrs) {
+  return cudaFuncGetAttributes(attrs, gemm_naive_kernel);
 }
 
 }  // namespace aegis::gemm

@@ -1,6 +1,7 @@
 /* C ABI test, compiled as strict C11 (no CUDA headers): error paths, the
- * manifest buffer protocol, and aegis_gemm_f16 against a CPU reference with
- * the bench tolerance (max_abs_err / max|ref| <= 4e-3). */
+ * manifest buffer protocol, a forced kernel-launch failure the process must
+ * survive, and aegis_gemm_f16 against a CPU reference with the bench
+ * tolerance (max_abs_err / max|ref| <= 4e-3). */
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -73,6 +74,40 @@ static void test_errors(aegis_context* ctx) {
   EXPECT(strcmp(aegis_status_string(AEGIS_ERR_CUDA), "unknown status") != 0, "status string");
   EXPECT(aegis_abi_version() == AEGIS_ABI_VERSION_MAJOR * 1000 + AEGIS_ABI_VERSION_MINOR,
          "abi version");
+  EXPECT(aegis_gemm_f16(ctx, NULL, NULL, NULL, 1, 1, 1) == AEGIS_ERR_INVALID_ARGUMENT &&
+             strlen(aegis_last_error_string()) > 0,
+         "invalid argument sets aegis_last_error_string");
+}
+
+/* A shape whose tuned kernel cannot be launched: M = 10^7 rows with a tuned
+ * N, K (896 x 896) selects a tuned kernel (nearest-M winner) whose grid needs
+ * > 65535 blocks in y, so the launch is rejected (CUDA 13: "invalid
+ * argument") before touching memory. The process must survive with
+ * AEGIS_ERR_LAUNCH_FAILED, and the context must stay usable. */
+static void test_launch_failure(aegis_context* ctx) {
+  const int M = 10000000, N = 896, K = 896;
+  char choice[64] = "";
+  EXPECT(aegis_gemm_choice(ctx, M, N, K, choice, sizeof choice, NULL) == AEGIS_OK, "choice");
+  if (strcmp(choice, "cublas") == 0) {
+    /* No tuned kernel for 896x896 on this arch (no winners header yet): cuBLAS
+     * would really run a 10^7-row GEMM on these tiny buffers. Not testable. */
+    printf("skip launch-failure test: %dx%dx%d would use cuBLAS on this arch\n", M, N, K);
+    return;
+  }
+  void* p = NULL;
+  EXPECT(aegis_device_alloc(ctx, 256, &p) == AEGIS_OK, "alloc");
+  const int s = aegis_gemm_f16(ctx, p, p, p, M, N, K);
+  const char* detail = aegis_last_error_string();
+  printf("%-4s forced launch failure via %s: status %d (%s), detail \"%s\"\n",
+         s == AEGIS_ERR_LAUNCH_FAILED ? "ok" : "FAIL", choice, s, aegis_status_string(s), detail);
+  EXPECT(s == AEGIS_ERR_LAUNCH_FAILED, "expected AEGIS_ERR_LAUNCH_FAILED, got %d", s);
+  EXPECT(strstr(detail, choice) != NULL, "detail names the kernel: %s", detail);
+  /* CUDA 13 reports the y-grid overflow as "invalid argument"; require some
+   * CUDA error text after the kernel name rather than one exact wording. */
+  EXPECT(strstr(detail, ": ") != NULL && strlen(strstr(detail, ": ")) > 2,
+         "detail has the CUDA error text: %s", detail);
+  EXPECT(aegis_synchronize(ctx) == AEGIS_OK, "context still usable after the failed launch");
+  EXPECT(aegis_device_free(ctx, p) == AEGIS_OK, "free");
 }
 
 static void test_manifest(void) {
@@ -143,7 +178,8 @@ int main(void) {
   }
   test_errors(ctx);
   test_manifest();
-  test_gemm(ctx, 127, 129, 65);  /* unaligned */
+  test_launch_failure(ctx);
+  test_gemm(ctx, 127, 129, 65);  /* unaligned; also proves the process survived */
   test_gemm(ctx, 16, 896, 896);  /* tuned decode shape (if winners are compiled in) */
   test_gemm(ctx, 256, 256, 256);
   EXPECT(aegis_destroy(ctx) == AEGIS_OK, "destroy");

@@ -5,9 +5,11 @@
 //   C[M,N] = A[M,K] * B[K,N], all row-major, FP16 in, FP32 accumulate, FP16 out.
 //
 // Each impl exposes:
-//   launch_<impl>(A, B, C, M, N, K, stream)   asynchronous, no sync
-//   attrs_<impl>()                            cudaFuncAttributes of its kernel
+//   launch_<impl>(A, B, C, M, N, K, stream)   asynchronous, no sync; returns the
+//                                             launch status (never exits)
+//   attrs_<impl>(&attrs)                      cudaFuncAttributes of its kernel
 //   CONFIG_<impl>                             JSON string of its fixed config
+// Library code returns cudaError_t; only bench/test/tool binaries may abort.
 //
 // Templated impls (tiers 2+) expose a constexpr config table instead. Each row
 // is one instantiation; its impl name and JSON config are derived from the row.
@@ -22,23 +24,23 @@
 namespace aegis::gemm {
 
 // Tier 0: one thread per output, global memory only.
-void launch_naive(const __half* A, const __half* B, __half* C,
-                  int M, int N, int K, cudaStream_t stream);
-cudaFuncAttributes attrs_naive();
+cudaError_t launch_naive(const __half* A, const __half* B, __half* C,
+                         int M, int N, int K, cudaStream_t stream);
+cudaError_t attrs_naive(cudaFuncAttributes* attrs);
 inline constexpr const char* CONFIG_naive = R"({"block":[16,16]})";
 
 // Tier 1: 32x32 shared-memory tiles, one output per thread.
-void launch_tiled(const __half* A, const __half* B, __half* C,
-                  int M, int N, int K, cudaStream_t stream);
-cudaFuncAttributes attrs_tiled();
+cudaError_t launch_tiled(const __half* A, const __half* B, __half* C,
+                         int M, int N, int K, cudaStream_t stream);
+cudaError_t attrs_tiled(cudaFuncAttributes* attrs);
 inline constexpr const char* CONFIG_tiled = R"({"tile":32,"block":[32,32]})";
 
 // ---------------------------------------------------------------------------
 // Registry
 // ---------------------------------------------------------------------------
-using LaunchFn = void (*)(const __half* A, const __half* B, __half* C,
-                          int M, int N, int K, cudaStream_t stream);
-using AttrsFn = cudaFuncAttributes (*)();
+using LaunchFn = cudaError_t (*)(const __half* A, const __half* B, __half* C,
+                                 int M, int N, int K, cudaStream_t stream);
+using AttrsFn = cudaError_t (*)(cudaFuncAttributes* attrs);
 
 struct KernelEntry {
   const char* name;    // impl name: bench_gemm --impl, aegis_tune, perf DB

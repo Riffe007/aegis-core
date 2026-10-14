@@ -35,10 +35,14 @@ fn check(status: i32, ctx: Option<&Context>) -> Result<()> {
         return Ok(());
     }
     let mut message = status_string(status);
-    if let Some(ctx) = ctx {
-        let detail = ctx.last_error();
-        if !detail.is_empty() {
-            message = format!("{message}: {detail}");
+    // SAFETY: returns a NUL-terminated thread-local string, valid until the next call.
+    let detail = unsafe { CStr::from_ptr(ffi::aegis_last_error_string()) }.to_string_lossy().into_owned();
+    if !detail.is_empty() {
+        message = format!("{message}: {detail}");
+    } else if let Some(ctx) = ctx {
+        let cuda = ctx.last_error();
+        if !cuda.is_empty() {
+            message = format!("{message}: {cuda}");
         }
     }
     Err(Error { status, message })

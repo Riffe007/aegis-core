@@ -2,8 +2,10 @@
  * AEGIS Core C ABI. Pure C (C99 and later), no C++ or CUDA types.
  *
  * All functions return an int status: AEGIS_OK (0) or a negative AEGIS_ERR_*.
- * aegis_status_string() describes any status. When a CUDA call failed, the
- * context also remembers the CUDA error text (aegis_last_error()).
+ * No function exits or aborts the process. aegis_status_string() describes a
+ * status code; aegis_last_error_string() gives the detail of the last failure
+ * on the calling thread (errno-style: kept until the next failure), and
+ * aegis_last_error(ctx) the last CUDA error a context saw.
  *
  * Memory: GEMM operands are device pointers to FP16 data (IEEE binary16 bit
  * patterns, uint16_t on the host). Allocate them with aegis_device_alloc() or
@@ -41,14 +43,20 @@ extern "C" {
 #define AEGIS_ERR_BUFFER_TOO_SMALL (-3)  /* see the `needed` out-parameter */
 #define AEGIS_ERR_NO_DEVICE (-4)         /* device index out of range / no GPU */
 #define AEGIS_ERR_OUT_OF_MEMORY (-5)
+#define AEGIS_ERR_LAUNCH_FAILED (-6)     /* a kernel could not be launched (since ABI 1.1) */
 
 /* ABI version: bump the major on any incompatible change. */
 #define AEGIS_ABI_VERSION_MAJOR 1
-#define AEGIS_ABI_VERSION_MINOR 0
+#define AEGIS_ABI_VERSION_MINOR 1
 AEGIS_API int aegis_abi_version(void); /* major * 1000 + minor */
 
 /* Static description of a status code. Never NULL. */
 AEGIS_API const char* aegis_status_string(int status);
+
+/* Detail of the last failed call on this thread, e.g. which kernel failed to
+ * launch and the CUDA error text. "" if nothing has failed. Valid until the
+ * next aegis_* call on this thread. Since ABI 1.1. */
+AEGIS_API const char* aegis_last_error_string(void);
 
 /* Opaque context: one device and one stream (a private non-blocking stream,
  * or the caller's, see aegis_set_stream). */
@@ -75,7 +83,9 @@ AEGIS_API int aegis_copy_to_host(aegis_context* ctx, void* dst, const void* src,
 
 /* C[M,N] = A[M,K] * B[K,N]; row-major, FP16 in, FP32 accumulate, FP16 out.
  * Runs the tuned winner for the device (aegis::matmul), else cuBLAS.
- * Asynchronous on the context's stream. */
+ * Asynchronous on the context's stream. A kernel that cannot be launched for
+ * this shape (e.g. its grid exceeds device limits) returns
+ * AEGIS_ERR_LAUNCH_FAILED; the context stays usable. */
 AEGIS_API int aegis_gemm_f16(aegis_context* ctx, const void* A, const void* B, void* C,
                              int M, int N, int K);
 

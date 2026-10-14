@@ -118,20 +118,18 @@ gemm_regblock_kernel(const __half* __restrict__ A, const __half* __restrict__ B,
 bool aligned16(const void* p) { return (reinterpret_cast<uintptr_t>(p) & 15) == 0; }
 
 template <int BM, int BN, int BK, int TM, int TN>
-void launch(const __half* A, const __half* B, __half* C, int M, int N, int K,
-            cudaStream_t stream) {
+cudaError_t launch(const __half* A, const __half* B, __half* C, int M, int N, int K,
+                   cudaStream_t stream) {
   const bool vec = K % 8 == 0 && N % 8 == 0 && aligned16(A) && aligned16(B);
   const dim3 block((BM / TM) * (BN / TN));
   const dim3 grid(ceil_div(N, BN), ceil_div(M, BM));
   gemm_regblock_kernel<BM, BN, BK, TM, TN><<<grid, block, 0, stream>>>(A, B, C, M, N, K, vec);
-  AEGIS_CUDA_CHECK(cudaGetLastError());
+  return cudaGetLastError();
 }
 
 template <int BM, int BN, int BK, int TM, int TN>
-cudaFuncAttributes attrs() {
-  cudaFuncAttributes a{};
-  AEGIS_CUDA_CHECK(cudaFuncGetAttributes(&a, gemm_regblock_kernel<BM, BN, BK, TM, TN>));
-  return a;
+cudaError_t attrs(cudaFuncAttributes* a) {
+  return cudaFuncGetAttributes(a, gemm_regblock_kernel<BM, BN, BK, TM, TN>);
 }
 
 constexpr size_t kN = std::size(REGBLOCK_CONFIGS);

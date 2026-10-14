@@ -9,7 +9,10 @@
 //   2. else the winner with the same N and K whose M is nearest in log2
 //      (ties go to the larger M);
 //   3. else cuBLAS (also if the winner's impl is no longer registered).
-// Asynchronous on `stream`, like the per-impl launchers.
+// Asynchronous on `stream`, like the per-impl launchers. Never exits the
+// process: returns cudaSuccess or the error (a launch-configuration error, or
+// cudaErrorUnknown when cuBLAS fails); matmul_last_error() describes the last
+// failure on this host thread.
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -23,8 +26,11 @@ struct Winner {
 };
 }  // namespace detail
 
-void matmul(const __half* A, const __half* B, __half* C, int M, int N, int K,
-            cudaStream_t stream = nullptr);
+cudaError_t matmul(const __half* A, const __half* B, __half* C, int M, int N, int K,
+                   cudaStream_t stream = nullptr);
+
+// Text of the last matmul() failure on this host thread ("" if none yet).
+const char* matmul_last_error();
 
 // The impl matmul() would run for this shape on the current device, or
 // "cublas". For logging and tests.

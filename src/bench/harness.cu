@@ -82,7 +82,7 @@ Harness::~Harness() {
 }
 
 void Harness::launch(const gemm::KernelEntry* e, Problem& p) {
-  if (e) e->launch(p.A, p.B, p.C, p.M, p.N, p.K, stream_);
+  if (e) AEGIS_CUDA_CHECK(e->launch(p.A, p.B, p.C, p.M, p.N, p.K, stream_));
   else cublas_gemm(cublas_, p.A, p.B, p.C, p.M, p.N, p.K);
 }
 
@@ -150,7 +150,8 @@ std::string Harness::json_row(const char* impl, const gemm::KernelEntry* e, cons
   const double tflops = flops / (t.median_us * 1e-6) / 1e12;
   const double gbps = bytes / (t.median_us * 1e-6) / 1e9;
   const char* config = e ? e->config : R"({"algo":"CUBLAS_GEMM_DEFAULT"})";
-  const cudaFuncAttributes attrs = e ? e->attrs() : cudaFuncAttributes{};
+  cudaFuncAttributes attrs{};
+  if (e) AEGIS_CUDA_CHECK(e->attrs(&attrs));
   auto print = [&](char* buf, size_t n) {
     return std::snprintf(
         buf, n,

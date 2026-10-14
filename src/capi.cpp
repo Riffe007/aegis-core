@@ -1,9 +1,7 @@
 // C ABI (include/aegis/aegis.h) over aegis::matmul and the device manifest.
 //
-// Every entry point validates its arguments and turns CUDA errors into status
-// codes. Limitation: the per-impl kernel launchers abort the process on a
-// launch failure (AEGIS_CUDA_CHECK). With validated arguments that indicates a
-// broken device or build, not a caller error.
+// Every entry point validates its arguments and turns CUDA, cuBLAS and launch
+// errors into status codes. Nothing on this path exits the process.
 #include "aegis/aegis.h"
 
 #include <cuda_runtime.h>
@@ -26,15 +24,23 @@ struct aegis_context {
 
 namespace {
 
+thread_local std::string thread_error;  // aegis_last_error_string()
+
+int fail(int status, const std::string& detail) {
+  thread_error = detail;
+  return status;
+}
+
 int fail_cuda(aegis_context* ctx, cudaError_t e) {
   if (ctx) ctx->last_error = cudaGetErrorString(e);
   cudaGetLastError();  // clear a non-sticky error so it does not leak into the next call
-  return e == cudaErrorMemoryAllocation ? AEGIS_ERR_OUT_OF_MEMORY : AEGIS_ERR_CUDA;
+  return fail(e == cudaErrorMemoryAllocation ? AEGIS_ERR_OUT_OF_MEMORY : AEGIS_ERR_CUDA,
+              cudaGetErrorString(e));
 }
 
 // Make ctx's device current on this thread before any CUDA call.
 int enter(aegis_context* ctx) {
-  if (!ctx) return AEGIS_ERR_INVALID_ARGUMENT;
+  if (!ctx) return fail(AEGIS_ERR_INVALID_ARGUMENT, aegis_status_string(AEGIS_ERR_INVALID_ARGUMENT));
   const cudaError_t e = cudaSetDevice(ctx->device);
   return e == cudaSuccess ? AEGIS_OK : fail_cuda(ctx, e);
 }
@@ -42,8 +48,8 @@ int enter(aegis_context* ctx) {
 int copy_out(const std::string& s, char* buf, size_t buf_len, size_t* needed) {
   if (needed) *needed = s.size() + 1;
   if (!buf && buf_len == 0) return AEGIS_OK;  // size query
-  if (!buf) return AEGIS_ERR_INVALID_ARGUMENT;
-  if (buf_len < s.size() + 1) return AEGIS_ERR_BUFFER_TOO_SMALL;
+  if (!buf) return fail(AEGIS_ERR_INVALID_ARGUMENT, aegis_status_string(AEGIS_ERR_INVALID_ARGUMENT));
+  if (buf_len < s.size() + 1) return fail(AEGIS_ERR_BUFFER_TOO_SMALL, aegis_status_string(AEGIS_ERR_BUFFER_TOO_SMALL));
   std::memcpy(buf, s.c_str(), s.size() + 1);
   return AEGIS_OK;
 }
@@ -54,6 +60,8 @@ extern "C" {
 
 int aegis_abi_version(void) { return AEGIS_ABI_VERSION_MAJOR * 1000 + AEGIS_ABI_VERSION_MINOR; }
 
+const char* aegis_last_error_string(void) { return thread_error.c_str(); }
+
 const char* aegis_status_string(int status) {
   switch (status) {
     case AEGIS_OK: return "ok";
@@ -62,20 +70,21 @@ const char* aegis_status_string(int status) {
     case AEGIS_ERR_BUFFER_TOO_SMALL: return "buffer too small (see needed)";
     case AEGIS_ERR_NO_DEVICE: return "no such CUDA device";
     case AEGIS_ERR_OUT_OF_MEMORY: return "out of device memory";
+    case AEGIS_ERR_LAUNCH_FAILED: return "kernel launch failed (see aegis_last_error_string)";
     default: return "unknown status";
   }
 }
 
 int aegis_create(aegis_context** out, int device) {
-  if (!out) return AEGIS_ERR_INVALID_ARGUMENT;
+  if (!out) return fail(AEGIS_ERR_INVALID_ARGUMENT, aegis_status_string(AEGIS_ERR_INVALID_ARGUMENT));
   *out = nullptr;
   int count = 0;
   if (cudaGetDeviceCount(&count) != cudaSuccess || device < 0 || device >= count) {
     cudaGetLastError();
-    return AEGIS_ERR_NO_DEVICE;
+    return fail(AEGIS_ERR_NO_DEVICE, aegis_status_string(AEGIS_ERR_NO_DEVICE));
   }
   auto* ctx = new (std::nothrow) aegis_context;
-  if (!ctx) return AEGIS_ERR_OUT_OF_MEMORY;
+  if (!ctx) return fail(AEGIS_ERR_OUT_OF_MEMORY, aegis_status_string(AEGIS_ERR_OUT_OF_MEMORY));
   ctx->device = device;
   cudaError_t e = cudaSetDevice(device);
   if (e == cudaSuccess) e = cudaStreamCreateWithFlags(&ctx->own, cudaStreamNonBlocking);
@@ -104,7 +113,7 @@ int aegis_destroy(aegis_context* ctx) {
 }
 
 int aegis_set_stream(aegis_context* ctx, void* cuda_stream) {
-  if (!ctx) return AEGIS_ERR_INVALID_ARGUMENT;
+  if (!ctx) return fail(AEGIS_ERR_INVALID_ARGUMENT, aegis_status_string(AEGIS_ERR_INVALID_ARGUMENT));
   ctx->stream = cuda_stream ? static_cast<cudaStream_t>(cuda_stream) : ctx->own;
   return AEGIS_OK;
 }
@@ -120,7 +129,7 @@ const char* aegis_last_error(const aegis_context* ctx) {
 }
 
 int aegis_device_alloc(aegis_context* ctx, size_t bytes, void** out) {
-  if (!out || bytes == 0) return AEGIS_ERR_INVALID_ARGUMENT;
+  if (!out || bytes == 0) return fail(AEGIS_ERR_INVALID_ARGUMENT, aegis_status_string(AEGIS_ERR_INVALID_ARGUMENT));
   *out = nullptr;
   if (int s = enter(ctx)) return s;
   const cudaError_t e = cudaMalloc(out, bytes);
@@ -135,7 +144,7 @@ int aegis_device_free(aegis_context* ctx, void* ptr) {
 }
 
 static int copy(aegis_context* ctx, void* dst, const void* src, size_t bytes, cudaMemcpyKind kind) {
-  if (!dst || !src) return AEGIS_ERR_INVALID_ARGUMENT;
+  if (!dst || !src) return fail(AEGIS_ERR_INVALID_ARGUMENT, aegis_status_string(AEGIS_ERR_INVALID_ARGUMENT));
   if (int s = enter(ctx)) return s;
   // On the context's stream, then wait: ordered after queued GEMMs.
   cudaError_t e = cudaMemcpyAsync(dst, src, bytes, kind, ctx->stream);
@@ -153,17 +162,22 @@ int aegis_copy_to_host(aegis_context* ctx, void* dst, const void* src, size_t by
 
 int aegis_gemm_f16(aegis_context* ctx, const void* A, const void* B, void* C, int M, int N,
                    int K) {
-  if (!A || !B || !C || M <= 0 || N <= 0 || K <= 0) return AEGIS_ERR_INVALID_ARGUMENT;
+  if (!A || !B || !C || M <= 0 || N <= 0 || K <= 0)
+    return fail(AEGIS_ERR_INVALID_ARGUMENT, "aegis_gemm_f16: null operand or non-positive dimension");
   if (int s = enter(ctx)) return s;
-  aegis::matmul(static_cast<const __half*>(A), static_cast<const __half*>(B),
-                static_cast<__half*>(C), M, N, K, ctx->stream);
-  const cudaError_t e = cudaGetLastError();
-  return e == cudaSuccess ? AEGIS_OK : fail_cuda(ctx, e);
+  const cudaError_t e = aegis::matmul(static_cast<const __half*>(A), static_cast<const __half*>(B),
+                                      static_cast<__half*>(C), M, N, K, ctx->stream);
+  if (e == cudaSuccess) return AEGIS_OK;
+  ctx->last_error = cudaGetErrorString(e);
+  const std::string detail = aegis::matmul_last_error();
+  if (e == cudaErrorMemoryAllocation) return fail(AEGIS_ERR_OUT_OF_MEMORY, detail);
+  if (e == cudaErrorUnknown) return fail(AEGIS_ERR_CUDA, detail);  // cuBLAS failure
+  return fail(AEGIS_ERR_LAUNCH_FAILED, detail);
 }
 
 int aegis_gemm_choice(aegis_context* ctx, int M, int N, int K, char* buf, size_t buf_len,
                       size_t* needed) {
-  if (M <= 0 || N <= 0 || K <= 0) return AEGIS_ERR_INVALID_ARGUMENT;
+  if (M <= 0 || N <= 0 || K <= 0) return fail(AEGIS_ERR_INVALID_ARGUMENT, aegis_status_string(AEGIS_ERR_INVALID_ARGUMENT));
   if (int s = enter(ctx)) return s;
   return copy_out(aegis::matmul_choice(M, N, K), buf, buf_len, needed);
 }
@@ -174,7 +188,7 @@ int aegis_device_manifest(int device, char* buf, size_t buf_len, size_t* needed)
   int count = 0;
   if (cudaGetDeviceCount(&count) != cudaSuccess || device < 0 || device >= count) {
     cudaGetLastError();
-    return AEGIS_ERR_NO_DEVICE;
+    return fail(AEGIS_ERR_NO_DEVICE, aegis_status_string(AEGIS_ERR_NO_DEVICE));
   }
   std::lock_guard<std::mutex> lock(mu);
   auto it = cache.find(device);

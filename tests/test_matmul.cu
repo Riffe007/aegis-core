@@ -32,7 +32,7 @@ bool check(int M, int N, int K) {
   AEGIS_CUDA_CHECK(cudaMemcpy(A, hA.data(), nA * 2, cudaMemcpyHostToDevice));
   AEGIS_CUDA_CHECK(cudaMemcpy(B, hB.data(), nB * 2, cudaMemcpyHostToDevice));
 
-  aegis::matmul(A, B, C, M, N, K);
+  AEGIS_CUDA_CHECK(aegis::matmul(A, B, C, M, N, K));
   cublasHandle_t h;
   cublasCreate(&h);
   const float alpha = 1.f, beta = 0.f;
