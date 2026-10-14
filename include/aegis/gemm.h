@@ -64,4 +64,18 @@ inline constexpr RegblockConfig REGBLOCK_CONFIGS[] = {
 };
 std::span<const KernelEntry> regblock_entries();
 
+// ---------------------------------------------------------------------------
+// Tier 3: tensor cores via inline PTX (ldmatrix + mma.sync m16n8k16, FP32
+// accumulate), synchronous global->smem loads. WARPS_M x WARPS_N warps, each
+// computing (BM/WARPS_M) x (BN/WARPS_N). Name: mma_<BM>x<BN>x<BK>_<WM>x<WN>
+// ---------------------------------------------------------------------------
+struct MmaConfig { int BM, BN, BK, WARPS_M, WARPS_N; };
+inline constexpr MmaConfig MMA_CONFIGS[] = {
+    {128, 128, 32, 2, 4},  // default: 8 warps of 64x32
+    {128, 64, 32, 2, 2},
+    {64, 128, 32, 2, 4},
+    {64, 64, 32, 2, 2},
+};
+std::span<const KernelEntry> mma_entries();
+
 }  // namespace aegis::gemm

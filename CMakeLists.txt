@@ -24,6 +24,7 @@ add_library(aegis_kernels STATIC
   src/gemm/naive.cu
   src/gemm/tiled.cu
   src/gemm/regblock.cu
+  src/gemm/mma.cu
   src/gemm/registry.cu
 )
 target_include_directories(aegis_kernels PUBLIC include)
@@ -42,6 +43,7 @@ enable_testing()
 set(AEGIS_IMPLS
   naive tiled
   regblock_64x64x8_4x4 regblock_128x128x8_8x8 regblock_128x64x16_8x4
+  mma_128x128x32_2x4 mma_128x64x32_2x2 mma_64x128x32_2x4 mma_64x64x32_2x2
 )
 foreach(impl ${AEGIS_IMPLS})
   # 127x129x65: scalar fallback. 200x136x72: 16-byte path with partial edge tiles.
