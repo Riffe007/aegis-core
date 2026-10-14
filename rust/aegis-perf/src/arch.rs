@@ -5,7 +5,8 @@
 //! - L2 / DRAM latency: ptr_chase_latency medians (ns and cycles) over the
 //!   L2-resident working sets (256 KiB..8 MiB) and the DRAM ones (>= 32 MiB),
 //!   from the selected (run, layout) pairs; the median across them.
-//! - DRAM bandwidth: the latest dram_bandwidth median (memcpy D2D).
+//! - DRAM bandwidth: the latest dram_bandwidth medians, copy (memcpy D2D) and
+//!   read (read-only 128-bit stream).
 //! - MMA peak: the highest current mma_throughput row (TFLOPS, HMMA/clk/SM).
 use std::path::Path;
 
@@ -106,23 +107,37 @@ pub fn cmd_emit_arch(db_path: &Path, arch: i64, ptr_chase: &[String], results: &
         })
         .collect();
 
-    // DRAM bandwidth: the latest current dram_bandwidth median.
-    let (bw, bw_run): (f64, String) = con
-        .query_row(
-            "SELECT m.value, m.run_id FROM microbench m JOIN runs r USING(run_id) \
-             WHERE m.probe = 'dram_bandwidth' AND m.superseded = 0 AND r.sm_arch = ? \
-               AND json_extract(m.param_json, '$.stat') = 'median' ORDER BY r.started_at DESC LIMIT 1",
-            [arch],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .context("no dram_bandwidth row; run build/microbench/mb_dram_bw and ingest-microbench")?;
-    let bw_reps: Vec<f64> = con
-        .prepare(
-            "SELECT value FROM microbench WHERE run_id = ? AND probe = 'dram_bandwidth' \
-             AND json_extract(param_json, '$.rep') IS NOT NULL",
-        )?
-        .query_map([&bw_run], |r| r.get(0))?
-        .collect::<rusqlite::Result<_>>()?;
+    // DRAM bandwidth, per stream: the latest current median and its reps.
+    let bandwidth = |method: &str, desc: &str| -> Result<Value> {
+        let (value, run): (f64, String) = con
+            .query_row(
+                "SELECT m.value, m.run_id FROM microbench m JOIN runs r USING(run_id) \
+                 WHERE m.probe = 'dram_bandwidth' AND m.superseded = 0 AND r.sm_arch = ?1 \
+                   AND json_extract(m.param_json, '$.method') = ?2 \
+                   AND json_extract(m.param_json, '$.stat') = 'median' ORDER BY r.started_at DESC LIMIT 1",
+                params![arch, method],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .with_context(|| format!("no dram_bandwidth {method} row; run build/microbench/mb_dram_bw and ingest"))?;
+        let reps: Vec<f64> = con
+            .prepare(
+                "SELECT value FROM microbench WHERE run_id = ?1 AND probe = 'dram_bandwidth' \
+                 AND json_extract(param_json, '$.method') = ?2 AND json_extract(param_json, '$.rep') IS NOT NULL",
+            )?
+            .query_map(params![run, method], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(json!({"value": value, "reps": reps, "method": desc,
+                  "source": {"probe": "dram_bandwidth", "stream": method, "run_id": run}}))
+    };
+    let copy_bw = bandwidth(
+        "memcpy_d2d",
+        "cudaMemcpyAsync D2D, 512 MiB, (read + write bytes) / time; median of 20 copies per rep, median of reps",
+    )?;
+    let read_bw = bandwidth(
+        "read_v4",
+        "read-only stream, 4 independent 128-bit loads per thread per iteration (SASS-proven), 512 MiB, \
+         bytes read / time; median of 20 runs per rep, median of reps",
+    )?;
 
     // MMA peak: the highest current mma_throughput point.
     let (tflops, mma_param, mma_run): (f64, String, String) = con
@@ -162,12 +177,9 @@ pub fn cmd_emit_arch(db_path: &Path, arch: i64, ptr_chase: &[String], results: &
                  the probes; do not edit by hand.",
         "l2_latency": { "value": l2, "source": {"probe": "ptr_chase_latency", "runs": sel_json(&sel), "clocks": clocks} },
         "dram_latency": { "value": dram, "source": {"probe": "ptr_chase_latency", "runs": sel_json(&sel)} },
-        "dram_bandwidth_gbps": {
-            "value": bw,
-            "reps": bw_reps,
-            "method": "cudaMemcpyAsync D2D, 512 MiB, (read + write bytes) / time; median of 20 copies per rep, median of reps",
-            "source": {"probe": "dram_bandwidth", "run_id": bw_run},
-        },
+        "copy_bw_gbps": copy_bw,
+        "read_bw_gbps": read_bw,
+        "roof_rule": "memory roof: read_bw_gbps for GEMV and decode shapes (M <= 16), copy_bw_gbps elsewhere",
         "mma_peak": {
             "tflops": tflops,
             "hmma_per_clk_per_sm": hmma,

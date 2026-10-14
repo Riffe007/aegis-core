@@ -697,12 +697,19 @@ pub fn roof_text(con: &Connection, arch: Option<i64>, sel: &Selection) -> Result
         };
         writeln!(
             out,
-            "\nRoofline, sm_{a}: {:.1} GB/s, {:.1} TFLOPS, ridge {:.0} FLOP/B (from {}, computed now)",
-            p.bw_gbps, p.peak_tflops, p.ridge(), p.path.display()
+            "\nRoofline, sm_{a}: read {:.1} GB/s (roof for M <= {}), copy {:.1} GB/s (roof otherwise), {:.1} TFLOPS; \
+             ridge {:.0} / {:.0} FLOP/B (from {}, computed now)",
+            p.read_bw_gbps,
+            crate::params::DECODE_MAX_M,
+            p.copy_bw_gbps,
+            p.peak_tflops,
+            p.ridge(crate::params::BwKind::Read),
+            p.ridge(crate::params::BwKind::Copy),
+            p.path.display()
         )?;
         let hdr = format!(
-            "{:>6} {:>6} {:>6}  {:<30} {:>10} {:>7} {:>8} {:>6} {:>8} {:>6} {:>6} {:>6}",
-            "M", "N", "K", "impl", "median us", "AI", "TFLOPS", "%peak", "GB/s", "%bw", "bound", "%roof"
+            "{:>6} {:>6} {:>6}  {:<30} {:>10} {:>7} {:>8} {:>6} {:>8} {:>5} {:>6} {:>6} {:>6}",
+            "M", "N", "K", "impl", "median us", "AI", "TFLOPS", "%peak", "GB/s", "roof", "%bw", "bound", "%roof"
         );
         writeln!(out, "{hdr}\n{}", "-".repeat(hdr.len()))?;
         let winners: HashMap<String, String> = con
@@ -725,12 +732,13 @@ pub fn roof_text(con: &Connection, arch: Option<i64>, sel: &Selection) -> Result
                 let x = p.roof(m as f64, n as f64, k as f64, r.median_us);
                 writeln!(
                     out,
-                    "{m:>6} {n:>6} {k:>6}  {impl_:<30} {:>10.2} {:>7.1} {:>8.2} {:>5.1}% {:>8.1} {:>5.1}% {:>6} {:>5.1}%",
+                    "{m:>6} {n:>6} {k:>6}  {impl_:<30} {:>10.2} {:>7.1} {:>8.2} {:>5.1}% {:>8.1} {:>5} {:>5.1}% {:>6} {:>5.1}%",
                     r.median_us,
                     x.ai,
                     x.tflops,
                     x.pct_peak,
                     x.gbps,
+                    x.bw.name(),
                     x.pct_bw,
                     if x.memory_bound { "mem" } else { "comp" },
                     x.pct_roof
@@ -738,7 +746,11 @@ pub fn roof_text(con: &Connection, arch: Option<i64>, sel: &Selection) -> Result
             }
         }
     }
-    writeln!(out, "\nCompulsory traffic (A, B read once, C written once). First row per shape: the winner.")?;
+    writeln!(
+        out,
+        "\nCompulsory traffic (A, B read once, C written once). First row per shape: the winner.\n\
+         roof: the memory roof used, read-only stream bandwidth for GEMV/decode (M <= 16), copy bandwidth otherwise."
+    )?;
     Ok(out)
 }
 

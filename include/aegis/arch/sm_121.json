@@ -1,20 +1,21 @@
 {
-  "device": "NVIDIA GB10",
-  "dram_bandwidth_gbps": {
+  "copy_bw_gbps": {
     "method": "cudaMemcpyAsync D2D, 512 MiB, (read + write bytes) / time; median of 20 copies per rep, median of reps",
     "reps": [
-      236.307,
-      235.897,
-      237.921,
-      238.191,
-      236.848
+      236.696,
+      236.739,
+      230.24,
+      236.317,
+      237.948
     ],
     "source": {
       "probe": "dram_bandwidth",
-      "run_id": "d601cda25a28"
+      "run_id": "941ff9215564",
+      "stream": "memcpy_d2d"
     },
-    "value": 236.848
+    "value": 236.696
   },
+  "device": "NVIDIA GB10",
   "dram_latency": {
     "source": {
       "probe": "ptr_chase_latency",
@@ -43,7 +44,7 @@
       "working_sets": ">= 32 MiB"
     }
   },
-  "generated_by": "aegis-perf emit-arch on spark-5822, 2026-10-14 19:21 UTC",
+  "generated_by": "aegis-perf emit-arch on spark-5822, 2026-10-14 20:14 UTC",
   "l2_bytes": 25165824,
   "l2_latency": {
     "source": {
@@ -102,6 +103,23 @@
     "tflops": 125.597
   },
   "note": "Measured on this device (CLAUDE.md rule 8). Regenerate with aegis-perf emit-arch after re-running the probes; do not edit by hand.",
+  "read_bw_gbps": {
+    "method": "read-only stream, 4 independent 128-bit loads per thread per iteration (SASS-proven), 512 MiB, bytes read / time; median of 20 runs per rep, median of reps",
+    "reps": [
+      258.27,
+      257.841,
+      256.086,
+      258.764,
+      257.0
+    ],
+    "source": {
+      "probe": "dram_bandwidth",
+      "run_id": "941ff9215564",
+      "stream": "read_v4"
+    },
+    "value": 257.841
+  },
+  "roof_rule": "memory roof: read_bw_gbps for GEMV and decode shapes (M <= 16), copy_bw_gbps elsewhere",
   "schema": "aegis-arch-params/1",
   "sm_arch": 121,
   "sm_count": 48

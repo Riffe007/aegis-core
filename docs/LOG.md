@@ -647,3 +647,29 @@ the v1 → v2 measurements. Observation, not explained: at 1x4864x896 cuBLAS and
 cublaslt_best reach 100.9% and 101.3% of the memcpy-measured bandwidth (and
 16x4864x896 cublaslt_best 100.0%), so the D2D-copy figure is not an upper
 bound for every access pattern.
+
+## 2026-10-14 (late night, Spark-only) — read bandwidth, sm_87 gate, Nsight
+
+Decision recorded in CLAUDE.md: all Core work stays on the Spark until v1 is
+complete; the Jetson port comes after. No Jetson work was started.
+
+### 1. Read-only bandwidth
+
+`mb_dram_bw` gained a read-only stream: 4 independent `ld.global.v4.u32` per
+thread per iteration over 512 MiB, folded into an XOR reduction, 2048
+threads/SM. SASS proof: the timed loop holds exactly 4 `LDG.E.128` (ok). Run
+`941ff9215564`, idle guard 1.5%:
+
+| Stream | Median of 5 reps | Reps |
+|---|---|---|
+| copy (memcpy D2D, read + write bytes) | **236.7 GB/s** | 230.2–237.9 |
+| read-only (bytes read) | **257.8 GB/s** | 256.1–258.8 |
+
+`arch/sm_121.json` now has `copy_bw_gbps` and `read_bw_gbps` (the old
+`dram_bandwidth_gbps` key is gone) and a `roof_rule`. Rooflines and the report
+hold GEMV/decode shapes (M <= 16) to the read roof (ridge 487 FLOP/B) and every
+other shape to the copy roof (ridge 531 FLOP/B); the report prints which on
+each row. Effect: the decode points that exceeded the copy roof are now under
+the read roof — 1x4864x896 cublaslt_best 101.3% → 93.1%, cublas 100.9% →
+92.7%; 16x4864x896 cublaslt_best 100.0% → 91.8%. The M = 1/16 winner points
+drop by ~8% of roof (e.g. 1x896x896 63.1% → 58.0%).

@@ -18,9 +18,10 @@ struct Point {
     label: String,
     ai: f64,
     tflops: f64,
+    roof: params::Roof,
 }
 
-fn points(con: &Connection, arch: i64) -> Result<Vec<Point>> {
+fn points(con: &Connection, arch: i64, p: &ArchParams) -> Result<Vec<Point>> {
     let mut stmt = con.prepare(
         "SELECT w.shape_bucket, k.impl, w.median_us, \
                 (SELECT m.median_us FROM measurements m JOIN kernels kc USING(kernel_id) JOIN runs r USING(run_id) \
@@ -40,9 +41,10 @@ fn points(con: &Connection, arch: i64) -> Result<Vec<Point>> {
         let (m, n, k) = (d[0], d[1], d[2]);
         let flops = 2.0 * m * n * k;
         let ai = flops / (2.0 * (m * k + k * n + m * n));
-        out.push(Point { label: format!("{bucket} {impl_}"), ai, tflops: flops / (ours_us * 1e-6) / 1e12 });
+        let pt = |label: String, us: f64| Point { label, ai, tflops: flops / (us * 1e-6) / 1e12, roof: p.roof(m, n, k, us) };
+        out.push(pt(format!("{bucket} {impl_}"), ours_us));
         if let Some(c) = cublas_us {
-            out.push(Point { label: format!("{bucket} cublaslt_best"), ai, tflops: flops / (c * 1e-6) / 1e12 });
+            out.push(pt(format!("{bucket} cublaslt_best"), c));
         }
     }
     Ok(out)
@@ -51,15 +53,15 @@ fn points(con: &Connection, arch: i64) -> Result<Vec<Point>> {
 pub fn cmd_roofline(db_path: &Path, arch: i64, out: &Path, arch_file: Option<&Path>) -> Result<()> {
     let con = db::connect(db_path)?;
     let p: ArchParams = params::load(arch_file.unwrap_or(&params::arch_file(arch)))?;
-    let (bw_gbps, peak_tflops) = (p.bw_gbps, p.peak_tflops);
-    let pts = points(&con, arch)?;
+    let peak_tflops = p.peak_tflops;
+    let pts = points(&con, arch, &p)?;
     if pts.is_empty() {
         bail!("no winners for sm_{arch}; run aegis-perf tune first");
     }
     if let Some(parent) = out.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent)?;
     }
-    let ridge = p.ridge(); // FLOP/B where the roofs meet
+    let (ridge_r, ridge_c) = (p.ridge(params::BwKind::Read), p.ridge(params::BwKind::Copy));
     let (x0, x1) = (0.1f64, 4096.0f64);
     let (y0, y1) = (0.01f64, peak_tflops * 2.0);
 
@@ -79,12 +81,23 @@ pub fn cmd_roofline(db_path: &Path, arch: i64, out: &Path, arch_file: Option<&Pa
         .light_line_style(RGBColor(240, 240, 240))
         .draw()?;
 
-    let roof = |x: f64| (bw_gbps * x / 1e3).min(peak_tflops);
+    // Two memory roofs: read-only stream (held against GEMV/decode shapes,
+    // M <= 16) and copy (every other shape); one compute roof.
+    let (read_bw, copy_bw) = (p.read_bw_gbps, p.copy_bw_gbps);
+    let roof_r = |x: f64| (read_bw * x / 1e3).min(peak_tflops);
+    let roof_c = |x: f64| (copy_bw * x / 1e3).min(peak_tflops);
     let xs: Vec<f64> = (0..=200).map(|i| x0 * (x1 / x0).powf(i as f64 / 200.0)).collect();
     chart
-        .draw_series(LineSeries::new(xs.iter().map(|&x| (x, roof(x))), BLACK.stroke_width(2)))?
-        .label(format!("roof: {bw_gbps:.1} GB/s measured, {peak_tflops:.1} TFLOPS mma.sync measured, ridge {ridge:.0} FLOP/B"))
+        .draw_series(LineSeries::new(xs.iter().map(|&x| (x, roof_c(x))), BLACK.stroke_width(2)))?
+        .label(format!(
+            "roof (M > 16): copy {copy_bw:.1} GB/s, {peak_tflops:.1} TFLOPS mma.sync, ridge {ridge_c:.0} FLOP/B"
+        ))
         .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], BLACK.stroke_width(2)));
+    let grey = RGBColor(130, 130, 130);
+    chart
+        .draw_series(LineSeries::new(xs.iter().map(|&x| (x, roof_r(x))), grey.stroke_width(2)))?
+        .label(format!("roof (GEMV/decode, M <= 16): read {read_bw:.1} GB/s, ridge {ridge_r:.0} FLOP/B"))
+        .legend(move |(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], grey.stroke_width(2)));
 
     let ours: Vec<&Point> = pts.iter().filter(|p| !p.label.ends_with(" cublaslt_best")).collect();
     let cub: Vec<&Point> = pts.iter().filter(|p| p.label.ends_with(" cublaslt_best")).collect();
@@ -104,9 +117,21 @@ pub fn cmd_roofline(db_path: &Path, arch: i64, out: &Path, arch_file: Option<&Pa
         .draw()?;
     root.present()?;
 
-    println!("wrote {} ({} points, ridge {ridge:.0} FLOP/B; roofs from {})", out.display(), pts.len(), p.path.display());
+    println!(
+        "wrote {} ({} points, ridge {ridge_r:.0} (read) / {ridge_c:.0} (copy) FLOP/B; roofs from {})",
+        out.display(),
+        pts.len(),
+        p.path.display()
+    );
     for p in &pts {
-        println!("  {:<44} AI {:7.1}  {:7.2} TFLOPS  {:5.1}% of roof", p.label, p.ai, p.tflops, p.tflops / roof(p.ai) * 100.0);
+        println!(
+            "  {:<44} AI {:7.1}  {:7.2} TFLOPS  {:5.1}% of roof ({} bw)",
+            p.label,
+            p.ai,
+            p.tflops,
+            p.roof.pct_roof,
+            p.roof.bw.name()
+        );
     }
     Ok(())
 }
