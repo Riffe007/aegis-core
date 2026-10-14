@@ -1045,3 +1045,26 @@ fewer instructions did not move the time, so the removed integer/predicate
 instructions were not the binding limit at 4096³ (issue slots were not
 saturated: issue active ~18% before). The per-shape re-tune vs. the previous
 winners follows with Phase B, on the final kernels.
+
+## 2026-10-15 — Phase B a: fragment double buffering (negative, reverted)
+
+On the hardened kernel, `compute_tile` loaded k-step s+1's ldmatrix fragments
+before issuing step s's MMAs (tier 4 only; on tier 3 it spilled
+`mma_128x64x32_2x2` with column-major A on sm_121 and sm_87).
+
+- **SASS, `mma_pipe_128x256x32_2x4_s3` NN:** NOPs 171 per 192 HMMA before and
+  after (static count, unchanged); registers 188 -> 206; no spills. ptxas
+  does interleave the next step's 8 LDSMs into the current step's 32 HMMAs,
+  but 8 independent instructions cannot fill ~31 gaps, and fragments of the
+  next BK tile cannot be loaded early (a barrier separates the tiles). The
+  scratch kernel's -58% came from cross-iteration work it had to interleave;
+  the real kernel has none within a tile.
+- **Paired vs. the Phase A build** (alternating processes, 30 pairs, cold;
+  idle guard read 2.9% before the run): 4096³ B/A 0.999 [0.983, 1.016] (tie);
+  2048³ (`mma_pipe_128x128x32_2x4_s2`) B/A 1.007 [1.002, 1.014] (0.7% slower).
+- **Verdict:** no NOP reduction, more registers, no speedup -> reverted (kernel
+  SASS identical to Phase A again). The NOPs between back-to-back HMMAs need
+  either more independent work per k-step (larger k-steps, or moving global
+  -> smem copy issue into the MMA stream, as TMA would) or nothing at all: with
+  the tensor pipe ~50% busy and issue active ~18%, they may not be the binding
+  limit. Not pursued further in Phase B.
