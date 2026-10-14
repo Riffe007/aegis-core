@@ -417,7 +417,8 @@ Warm % has the caveats of the previous entry.
 
 Against the previous v2 run (`46372b6f92ba`, Firefox open): 12 of 14 winners
 identical; 1x4864x896 and 512x4864x896 changed, both tied shapes. Cold % of
-cublaslt_best moved by at most 3.4 points per shape (16x896x4864: 76.6 → 71.8).
+cublaslt_best (fastest config per shape) moved by at most 4.8 points
+(16x896x4864: 76.6 → 71.8); 10 of 14 shapes moved by 2 points or less.
 
 **Verdicts (unchanged by this rerun):**
 - **Decode >100% of cuBLAS — died.** Best decode shape 16x896x896 at 94.9% of
