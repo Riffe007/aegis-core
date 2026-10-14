@@ -362,3 +362,22 @@ stopped and a reboot. Hypothesis, not tested: remote desktop's GPU context
 Test: rerun with `systemctl --user start gnome-remote-desktop` and a client
 connected. Until then, microbench and latency numbers taken with remote desktop
 on are suspect (the ptr_chase rows of `fb77bc085d64` are superseded).
+
+### 4096³ run-to-run variance under v2 (step 4)
+
+Six back-to-back `bench_gemm --check` processes per impl, cold, 20 windows
+each, idle guard 0.8%; rows ingested (`results/var4096-20261014-115315.jsonl`).
+
+| Impl | Medians (µs) | Run-to-run spread (max−min)/mean | Within-run p90−p10, % of median |
+|---|---|---|---|
+| cublas | 1465.2–1476.1 | 0.7% | 12.6–28.1 |
+| cublaslt_best | 1416.2–1431.0 | 1.0% | 10.1–31.8 |
+| mma_pipe_128x128x32_2x4_s2 | 2470.1–2566.4 | 3.9% (one run 2566; the other five 2470–2485, 0.6%) | 17.1–22.0 |
+
+**Run-to-run spread is under 5% for all three** (v1: cuBLAS medians from
+1496 to 2837 µs across runs). The window-to-window spread is still wide: at
+this size N = 1 (one 1.4–2.6 ms launch per window), so each window is a single
+launch and its p10–p90 band is 10–32% of the median. That band is why 4096³
+(and 2048³) stay "tied" in the winners table even though the medians repeat
+within 1–4%. Not investigated tonight: whether the per-launch variation is
+clock (power/thermal) or memory-system behaviour.
