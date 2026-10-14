@@ -618,3 +618,32 @@ and has the lowest p99 on the two short shapes; the driver API saves ~0.2 µs;
 At 1x896x896 the fixed cost is ~1/3 of the end-to-end time: larger than the
 winner's cold kernel gap to cublaslt_best (10.76 vs 8.83 µs, 1.9 µs) and
 smaller than its warm gap (9.47 vs 3.21 µs, 6.3 µs).
+
+## 2026-10-14 (late night) — derived metrics, launch decision, Jetson
+
+### 1. Roof metrics computed at report time
+
+Nothing derived from a roof is stored. `aegis-perf report` now ends with a
+roofline table per arch (AI, TFLOPS and % of mma peak, GB/s and % of DRAM
+bandwidth, memory/compute bound, % of roof) computed when it runs from
+`include/aegis/arch/sm_<arch>.json`; `aegis-perf roofline` takes its roofs from
+the same file (it used the latest `runs.measured_bw_gbps`, still 214.7 GB/s on
+most runs; that column is now only a record of what the manifest said).
+Baseline points in the roofline are cublaslt_best (v2 cold), no longer cuBLAS.
+
+Old percentages that moved (old: bring-up LOG, v1 rows, 214.7 GB/s and
+125.5 TFLOPS roofs, ridge 585 FLOP/B; new: v2 cold rows, 236.8 GB/s and
+125.6 TFLOPS, ridge 530 FLOP/B):
+
+| Shape | Old winner % of roof | New winner % of roof | Old cuBLAS % of roof | New cublaslt_best (cublas) % of roof | Bound |
+|---|---|---|---|---|---|
+| 1024³ | 30–44 (range over 1024³–4096³) | 56.4 | 47–67 (range) | 75.0 (75.1) | memory (AI 341) |
+| 2048³ | ″ | 49.2 | ″ | 71.4 (66.9) | compute (AI 683) |
+| 4096³ | ″ | 44.5 | ″ | 76.8 (74.7) | compute (AI 1365) |
+
+The bandwidth change (214.7 → 236.8 GB/s, +10%) moves only memory-bound
+points; 2048³ and 4096³ sit above the ridge, so their movement is all from
+the v1 → v2 measurements. Observation, not explained: at 1x4864x896 cuBLAS and
+cublaslt_best reach 100.9% and 101.3% of the memcpy-measured bandwidth (and
+16x4864x896 cublaslt_best 100.0%), so the D2D-copy figure is not an upper
+bound for every access pattern.

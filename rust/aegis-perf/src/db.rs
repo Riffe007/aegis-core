@@ -677,9 +677,75 @@ pub fn report_text(con: &Connection, arch: Option<i64>, sel: &Selection, baselin
     Ok(out)
 }
 
+/// Roof metrics per shape for the winner and the baselines, computed now from
+/// include/aegis/arch/sm_<arch>.json (never stored): AI, TFLOPS and % of the
+/// mma peak, GB/s and % of DRAM bandwidth, bound, % of the roofline.
+pub fn roof_text(con: &Connection, arch: Option<i64>, sel: &Selection) -> Result<String> {
+    let rows = latest_per_kernel_shape(con, arch, sel)?;
+    let mut archs: Vec<i64> = rows.iter().map(|r| r.sm_arch).collect();
+    archs.sort();
+    archs.dedup();
+    let mut out = String::new();
+    for a in archs {
+        let path = crate::params::arch_file(a);
+        let p = match crate::params::load(&path) {
+            Ok(p) => p,
+            Err(e) => {
+                writeln!(out, "\nsm_{a}: no roof metrics ({e:#}); run aegis-perf emit-arch --arch {a}")?;
+                continue;
+            }
+        };
+        writeln!(
+            out,
+            "\nRoofline, sm_{a}: {:.1} GB/s, {:.1} TFLOPS, ridge {:.0} FLOP/B (from {}, computed now)",
+            p.bw_gbps, p.peak_tflops, p.ridge(), p.path.display()
+        )?;
+        let hdr = format!(
+            "{:>6} {:>6} {:>6}  {:<30} {:>10} {:>7} {:>8} {:>6} {:>8} {:>6} {:>6} {:>6}",
+            "M", "N", "K", "impl", "median us", "AI", "TFLOPS", "%peak", "GB/s", "%bw", "bound", "%roof"
+        );
+        writeln!(out, "{hdr}\n{}", "-".repeat(hdr.len()))?;
+        let winners: HashMap<String, String> = con
+            .prepare(
+                "SELECT w.shape_bucket, k.impl FROM winners w JOIN kernels k USING(kernel_id) \
+                 WHERE w.sm_arch = ? AND w.op = 'gemm'",
+            )?
+            .query_map([a], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut shapes: Vec<(i64, i64, i64)> = rows.iter().filter(|r| r.sm_arch == a).map(|r| (r.m, r.n, r.k)).collect();
+        shapes.sort();
+        shapes.dedup();
+        for (m, n, k) in shapes {
+            let winner = winners.get(&shape_bucket(m, n, k)).cloned();
+            for impl_ in winner.iter().map(String::as_str).chain(["cublaslt_best", "cublas"]) {
+                let Some(r) = rows.iter().find(|r| r.sm_arch == a && (r.m, r.n, r.k) == (m, n, k) && r.impl_ == impl_)
+                else {
+                    continue;
+                };
+                let x = p.roof(m as f64, n as f64, k as f64, r.median_us);
+                writeln!(
+                    out,
+                    "{m:>6} {n:>6} {k:>6}  {impl_:<30} {:>10.2} {:>7.1} {:>8.2} {:>5.1}% {:>8.1} {:>5.1}% {:>6} {:>5.1}%",
+                    r.median_us,
+                    x.ai,
+                    x.tflops,
+                    x.pct_peak,
+                    x.gbps,
+                    x.pct_bw,
+                    if x.memory_bound { "mem" } else { "comp" },
+                    x.pct_roof
+                )?;
+            }
+        }
+    }
+    writeln!(out, "\nCompulsory traffic (A, B read once, C written once). First row per shape: the winner.")?;
+    Ok(out)
+}
+
 pub fn cmd_report(db: &Path, arch: Option<i64>, sel: &Selection, baseline: Option<&str>) -> Result<()> {
     let con = connect(db)?;
     print!("{}", report_text(&con, arch, sel, baseline.unwrap_or(default_baseline(sel)))?);
+    print!("{}", roof_text(&con, arch, sel)?);
     Ok(())
 }
 

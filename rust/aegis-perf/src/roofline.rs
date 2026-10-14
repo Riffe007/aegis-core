@@ -1,13 +1,14 @@
 //! `roofline`: an SVG roofline per arch from the perf DB.
 //!
 //! Roofs come from measurements on the same device (CLAUDE.md rule 8):
-//! memory = latest measured_bw_gbps in `runs` (aegis_manifest D2D copy);
-//! compute = best current (not superseded) `mma_throughput` TFLOPS in `microbench`.
-//! Points: per shape, cuBLAS and our winner (latest passing measurement), at
+//! include/aegis/arch/sm_<arch>.json (emit-arch): memory = dram_bandwidth_gbps,
+//! compute = mma_peak.tflops. Nothing derived from them is stored.
+//! Points: per shape, our winner and cublaslt_best (latest v2 cold rows), at
 //! compulsory arithmetic intensity 2MNK / (2 (MK + KN + MN)) FLOP/B.
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
+use crate::params::{self, ArchParams};
 use plotters::prelude::*;
 use rusqlite::Connection;
 
@@ -19,36 +20,11 @@ struct Point {
     tflops: f64,
 }
 
-fn roofs(con: &Connection, arch: i64) -> Result<(f64, f64)> {
-    let bw: Option<f64> = con
-        .query_row(
-            "SELECT measured_bw_gbps FROM runs WHERE sm_arch = ? AND measured_bw_gbps IS NOT NULL \
-             ORDER BY started_at DESC LIMIT 1",
-            [arch],
-            |r| r.get(0),
-        )
-        .ok();
-    let peak: Option<f64> = con
-        .query_row(
-            "SELECT MAX(mb.value) FROM microbench mb JOIN runs r USING(run_id) \
-             WHERE r.sm_arch = ? AND mb.probe = 'mma_throughput' AND mb.unit = 'TFLOPS' \
-             AND mb.superseded = 0",
-            [arch],
-            |r| r.get(0),
-        )
-        .ok()
-        .flatten();
-    let (Some(bw), Some(peak)) = (bw, peak) else {
-        bail!("need a measured bandwidth (ingest with --manifest) and mma_throughput microbench rows for sm_{arch}");
-    };
-    Ok((bw, peak))
-}
-
 fn points(con: &Connection, arch: i64) -> Result<Vec<Point>> {
     let mut stmt = con.prepare(
         "SELECT w.shape_bucket, k.impl, w.median_us, \
                 (SELECT m.median_us FROM measurements m JOIN kernels kc USING(kernel_id) JOIN runs r USING(run_id) \
-                 WHERE kc.impl = 'cublas' AND r.sm_arch = w.sm_arch AND m.dtype = w.dtype \
+                 WHERE kc.impl = 'cublaslt_best' AND r.sm_arch = w.sm_arch AND m.dtype = w.dtype \
                    AND m.protocol_version = w.protocol_version AND m.allow_busy = 0 \
                    AND (m.protocol_version = 1 OR m.cache_mode = 'cold') \
                    AND (m.m || 'x' || m.n || 'x' || m.k) = w.shape_bucket \
@@ -66,15 +42,16 @@ fn points(con: &Connection, arch: i64) -> Result<Vec<Point>> {
         let ai = flops / (2.0 * (m * k + k * n + m * n));
         out.push(Point { label: format!("{bucket} {impl_}"), ai, tflops: flops / (ours_us * 1e-6) / 1e12 });
         if let Some(c) = cublas_us {
-            out.push(Point { label: format!("{bucket} cublas"), ai, tflops: flops / (c * 1e-6) / 1e12 });
+            out.push(Point { label: format!("{bucket} cublaslt_best"), ai, tflops: flops / (c * 1e-6) / 1e12 });
         }
     }
     Ok(out)
 }
 
-pub fn cmd_roofline(db_path: &Path, arch: i64, out: &Path) -> Result<()> {
+pub fn cmd_roofline(db_path: &Path, arch: i64, out: &Path, arch_file: Option<&Path>) -> Result<()> {
     let con = db::connect(db_path)?;
-    let (bw_gbps, peak_tflops) = roofs(&con, arch)?;
+    let p: ArchParams = params::load(arch_file.unwrap_or(&params::arch_file(arch)))?;
+    let (bw_gbps, peak_tflops) = (p.bw_gbps, p.peak_tflops);
     let pts = points(&con, arch)?;
     if pts.is_empty() {
         bail!("no winners for sm_{arch}; run aegis-perf tune first");
@@ -82,7 +59,7 @@ pub fn cmd_roofline(db_path: &Path, arch: i64, out: &Path) -> Result<()> {
     if let Some(parent) = out.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent)?;
     }
-    let ridge = peak_tflops * 1e3 / bw_gbps; // FLOP/B where the roofs meet
+    let ridge = p.ridge(); // FLOP/B where the roofs meet
     let (x0, x1) = (0.1f64, 4096.0f64);
     let (y0, y1) = (0.01f64, peak_tflops * 2.0);
 
@@ -109,11 +86,11 @@ pub fn cmd_roofline(db_path: &Path, arch: i64, out: &Path) -> Result<()> {
         .label(format!("roof: {bw_gbps:.1} GB/s measured, {peak_tflops:.1} TFLOPS mma.sync measured, ridge {ridge:.0} FLOP/B"))
         .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], BLACK.stroke_width(2)));
 
-    let ours: Vec<&Point> = pts.iter().filter(|p| !p.label.ends_with(" cublas")).collect();
-    let cub: Vec<&Point> = pts.iter().filter(|p| p.label.ends_with(" cublas")).collect();
+    let ours: Vec<&Point> = pts.iter().filter(|p| !p.label.ends_with(" cublaslt_best")).collect();
+    let cub: Vec<&Point> = pts.iter().filter(|p| p.label.ends_with(" cublaslt_best")).collect();
     chart
         .draw_series(cub.iter().map(|p| Cross::new((p.ai, p.tflops), 5, RED.stroke_width(2))))?
-        .label("cuBLAS")
+        .label("cublaslt_best")
         .legend(|(x, y)| Cross::new((x + 10, y), 5, RED.stroke_width(2)));
     chart
         .draw_series(ours.iter().map(|p| Circle::new((p.ai, p.tflops), 4, BLUE.filled())))?
@@ -127,7 +104,7 @@ pub fn cmd_roofline(db_path: &Path, arch: i64, out: &Path) -> Result<()> {
         .draw()?;
     root.present()?;
 
-    println!("wrote {} ({} points, ridge {ridge:.0} FLOP/B)", out.display(), pts.len());
+    println!("wrote {} ({} points, ridge {ridge:.0} FLOP/B; roofs from {})", out.display(), pts.len(), p.path.display());
     for p in &pts {
         println!("  {:<44} AI {:7.1}  {:7.2} TFLOPS  {:5.1}% of roof", p.label, p.ai, p.tflops, p.tflops / roof(p.ai) * 100.0);
     }
