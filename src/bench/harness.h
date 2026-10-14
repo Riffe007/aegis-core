@@ -17,10 +17,15 @@
 //     until one timed window (one graph replay) lasts >= max(1 ms, 500 timer
 //     ticks). The graph keeps CPU launch cost out of the window.
 //   - warmup windows are not timed
-//   - before every timed window (outside it), L2 is flushed by writing a
-//     buffer 2x the L2 size; nothing else runs inside the window
+//   - cache_mode=cold (default; tuning): launch i reads and writes buffer set
+//     i mod K, K = max(2, ceil(3 x L2 / problem footprint)) copies of A, B, C,
+//     so no launch finds its operands in L2 from an earlier launch; before
+//     every timed window (outside it), L2 is also flushed by writing a
+//     buffer 2x the L2 size. Nothing but the N launches runs inside a window.
+//   - cache_mode=warm: one buffer set, no flush; operands that fit stay
+//     L2-resident across launches. Recorded for winners, never used to rank.
 //   - per-launch time = window / N; median/p10/p90 across `reps` windows;
-//     batch_n = N is recorded
+//     batch_n = N, cache_mode and buffer_sets = K are recorded
 // v2 measures steady-state throughput of back-to-back launches. Single-launch
 // latency (launch overhead, cold start) is not this harness's job.
 //
@@ -48,6 +53,13 @@ inline constexpr double kRelTol = 4e-3;  // CLAUDE.md rule 2
 void cublas_gemm(cublasHandle_t h, const __half* A, const __half* B, __half* C, int M, int N,
                  int K);
 
+// A, B, C for one launch.
+struct BufferSet {
+  __half* A = nullptr;
+  __half* B = nullptr;
+  __half* C = nullptr;
+};
+
 // One device-resident GEMM problem with generated inputs.
 class Problem {
  public:
@@ -61,6 +73,16 @@ class Problem {
   __half* B = nullptr;
   __half* C = nullptr;
   __half* Ref = nullptr;
+
+  // A + B + C bytes.
+  size_t footprint_bytes() const;
+  // At least k buffer sets: set 0 is (A, B, C); the others hold copies of A
+  // and B and their own C.
+  void ensure_sets(int k);
+  BufferSet set(int i) const;
+
+ private:
+  std::vector<BufferSet> extra_;
 };
 
 struct Check {
@@ -69,8 +91,12 @@ struct Check {
   bool pass = true;
 };
 
+enum class CacheMode { Cold, Warm };
+inline const char* cache_mode_name(CacheMode m) { return m == CacheMode::Cold ? "cold" : "warm"; }
+
 struct TimingOptions {
   int protocol = 2;            // 2: batched windows; 1: one flushed launch per rep
+  CacheMode cache = CacheMode::Cold;  // v2 only
   int warmup = 3;              // v2: windows; v1: launches
   int reps = 20;               // v2: timed windows; v1: timed launches
   double min_window_ms = 1.0;  // v2: a window lasts >= max(min_window_ms,
@@ -84,6 +110,8 @@ struct Timing {
   int protocol_version = 1;
   long long batch_n = 1;     // launches per timed window
   double window_ms = 0;      // median window length (v2)
+  CacheMode cache = CacheMode::Cold;  // v2
+  int buffer_sets = 1;       // v2: K
 };
 
 struct TimerResolution {
@@ -107,8 +135,9 @@ class Harness {
   // cudaEvent timer resolution (measured in the constructor).
   const TimerResolution& timer() const { return timer_; }
 
-  // Launch `e` (nullptr = cuBLAS) on p into p.C, asynchronously. Aborts on error.
-  void launch(const gemm::KernelEntry* e, Problem& p);
+  // Launch `e` (nullptr = cuBLAS) on buffer set `set` of p, asynchronously.
+  // Aborts on error.
+  void launch(const gemm::KernelEntry* e, Problem& p, int set = 0);
   // The untimed run, synchronized.
   void run_once(const gemm::KernelEntry* e, Problem& p);
   // cuBLAS into p.Ref, compared with p.C (call after run_once).
@@ -123,10 +152,12 @@ class Harness {
  private:
   Timing time_v1(const gemm::KernelEntry* e, Problem& p, const TimingOptions& o);
   Timing time_v2(const gemm::KernelEntry* e, Problem& p, const TimingOptions& o);
-  // N launches captured into one instantiated graph.
-  cudaGraphExec_t capture(const gemm::KernelEntry* e, Problem& p, long long n);
-  // Flush L2, then one timed replay of `g`, synchronized; ms.
-  float timed_window(cudaGraphExec_t g);
+
+  int cold_sets(const Problem& p) const;
+  // N launches (launch i on set i mod `sets`) captured into one instantiated graph.
+  cudaGraphExec_t capture(const gemm::KernelEntry* e, Problem& p, long long n, int sets);
+  // Optionally flush L2, then one timed replay of `g`, synchronized; ms.
+  float timed_window(cudaGraphExec_t g, bool flush);
   void flush_l2(int value);
 
   cudaDeviceProp prop_{};

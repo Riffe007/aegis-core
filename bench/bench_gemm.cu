@@ -1,7 +1,7 @@
 // bench_gemm: time one GEMM implementation on one shape and emit one JSON line.
 //
 //   bench_gemm --impl tiled --m 4096 --n 4096 --k 4096 [--reps 20] [--warmup 3]
-//              [--protocol 2] [--check] [--seed 42]
+//              [--protocol 2] [--cache cold|warm] [--check] [--seed 42]
 //   bench_gemm --list                  registered impls as JSON lines
 //
 // The timing protocol and JSON row live in src/bench/harness.{h,cu}, shared
@@ -21,6 +21,7 @@ struct Args {
   int M = 1024, N = 1024, K = 1024;
   int reps = -1, warmup = -1;  // default: per protocol (v2 20 windows / 3; v1 50 / 5)
   int protocol = 2;
+  std::string cache = "cold";
   bool check = false;
   bool list = false;
   unsigned seed = 42;
@@ -41,6 +42,7 @@ Args parse(int argc, char** argv) {
     else if (k == "--reps") a.reps = std::atoi(next());
     else if (k == "--warmup") a.warmup = std::atoi(next());
     else if (k == "--protocol") a.protocol = std::atoi(next());
+    else if (k == "--cache") a.cache = next();
     else if (k == "--seed") a.seed = static_cast<unsigned>(std::atoi(next()));
     else if (k == "--check") a.check = true;
     else if (k == "--list") a.list = true;
@@ -49,8 +51,8 @@ Args parse(int argc, char** argv) {
   if (a.reps < 0) a.reps = a.protocol == 1 ? 50 : 20;
   if (a.warmup < 0) a.warmup = a.protocol == 1 ? 5 : 3;
   if (a.M <= 0 || a.N <= 0 || a.K <= 0 || a.reps <= 0 || a.warmup < 0 ||
-      (a.protocol != 1 && a.protocol != 2)) {
-    std::fprintf(stderr, "invalid shape, rep count or protocol\n");
+      (a.protocol != 1 && a.protocol != 2) || (a.cache != "cold" && a.cache != "warm")) {
+    std::fprintf(stderr, "invalid shape, rep count, protocol or cache mode\n");
     std::exit(2);
   }
   return a;
@@ -80,6 +82,7 @@ int main(int argc, char** argv) {
   const aegis::bench::Check c = a.check ? h.check(p) : aegis::bench::Check{};
   aegis::bench::TimingOptions opt;
   opt.protocol = a.protocol;
+  opt.cache = a.cache == "warm" ? aegis::bench::CacheMode::Warm : aegis::bench::CacheMode::Cold;
   opt.warmup = a.warmup;
   opt.reps = a.reps;
   const aegis::bench::Timing t = h.time(entry, p, opt);

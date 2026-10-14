@@ -46,7 +46,33 @@ Problem::Problem(int M_, int N_, int K_, unsigned seed) : M(M_), N(N_), K(K_) {
   AEGIS_CUDA_CHECK(cudaMemcpy(B, hB.data(), nB * sizeof(__half), cudaMemcpyHostToDevice));
 }
 
+size_t Problem::footprint_bytes() const {
+  return sizeof(__half) * (size_t(M) * K + size_t(K) * N + size_t(M) * N);
+}
+
+void Problem::ensure_sets(int k) {
+  const size_t nA = size_t(M) * K, nB = size_t(K) * N, nC = size_t(M) * N;
+  while (int(extra_.size()) + 1 < k) {
+    BufferSet s;
+    AEGIS_CUDA_CHECK(cudaMalloc(&s.A, nA * sizeof(__half)));
+    AEGIS_CUDA_CHECK(cudaMalloc(&s.B, nB * sizeof(__half)));
+    AEGIS_CUDA_CHECK(cudaMalloc(&s.C, nC * sizeof(__half)));
+    AEGIS_CUDA_CHECK(cudaMemcpy(s.A, A, nA * sizeof(__half), cudaMemcpyDeviceToDevice));
+    AEGIS_CUDA_CHECK(cudaMemcpy(s.B, B, nB * sizeof(__half), cudaMemcpyDeviceToDevice));
+    extra_.push_back(s);
+  }
+}
+
+BufferSet Problem::set(int i) const {
+  return i == 0 ? BufferSet{A, B, C} : extra_[size_t(i) - 1];
+}
+
 Problem::~Problem() {
+  for (const BufferSet& s : extra_) {
+    cudaFree(s.C);
+    cudaFree(s.B);
+    cudaFree(s.A);
+  }
   cudaFree(Ref);
   cudaFree(C);
   cudaFree(B);
@@ -128,9 +154,10 @@ Harness::~Harness() {
   cudaStreamDestroy(stream_);
 }
 
-void Harness::launch(const gemm::KernelEntry* e, Problem& p) {
-  if (e) AEGIS_CUDA_CHECK(e->launch(p.A, p.B, p.C, p.M, p.N, p.K, stream_));
-  else cublas_gemm(cublas_, p.A, p.B, p.C, p.M, p.N, p.K);
+void Harness::launch(const gemm::KernelEntry* e, Problem& p, int set) {
+  const BufferSet s = p.set(set);
+  if (e) AEGIS_CUDA_CHECK(e->launch(s.A, s.B, s.C, p.M, p.N, p.K, stream_));
+  else cublas_gemm(cublas_, s.A, s.B, s.C, p.M, p.N, p.K);
 }
 
 void Harness::run_once(const gemm::KernelEntry* e, Problem& p) {
@@ -201,10 +228,15 @@ Timing Harness::time_v1(const gemm::KernelEntry* e, Problem& p, const TimingOpti
   return t;
 }
 
-cudaGraphExec_t Harness::capture(const gemm::KernelEntry* e, Problem& p, long long n) {
+int Harness::cold_sets(const Problem& p) const {
+  const double l2x3 = 3.0 * double(prop_.l2CacheSize);
+  return std::max(2, int(std::ceil(l2x3 / double(p.footprint_bytes()))));
+}
+
+cudaGraphExec_t Harness::capture(const gemm::KernelEntry* e, Problem& p, long long n, int sets) {
   cudaGraph_t graph = nullptr;
   AEGIS_CUDA_CHECK(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeThreadLocal));
-  for (long long i = 0; i < n; ++i) launch(e, p);
+  for (long long i = 0; i < n; ++i) launch(e, p, int(i % sets));
   AEGIS_CUDA_CHECK(cudaStreamEndCapture(stream_, &graph));
   cudaGraphExec_t exec = nullptr;
   AEGIS_CUDA_CHECK(cudaGraphInstantiate(&exec, graph, 0));
@@ -213,11 +245,11 @@ cudaGraphExec_t Harness::capture(const gemm::KernelEntry* e, Problem& p, long lo
   return exec;
 }
 
-float Harness::timed_window(cudaGraphExec_t g) {
+float Harness::timed_window(cudaGraphExec_t g, bool flush) {
   cudaEvent_t start, stop;
   AEGIS_CUDA_CHECK(cudaEventCreate(&start));
   AEGIS_CUDA_CHECK(cudaEventCreate(&stop));
-  flush_l2(0);
+  if (flush) flush_l2(0);
   AEGIS_CUDA_CHECK(cudaEventRecord(start, stream_));
   AEGIS_CUDA_CHECK(cudaGraphLaunch(g, stream_));
   AEGIS_CUDA_CHECK(cudaEventRecord(stop, stream_));
@@ -232,15 +264,22 @@ float Harness::timed_window(cudaGraphExec_t g) {
 Timing Harness::time_v2(const gemm::KernelEntry* e, Problem& p, const TimingOptions& o) {
   const double target_ms =
       std::max(o.min_window_ms, o.min_window_ticks * timer_.tick_ns * 1e-6);
+  // Cache state. cold: launch i uses buffer set i mod K, with K sets covering
+  // >= 3x L2, so no launch finds its operands in L2 from an earlier launch;
+  // L2 is also flushed before each window (outside it). warm: one set, no
+  // flush; the operands stay L2-resident across launches when they fit.
+  const bool cold = o.cache == CacheMode::Cold;
+  const int sets = cold ? cold_sets(p) : 1;
+  p.ensure_sets(sets);
 
   // Calibrate N: grow the batch until one window reaches the target. Each
   // candidate graph is replayed once untimed (first-replay costs) first.
   long long n = 1;
   cudaGraphExec_t g = nullptr;
   for (int iter = 0;; ++iter) {
-    g = capture(e, p, n);
+    g = capture(e, p, n, sets);
     AEGIS_CUDA_CHECK(cudaGraphLaunch(g, stream_));
-    const float ms = timed_window(g);
+    const float ms = timed_window(g, cold);
     if (ms >= target_ms || n >= o.max_batch || iter >= 16) {
       if (ms < target_ms)
         std::fprintf(stderr, "warning: window %.3f ms < target %.3f ms at N=%lld\n", ms, target_ms, n);
@@ -264,7 +303,7 @@ Timing Harness::time_v2(const gemm::KernelEntry* e, Problem& p, const TimingOpti
     AEGIS_CUDA_CHECK(cudaEventCreate(&stops[i]));
   }
   for (int i = 0; i < reps; ++i) {
-    flush_l2(i);  // outside the window
+    if (cold) flush_l2(i);  // outside the window
     AEGIS_CUDA_CHECK(cudaEventRecord(starts[i], stream_));
     AEGIS_CUDA_CHECK(cudaGraphLaunch(g, stream_));
     AEGIS_CUDA_CHECK(cudaEventRecord(stops[i], stream_));
@@ -287,6 +326,8 @@ Timing Harness::time_v2(const gemm::KernelEntry* e, Problem& p, const TimingOpti
   t.protocol_version = 2;
   t.batch_n = n;
   t.window_ms = percentile(window, 0.5);
+  t.cache = o.cache;
+  t.buffer_sets = sets;
   return t;
 }
 
@@ -311,12 +352,15 @@ std::string Harness::json_row(const char* impl, const gemm::KernelEntry* e, cons
         "\"checked\":%s,\"pass\":%s,\"max_abs_err\":%.6g,\"rel_err\":%.6g,"
         "\"regs\":%d,\"smem_bytes\":%zu,\"local_bytes\":%zu,"
         "\"device\":\"%s\",\"sm_arch\":%d%d,\"cuda_runtime\":%d,\"cuda_driver\":%d,"
-        "\"timer_res_ns\":%.1f,\"protocol_version\":%d,\"batch_n\":%lld,\"window_ms\":%.4f%s}",
+        "\"timer_res_ns\":%.1f,\"protocol_version\":%d,\"batch_n\":%lld,\"window_ms\":%.4f,"
+        "\"cache_mode\":\"%s\",\"buffer_sets\":%d%s}",
         impl, config, M, N, K, t.median_us, t.p10_us, t.p90_us, tflops, gbps, t.reps,
         c.checked ? "true" : "false", c.pass ? "true" : "false", c.max_abs_err, c.rel_err,
         e ? attrs.numRegs : -1, e ? attrs.sharedSizeBytes : size_t(0),
         e ? attrs.localSizeBytes : size_t(0), prop_.name, prop_.major, prop_.minor, runtime_,
-        driver_, timer_.tick_ns, t.protocol_version, t.batch_n, t.window_ms, extra.c_str());
+        driver_, timer_.tick_ns, t.protocol_version, t.batch_n, t.window_ms,
+        t.protocol_version == 1 ? "flush_per_launch" : cache_mode_name(t.cache), t.buffer_sets,
+        extra.c_str());
   };
   std::string s(size_t(print(nullptr, 0)), '\0');
   print(s.data(), s.size() + 1);

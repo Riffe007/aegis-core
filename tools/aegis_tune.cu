@@ -2,6 +2,7 @@
 //
 //   aegis_tune --shapes shapes/default.txt [--seed S] [--prefix regblock_,mma_,mma_pipe_]
 //              [--reps 20] [--cublas-reps 50] [--warmup 3] [--data-seed 42] [--protocol 2]
+//              [--warm-top 2]
 //
 // For each shape (from a file, "M N K" per line, # comments) it allocates the
 // problem once, then runs cuBLAS and every registered config whose name starts
@@ -9,7 +10,9 @@
 // logged) so neither ordering nor thermal drift favours a config. Each config
 // gets the bench_gemm protocol (src/bench/harness.h): untimed run, --check
 // against cuBLAS, then timing (protocol v2 by default: batched windows; --reps
-// is the number of timed windows). Configs failing the check are
+// is the number of timed windows). Configs are ranked on cache_mode=cold; then
+// cuBLAS and the --warm-top fastest configs are timed again with cache_mode=warm
+// (recorded for winners, not used to rank). Configs failing the check are
 // not timed and not emitted; they are listed on stderr.
 //
 // stdout: one JSON row per timed config, bench_gemm's schema plus
@@ -38,6 +41,7 @@ struct Args {
   int reps = 20, cublas_reps = 50, warmup = 3;
   unsigned data_seed = 42;
   int protocol = 2;
+  int warm_top = 2;  // warm rows for cuBLAS and the N fastest cold configs per shape
 };
 
 std::vector<std::string> split(const std::string& s, char sep) {
@@ -64,6 +68,7 @@ Args parse(int argc, char** argv) {
     else if (k == "--warmup") a.warmup = std::stoi(next());
     else if (k == "--data-seed") a.data_seed = static_cast<unsigned>(std::stoul(next()));
     else if (k == "--protocol") a.protocol = std::stoi(next());
+    else if (k == "--warm-top") a.warm_top = std::stoi(next());
     else { std::fprintf(stderr, "unknown arg %s\n", k.c_str()); std::exit(2); }
   }
   if (a.shapes.empty()) { std::fprintf(stderr, "--shapes FILE is required\n"); std::exit(2); }
@@ -124,6 +129,29 @@ int main(int argc, char** argv) {
     std::shuffle(order.begin(), order.end(), std::mt19937_64(shape_seed));
     aegis::bench::Problem p(s.M, s.N, s.K, a.data_seed);
 
+    // Pass 1, cold (ranks the configs). Pass 2, warm: cuBLAS and the
+    // --warm-top fastest cold configs (the winner and its tie candidate).
+    struct Done { const aegis::gemm::KernelEntry* e; aegis::bench::Check c; double cold_us; size_t order; };
+    std::vector<Done> done;
+    auto measure = [&](const Done& d, aegis::bench::CacheMode cache) {
+      const char* name = d.e ? d.e->name : "cublas";
+      aegis::bench::TimingOptions opt;
+      opt.protocol = a.protocol;
+      opt.cache = cache;
+      opt.warmup = a.warmup;
+      opt.reps = d.e ? a.reps : a.cublas_reps;
+      const aegis::bench::Timing t = h.time(d.e, p, opt);
+      const std::string extra = ",\"tune\":{\"seed\":" + std::to_string(a.seed) +
+                                ",\"shape_seed\":" + std::to_string(shape_seed) +
+                                ",\"order\":" + std::to_string(d.order) + "}";
+      std::printf("%s\n", h.json_row(name, d.e, p, d.c, t, extra).c_str());
+      std::fflush(stdout);
+      ++timed;
+      std::fprintf(stderr, "  %-28s %5dx%5dx%5d  %10.2f us  N=%-6lld %s\n", name, s.M, s.N, s.K,
+                   t.median_us, t.batch_n, a.protocol == 1 ? "v1" : aegis::bench::cache_mode_name(cache));
+      return t.median_us;
+    };
+
     for (size_t oi = 0; oi < order.size(); ++oi) {
       const aegis::gemm::KernelEntry* e = order[oi];
       const char* name = e ? e->name : "cublas";
@@ -136,19 +164,17 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "  SKIP %s (fails --check)\n", buf);
         continue;
       }
-      aegis::bench::TimingOptions opt;
-      opt.protocol = a.protocol;
-      opt.warmup = a.warmup;
-      opt.reps = e ? a.reps : a.cublas_reps;
-      const aegis::bench::Timing t = h.time(e, p, opt);
-      const std::string extra = ",\"tune\":{\"seed\":" + std::to_string(a.seed) +
-                                ",\"shape_seed\":" + std::to_string(shape_seed) +
-                                ",\"order\":" + std::to_string(oi) + "}";
-      std::printf("%s\n", h.json_row(name, e, p, c, t, extra).c_str());
-      std::fflush(stdout);
-      ++timed;
-      std::fprintf(stderr, "  %-28s %5dx%5dx%5d  %10.2f us  N=%lld\n", name, s.M, s.N, s.K, t.median_us,
-                   t.batch_n);
+      Done d{e, c, 0, oi};
+      d.cold_us = measure(d, aegis::bench::CacheMode::Cold);
+      done.push_back(d);
+    }
+    if (a.protocol == 2 && a.warm_top > 0) {
+      std::vector<Done> ours;
+      for (const Done& d : done) if (d.e) ours.push_back(d);
+      std::sort(ours.begin(), ours.end(), [](const Done& x, const Done& y) { return x.cold_us < y.cold_us; });
+      ours.resize(std::min(ours.size(), size_t(a.warm_top)));
+      for (const Done& d : done) if (!d.e) ours.insert(ours.begin(), d);  // cuBLAS first
+      for (const Done& d : ours) measure(d, aegis::bench::CacheMode::Warm);
     }
   }
 
