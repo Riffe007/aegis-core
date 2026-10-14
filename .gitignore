@@ -1,0 +1,5 @@
+build/
+results/
+artifacts/
+__pycache__/
+*.db
