@@ -1025,3 +1025,23 @@ past `AEGIS_GPU_BUDGET` (16 GiB) or below `AEGIS_GPU_MIN_FREE` (16 GiB) free per
 ctest `gpu_budget_*`: 17 GiB refused by default; 64 MiB budget: 32 MiB ok,
 +48 MiB refused, ok after the free, 1 TiB refused; min-free floor above RAM:
 1 MiB refused.
+
+### 6. 4096³ before vs after Phase A (paired, across builds)
+
+`aegis-perf paired-ab` (new: alternating processes of two builds, ratio B/A per
+pair, 10,000-resample bootstrap of the median), `mma_pipe_128x256x32_2x4_s3`,
+4096³ row-major NN, cold, 30 pairs x 10 windows; A = baseline worktree
+(`e8d7e6b`, before Phase A), B = after (`c5b8f7d`). Idle guard 1.4–2.0%
+(desktop up, remote desktop off).
+
+| | Instructions (ncu) | Instructions / HMMA | Median (µs, cold v2) |
+|---|---|---|---|
+| before Phase A | 184.8 M | 5.51 | 2317.4 |
+| after Phase A | 106.0 M | 3.16 | 2292.3 |
+| B / A | 0.57 | | **0.995 [0.973, 1.014]**, tie |
+
+**No regression** (CI upper bound +1.4% < 2%), and **no speedup** either: 43%
+fewer instructions did not move the time, so the removed integer/predicate
+instructions were not the binding limit at 4096³ (issue slots were not
+saturated: issue active ~18% before). The per-shape re-tune vs. the previous
+winners follows with Phase B, on the final kernels.
