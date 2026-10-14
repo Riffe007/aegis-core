@@ -24,7 +24,28 @@ pub fn connect(db: &Path) -> Result<Connection> {
     }
     let con = Connection::open(db).with_context(|| format!("open {}", db.display()))?;
     con.execute_batch(SCHEMA)?;
+    migrate(&con)?;
     Ok(con)
+}
+
+/// Columns added after v1. CREATE TABLE IF NOT EXISTS leaves existing tables
+/// alone, so add any missing column here (additive only; never rename).
+const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
+    ("winners", "tied", "INTEGER NOT NULL DEFAULT 0"),
+    ("winners", "tie_set", "TEXT"),
+    ("winners", "pick_reason", "TEXT"),
+];
+
+fn migrate(con: &Connection) -> Result<()> {
+    for (table, column, decl) in ADDED_COLUMNS {
+        let exists: bool = con
+            .prepare(&format!("SELECT 1 FROM pragma_table_info('{table}') WHERE name = ?"))?
+            .exists([column])?;
+        if !exists {
+            con.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"))?;
+        }
+    }
+    Ok(())
 }
 
 pub fn shape_bucket(m: i64, n: i64, k: i64) -> String {
@@ -247,6 +268,10 @@ pub struct Latest {
     pub run_id: String,
     pub median_us: f64,
     pub tflops: f64,
+    pub p10_us: f64,
+    pub p90_us: f64,
+    pub regs: Option<i64>,
+    pub smem_bytes: Option<i64>,
 }
 
 /// Most recent measurement per (arch, kernel, shape); only checked+passing rows
@@ -256,7 +281,7 @@ fn latest_per_kernel_shape(con: &Connection, arch: Option<i64>) -> Result<Vec<La
     let arch = arch.filter(|&a| a != 0); // Python: `if arch`
     let q = format!(
         "SELECT r.sm_arch, k.op, m.dtype, m.m, m.n, m.k, k.impl, k.kernel_id, m.run_id, \
-                m.median_us, m.tflops, k.regs, k.local_bytes, m.checked, m.pass \
+                m.median_us, m.tflops, m.p10_us, m.p90_us, k.regs, k.smem_bytes \
          FROM measurements m JOIN runs r USING(run_id) JOIN kernels k USING(kernel_id) \
          WHERE (k.impl = 'cublas' OR (m.checked = 1 AND m.pass = 1)) {} ORDER BY r.started_at",
         if arch.is_some() { "AND r.sm_arch = ?" } else { "" }
@@ -275,6 +300,10 @@ fn latest_per_kernel_shape(con: &Connection, arch: Option<i64>) -> Result<Vec<La
             run_id: row.get(8)?,
             median_us: row.get(9)?,
             tflops: row.get(10)?,
+            p10_us: row.get(11)?,
+            p90_us: row.get(12)?,
+            regs: row.get(13)?,
+            smem_bytes: row.get(14)?,
         })
     };
     let rows: Vec<Latest> = match arch {
@@ -296,6 +325,38 @@ fn latest_per_kernel_shape(con: &Connection, arch: Option<i64>) -> Result<Vec<La
     Ok(order)
 }
 
+/// The fastest config, plus the runner-up when the runner-up's median lies
+/// inside the fastest one's p10-p90 band (a tie). Only the runner-up joins:
+/// widening to every config inside the band let one noisy p90 (3.5x the
+/// median at 512x4864x896) pull in configs up to 2x slower.
+fn tie_set<'a>(ours: &[&'a Latest]) -> Vec<&'a Latest> {
+    let mut sorted: Vec<&Latest> = ours.to_vec();
+    sorted.sort_by(|a, b| a.median_us.total_cmp(&b.median_us).then_with(|| a.impl_.cmp(&b.impl_)));
+    match sorted[..] {
+        [] => Vec::new(),
+        [w] => vec![w],
+        [w, r, ..] => {
+            let (lo, hi) = (w.p10_us.min(w.median_us), w.p90_us.max(w.median_us));
+            if r.median_us >= lo && r.median_us <= hi { vec![w, r] } else { vec![w] }
+        }
+    }
+}
+
+/// Neighboring shapes for the tie-break: same N and K with a different M (the
+/// decode / prefill family), or every dimension within a factor of 2 (e.g.
+/// adjacent square sizes).
+fn neighbors(a: &ShapeKey, b: &ShapeKey) -> bool {
+    if (a.0, &a.1, &a.2) != (b.0, &b.1, &b.2) || (a.3, a.4, a.5) == (b.3, b.4, b.5) {
+        return false;
+    }
+    let within2 = |x: i64, y: i64| x.max(y) <= 2 * x.min(y);
+    (a.4 == b.4 && a.5 == b.5) || (within2(a.3, b.3) && within2(a.4, b.4) && within2(a.5, b.5))
+}
+
+/// Winner per (arch, op, dtype, shape). Clear win: the fastest median. Tie
+/// (runner-up median inside the fastest one's p10-p90): of the two, the one
+/// that wins or ties on the most neighboring shapes, then fewer registers,
+/// then less smem, then lower median, then name.
 pub fn cmd_winners(db: &Path, arch: Option<i64>) -> Result<()> {
     let con = connect(db)?;
     let rows = latest_per_kernel_shape(&con, arch)?;
@@ -309,22 +370,61 @@ pub fn cmd_winners(db: &Path, arch: Option<i64>) -> Result<()> {
         });
         groups[i].1.push(r);
     }
-    let mut n = 0;
-    for ((arch, op, dtype, m, nn, k), rs) in &groups {
-        let cublas: Vec<&&Latest> = rs.iter().filter(|r| r.impl_ == "cublas").collect();
-        let ours: Vec<&&Latest> = rs.iter().filter(|r| r.impl_ != "cublas").collect();
-        // Python min(): first of equal minima wins.
-        let Some(best) = ours.iter().copied().reduce(|a, b| if b.median_us < a.median_us { b } else { a }) else {
-            continue;
+    // Win-or-tie set per shape, by impl name.
+    let sets: Vec<(ShapeKey, Vec<String>)> = groups
+        .iter()
+        .map(|(key, rs)| {
+            let ours: Vec<&Latest> = rs.iter().copied().filter(|r| r.impl_ != "cublas").collect();
+            (key.clone(), tie_set(&ours).iter().map(|r| r.impl_.clone()).collect())
+        })
+        .collect();
+
+    let (mut n, mut tied_n) = (0, 0);
+    for (key, rs) in &groups {
+        let (arch, op, dtype, m, nn, k) = key;
+        let cublas = rs.iter().find(|r| r.impl_ == "cublas");
+        let ours: Vec<&Latest> = rs.iter().copied().filter(|r| r.impl_ != "cublas").collect();
+        let tie = tie_set(&ours);
+        let Some(&fastest) = tie.first() else { continue };
+        let (pick, reason) = if tie.len() == 1 {
+            (fastest, "fastest".to_string())
+        } else {
+            tied_n += 1;
+            let support = |r: &Latest| {
+                sets.iter().filter(|(other, set)| neighbors(key, other) && set.contains(&r.impl_)).count()
+            };
+            let mut ranked: Vec<(&Latest, usize)> = tie.iter().map(|&r| (r, support(r))).collect();
+            ranked.sort_by(|(a, sa), (b, sb)| {
+                sb.cmp(sa)
+                    .then_with(|| a.regs.unwrap_or(i64::MAX).cmp(&b.regs.unwrap_or(i64::MAX)))
+                    .then_with(|| a.smem_bytes.unwrap_or(i64::MAX).cmp(&b.smem_bytes.unwrap_or(i64::MAX)))
+                    .then_with(|| a.median_us.total_cmp(&b.median_us))
+                    .then_with(|| a.impl_.cmp(&b.impl_))
+            });
+            let (pick, s) = ranked[0];
+            let (_, s2) = ranked[1];
+            let by = if s != s2 {
+                format!("neighbors ({s} of {} neighboring shapes)", sets.iter().filter(|(o, _)| neighbors(key, o)).count())
+            } else if pick.regs != ranked[1].0.regs {
+                format!("fewer registers ({}), neighbors tied at {s}", pick.regs.unwrap_or(-1))
+            } else if pick.smem_bytes != ranked[1].0.smem_bytes {
+                format!("less smem ({} B), neighbors and registers tied", pick.smem_bytes.unwrap_or(-1))
+            } else {
+                "lower median, all other criteria tied".to_string()
+            };
+            (pick, format!("tie-break: {by}"))
         };
-        let pct = cublas.first().map(|c| c.median_us / best.median_us * 100.0);
+        let pct = cublas.map(|c| c.median_us / pick.median_us * 100.0);
+        let set_json = serde_json::to_string(&tie.iter().map(|r| r.impl_.as_str()).collect::<Vec<_>>())?;
         con.execute(
-            "INSERT OR REPLACE INTO winners VALUES (?,?,?,?,?,?,?,?)",
-            params![arch, op, dtype, shape_bucket(*m, *nn, *k), best.kernel_id, best.run_id, best.median_us, pct],
+            "INSERT OR REPLACE INTO winners (sm_arch, op, dtype, shape_bucket, kernel_id, run_id, median_us, \
+             pct_of_cublas, tied, tie_set, pick_reason) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            params![arch, op, dtype, shape_bucket(*m, *nn, *k), pick.kernel_id, pick.run_id, pick.median_us, pct,
+                    (tie.len() > 1) as i64, set_json, reason],
         )?;
         n += 1;
     }
-    println!("wrote {n} winners");
+    println!("wrote {n} winners ({tied_n} tied, resolved by the tie-break)");
     Ok(())
 }
 

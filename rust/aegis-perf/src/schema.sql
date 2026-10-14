@@ -46,6 +46,9 @@ CREATE TABLE IF NOT EXISTS winners (
   run_id TEXT NOT NULL REFERENCES runs(run_id),
   median_us REAL,
   pct_of_cublas REAL,
+  tied INTEGER NOT NULL DEFAULT 0,  -- runner-up median inside the winner's p10-p90
+  tie_set TEXT,                     -- JSON list of impls in the tie (incl. the pick)
+  pick_reason TEXT,                 -- "fastest", or which tie-break decided
   PRIMARY KEY (sm_arch, op, dtype, shape_bucket)
 );
 CREATE TABLE IF NOT EXISTS microbench (

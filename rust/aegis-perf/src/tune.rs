@@ -101,7 +101,9 @@ pub fn run_table(jsonl: &str) -> Result<String> {
             Some(c) => format!("{:8.1}%", med(c) / med(w) * 100.0),
             None => format!("{:>9}", "-"),
         };
+        let p90 = |r: &Value| r["p90_us"].as_f64().unwrap_or(f64::INFINITY);
         let (ru, gap) = match ok.get(1) {
+            Some(r) if med(r) <= p90(w) => (r["impl"].as_str().unwrap_or("?").to_string(), "  tied".to_string()),
             Some(r) => (r["impl"].as_str().unwrap_or("?").to_string(), format!("{:5.1}%", (med(r) / med(w) - 1.0) * 100.0)),
             None => ("-".to_string(), format!("{:>6}", "-")),
         };
@@ -109,7 +111,8 @@ pub fn run_table(jsonl: &str) -> Result<String> {
     }
     writeln!(
         out,
-        "\n% cuBLAS: cuBLAS median / winner median (100% = parity). gap: how much slower the runner-up's median is than the winner's."
+        "\n% cuBLAS: cuBLAS median / winner median (100% = parity). gap: how much slower the runner-up's median is than the winner's;\n\
+         \"tied\": the runner-up's median is inside the winner's p10-p90 (this run only; the DB winner is picked by the tie-break)."
     )?;
     Ok(out)
 }
@@ -118,16 +121,35 @@ pub fn run_table(jsonl: &str) -> Result<String> {
 /// apart from line 1: generator name, host, time).
 pub fn header_text(con: &rusqlite::Connection, arch: i64, generated: &str) -> Result<(String, usize)> {
     let mut stmt = con.prepare(
-        "SELECT w.shape_bucket, k.impl, w.pct_of_cublas FROM winners w \
+        "SELECT w.shape_bucket, k.impl, w.pct_of_cublas, w.tied, w.tie_set, w.pick_reason FROM winners w \
          JOIN kernels k USING(kernel_id) WHERE w.sm_arch = ? AND w.op = 'gemm' \
          AND w.dtype = 'f16f32f16'",
     )?;
-    let mut entries: Vec<(i64, i64, i64, String, Option<f64>)> = Vec::new();
-    for row in stmt.query_map([arch], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<f64>>(2)?)))? {
-        let (bucket, impl_, pct) = row?;
+    let mut entries: Vec<(i64, i64, i64, String, Option<f64>, String)> = Vec::new();
+    for row in stmt.query_map([arch], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, Option<f64>>(2)?,
+            r.get::<_, i64>(3)?,
+            r.get::<_, Option<String>>(4)?,
+            r.get::<_, Option<String>>(5)?,
+        ))
+    })? {
+        let (bucket, impl_, pct, tied, tie_set, reason) = row?;
+        // Tie status: which configs the measurements could not separate, and why this one.
+        let tie_note = if tied != 0 {
+            let others: Vec<String> = serde_json::from_str::<Vec<String>>(tie_set.as_deref().unwrap_or("[]"))?
+                .into_iter()
+                .filter(|i| *i != impl_)
+                .collect();
+            format!("; TIED with {} ({})", others.join(", "), reason.unwrap_or_default())
+        } else {
+            String::new()
+        };
         let dims: Vec<i64> = bucket.split('x').map(str::parse).collect::<Result<_, _>>().context("shape_bucket")?;
         let [m, n, k] = dims[..] else { bail!("bad shape_bucket {bucket}") };
-        entries.push((m, n, k, impl_, pct));
+        entries.push((m, n, k, impl_, pct, tie_note));
     }
     entries.sort_by_key(|e| (e.1, e.2, e.0)); // stable, like Python's sort
 
@@ -144,8 +166,12 @@ pub fn header_text(con: &rusqlite::Connection, arch: i64, generated: &str) -> Re
     } else {
         lines.push(format!("#define AEGIS_WINNERS_SM{arch} 1"));
         lines.push(format!("inline constexpr aegis::detail::Winner kWinners_sm{arch}[] = {{"));
-        for (m, n, k, impl_, pct) in &entries {
-            let note = pct.map(|p| format!("  // {p:.1}% of cuBLAS")).unwrap_or_default();
+        for (m, n, k, impl_, pct, tie_note) in &entries {
+            let note = match pct {
+                Some(p) => format!("  // {p:.1}% of cuBLAS{tie_note}"),
+                None if !tie_note.is_empty() => format!("  // {}", tie_note.trim_start_matches("; ")),
+                None => String::new(),
+            };
             lines.push(format!("    {{{m}, {n}, {k}, \"{impl_}\"}},{note}"));
         }
         lines.push("};".to_string());

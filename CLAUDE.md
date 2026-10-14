@@ -116,6 +116,12 @@ artifacts/          SASS dumps per arch, microbench SASS proofs (gitignored)
    `attrs_*`) and `aegis::matmul` return `cudaError_t`; the C ABI returns
    `AEGIS_ERR_*` and sets `aegis_last_error_string()`. Only bench, test and
    tool binaries may abort (`AEGIS_CUDA_CHECK`).
+11. **Winners are tie-aware.** A shape is *tied* when the runner-up's median
+   is inside the fastest config's p10-p90. Of the two, pick the one that wins
+   or ties on the most neighboring shapes (same N and K, or every dimension
+   within 2x), then fewer registers, then less smem. The `winners` table
+   records `tied`, `tie_set` and `pick_reason`; `emit-header` writes them as
+   comments. Never hand-edit a winner.
 
 ## Architecture notes you must respect
 
