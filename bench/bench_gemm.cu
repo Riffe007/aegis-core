@@ -2,6 +2,7 @@
 //
 //   bench_gemm --impl tiled --m 4096 --n 4096 --k 4096 [--reps 50] [--warmup 5]
 //              [--check] [--seed 42]
+//   bench_gemm --list                  registered impls as JSON lines
 //
 // Timing protocol (keep it identical across impls, or comparisons are invalid):
 //   - warmup launches are not timed
@@ -42,6 +43,7 @@ struct Args {
   int M = 1024, N = 1024, K = 1024;
   int reps = 50, warmup = 5;
   bool check = false;
+  bool list = false;
   unsigned seed = 42;
 };
 
@@ -61,6 +63,7 @@ Args parse(int argc, char** argv) {
     else if (k == "--warmup") a.warmup = std::atoi(next());
     else if (k == "--seed") a.seed = static_cast<unsigned>(std::atoi(next()));
     else if (k == "--check") a.check = true;
+    else if (k == "--list") a.list = true;
     else { std::fprintf(stderr, "unknown arg %s\n", k.c_str()); std::exit(2); }
   }
   if (a.M <= 0 || a.N <= 0 || a.K <= 0 || a.reps <= 0 || a.warmup < 0) {
@@ -86,20 +89,16 @@ struct ImplInfo {
   bool has_attrs;
 };
 
-// Register new impls here (and in gemm.h, sweep.py IMPLS, CMake tests).
-bool dispatch(const std::string& impl, cublasHandle_t h, const __half* A,
+// Impls come from aegis::gemm::registry(); "cublas" is the reference. The entry
+// is resolved once, before timing, so lookup cost never lands in a timed rep.
+void dispatch(const aegis::gemm::KernelEntry* e, cublasHandle_t h, const __half* A,
               const __half* B, __half* C, int M, int N, int K, cudaStream_t s) {
-  using namespace aegis::gemm;
-  if (impl == "naive") { launch_naive(A, B, C, M, N, K, s); return true; }
-  if (impl == "tiled") { launch_tiled(A, B, C, M, N, K, s); return true; }
-  if (impl == "cublas") { cublas_gemm(h, A, B, C, M, N, K); return true; }
-  return false;
+  if (e) e->launch(A, B, C, M, N, K, s);
+  else cublas_gemm(h, A, B, C, M, N, K);
 }
 
-ImplInfo info(const std::string& impl) {
-  using namespace aegis::gemm;
-  if (impl == "naive") return {CONFIG_naive, attrs_naive(), true};
-  if (impl == "tiled") return {CONFIG_tiled, attrs_tiled(), true};
+ImplInfo info(const aegis::gemm::KernelEntry* e) {
+  if (e) return {e->config, e->attrs(), true};
   return {R"({"algo":"CUBLAS_GEMM_DEFAULT"})", {}, false};
 }
 
@@ -116,6 +115,18 @@ double percentile(std::vector<float> v, double p) {
 int main(int argc, char** argv) {
   const Args a = parse(argc, argv);
   const int M = a.M, N = a.N, K = a.K;
+
+  // --list: one JSON line per registered impl (cuBLAS is always available too).
+  if (a.list) {
+    for (const auto& e : aegis::gemm::registry())
+      std::printf("{\"impl\":\"%s\",\"config\":%s}\n", e.name, e.config);
+    return 0;
+  }
+  const aegis::gemm::KernelEntry* entry = aegis::gemm::find(a.impl);
+  if (!entry && a.impl != "cublas") {
+    std::fprintf(stderr, "unknown impl '%s'\n", a.impl.c_str());
+    return 2;
+  }
 
   int dev = 0;
   AEGIS_CUDA_CHECK(cudaGetDevice(&dev));
@@ -152,10 +163,7 @@ int main(int argc, char** argv) {
   void* dFlush;
   AEGIS_CUDA_CHECK(cudaMalloc(&dFlush, flush_bytes));
 
-  if (!dispatch(a.impl, handle, dA, dB, dC, M, N, K, stream)) {
-    std::fprintf(stderr, "unknown impl '%s'\n", a.impl.c_str());
-    return 2;
-  }
+  dispatch(entry, handle, dA, dB, dC, M, N, K, stream);
   AEGIS_CUDA_CHECK(cudaStreamSynchronize(stream));
 
   // Correctness against cuBLAS.
@@ -180,7 +188,7 @@ int main(int argc, char** argv) {
   }
 
   // Timing.
-  for (int i = 0; i < a.warmup; ++i) dispatch(a.impl, handle, dA, dB, dC, M, N, K, stream);
+  for (int i = 0; i < a.warmup; ++i) dispatch(entry, handle, dA, dB, dC, M, N, K, stream);
   std::vector<cudaEvent_t> starts(a.reps), stops(a.reps);
   for (int i = 0; i < a.reps; ++i) {
     AEGIS_CUDA_CHECK(cudaEventCreate(&starts[i]));
@@ -189,7 +197,7 @@ int main(int argc, char** argv) {
   for (int i = 0; i < a.reps; ++i) {
     AEGIS_CUDA_CHECK(cudaMemsetAsync(dFlush, i & 0xff, flush_bytes, stream));
     AEGIS_CUDA_CHECK(cudaEventRecord(starts[i], stream));
-    dispatch(a.impl, handle, dA, dB, dC, M, N, K, stream);
+    dispatch(entry, handle, dA, dB, dC, M, N, K, stream);
     AEGIS_CUDA_CHECK(cudaEventRecord(stops[i], stream));
   }
   AEGIS_CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -209,7 +217,7 @@ int main(int argc, char** argv) {
   const double tflops = flops / (med_us * 1e-6) / 1e12;
   const double gbps = bytes / (med_us * 1e-6) / 1e9;
 
-  const ImplInfo ii = info(a.impl);
+  const ImplInfo ii = info(entry);
   std::printf(
       "{\"op\":\"gemm\",\"impl\":\"%s\",\"dtype\":\"f16f32f16\","
       "\"config\":%s,\"shape\":{\"M\":%d,\"N\":%d,\"K\":%d},"

@@ -23,6 +23,8 @@ set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -lineinfo --expt-relaxed-constexpr -Xp
 add_library(aegis_kernels STATIC
   src/gemm/naive.cu
   src/gemm/tiled.cu
+  src/gemm/regblock.cu
+  src/gemm/registry.cu
 )
 target_include_directories(aegis_kernels PUBLIC include)
 set_target_properties(aegis_kernels PROPERTIES CUDA_SEPARABLE_COMPILATION OFF)
@@ -36,8 +38,14 @@ target_link_libraries(aegis_manifest PRIVATE CUDA::cudart)
 
 # Correctness: every impl on shapes that are NOT multiples of any tile size.
 enable_testing()
-foreach(impl naive tiled)
-  foreach(shape "127;129;65" "1;896;896" "16;4864;896" "256;256;256")
+# Keep in sync with `bench_gemm --list` (the registry); one name per instantiation.
+set(AEGIS_IMPLS
+  naive tiled
+  regblock_64x64x8_4x4 regblock_128x128x8_8x8 regblock_128x64x16_8x4
+)
+foreach(impl ${AEGIS_IMPLS})
+  # 127x129x65: scalar fallback. 200x136x72: 16-byte path with partial edge tiles.
+  foreach(shape "127;129;65" "200;136;72" "1;896;896" "16;4864;896" "256;256;256")
     list(GET shape 0 M)
     list(GET shape 1 N)
     list(GET shape 2 K)

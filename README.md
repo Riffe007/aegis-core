@@ -13,7 +13,7 @@ of cuBLAS on the same device and shape.
 |---|---|---|---|
 | 0 | `naive` | one thread per output, global memory only | implemented |
 | 1 | `tiled` | 32x32 shared-memory tiles | implemented |
-| 2 | `regblock` | register-blocked micro-tiles | planned |
+| 2 | `regblock_*` | register-blocked micro-tiles, 3 configs | implemented |
 | 3 | `mma` | tensor cores via `mma.sync` m16n8k16 + `ldmatrix` | planned |
 | 4 | `mma_pipe` | tier 3 + multi-stage `cp.async` pipeline | planned |
 | — | autotuner | per-arch winner selection over template configs | planned |

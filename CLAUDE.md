@@ -48,10 +48,15 @@ artifacts/sass/     SASS dumps per arch (gitignored)
    (non-multiples of the tile) must pass too; add them to `tests` in CMakeLists.
 3. **The baseline is cuBLAS, not naive.** Report results as % of cuBLAS on the
    same shape and device.
-4. **One impl per file, registered in one place.** Adding a kernel = new file in
-   `src/gemm/`, a declaration + `attrs_*()` in `gemm.h`, a case in
-   `bench/bench_gemm.cu` `dispatch()`, an entry in `tools/sweep.py` `IMPLS`,
-   and a ctest line. Use `/new-kernel`.
+4. **One impl per file, registered in one place.** Every launchable impl is an
+   entry in `aegis::gemm::registry()` (`src/gemm/registry.cu`); `bench_gemm`
+   dispatches through it and `bench_gemm --list` prints it. A templated tier
+   declares a constexpr config table in `gemm.h` (one row per instantiation,
+   impl name `<tier>_<params>`) and an `<tier>_entries()` function that the
+   registry concatenates. Adding a kernel = new file in `src/gemm/`, its table
+   or declarations in `gemm.h`, its entries in `registry.cu`, the names in
+   `tools/sweep.py` `IMPLS` and `AEGIS_IMPLS` in `CMakeLists.txt`.
+   Use `/new-kernel`.
 5. **Look at the SASS before claiming an optimization worked.** If you add
    inline PTX, confirm with `tools/sass_dump.sh` that the expected instructions
    (HMMA, LDSM, LDGSTS) appear and that register count did not spill.
@@ -82,7 +87,7 @@ artifacts/sass/     SASS dumps per arch (gitignored)
 - [x] Build system, harness, cuBLAS reference, perf DB, manifest, SASS dump
 - [x] Tier 0: naive
 - [x] Tier 1: shared-memory tiled (32x32)
-- [ ] Tier 2: register-blocked (each thread computes a TMxTN micro-tile), templated on BM/BN/BK/TM/TN
+- [x] Tier 2: register-blocked (each thread computes a TMxTN micro-tile), templated on BM/BN/BK/TM/TN
 - [ ] Tier 3: tensor-core `mma.sync` m16n8k16 + `ldmatrix`, templated on BM/BN/BK/warps
 - [ ] Tier 4: tier 3 + `cp.async` multi-stage pipeline (STAGES template param)
 - [ ] Autotuner: enumerate template instantiations, time per shape, write `winners`

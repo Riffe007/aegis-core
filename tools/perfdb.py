@@ -215,21 +215,22 @@ def cmd_report(args) -> None:
     for r in rows:
         table.setdefault((r[0], r[3], r[4], r[5]), {})[r[6]] = r
     impls = sorted({r[6] for r in rows if r[6] != "cublas"})
+    widths = [max(11, len(i)) for i in impls]  # full impl names, never truncated
     hdr = f"{'arch':>5} {'M':>6} {'N':>6} {'K':>6} {'cuBLAS us':>10} {'TFLOPS':>7} " + \
-          " ".join(f"{i[:10]:>11}" for i in impls)
+          " ".join(f"{i:>{w}}" for i, w in zip(impls, widths))
     print(hdr)
     print("-" * len(hdr))
     for (arch, m, n, k), byimpl in sorted(table.items()):
         cb = byimpl.get("cublas")
         cells = []
-        for i in impls:
+        for i, w in zip(impls, widths):
             r = byimpl.get(i)
             if r is None:
-                cells.append(f"{'-':>11}")
+                cells.append(f"{'-':>{w}}")
             elif cb:
-                cells.append(f"{cb[9] / r[9] * 100:>10.1f}%")
+                cells.append(f"{cb[9] / r[9] * 100:>{w - 1}.1f}%")
             else:
-                cells.append(f"{r[9]:>9.1f}us")
+                cells.append(f"{r[9]:>{w - 2}.1f}us")
         cbs = f"{cb[9]:>10.1f} {cb[10]:>7.2f}" if cb else f"{'-':>10} {'-':>7}"
         print(f"{arch:>5} {m:>6} {n:>6} {k:>6} {cbs} " + " ".join(cells))
     print("\nCells are % of cuBLAS speed (100% = parity, >100% = faster than cuBLAS).")

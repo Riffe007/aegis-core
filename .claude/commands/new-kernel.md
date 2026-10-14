@@ -10,12 +10,15 @@ Follow CLAUDE.md. Do all of these in one change:
 1. Create `src/gemm/$1.cu`. Kernel lives in `aegis::gemm::(anonymous)`, named
    `gemm_$1_kernel`. Header comment says what this tier changes versus the
    previous one and what bottleneck it targets.
-2. Declare `launch_$1`, `attrs_$1`, `CONFIG_$1` in `include/aegis/gemm.h`.
-   If the kernel is templated, CONFIG must state every template parameter.
-3. Add the file to `aegis_kernels` in `CMakeLists.txt` and add `$1` to the
-   ctest `foreach(impl ...)` list.
-4. Register it in `dispatch()` and `info()` in `bench/bench_gemm.cu`.
-5. Add it to `IMPLS` in `tools/sweep.py`.
+2. In `include/aegis/gemm.h`: for a fixed kernel declare `launch_$1`,
+   `attrs_$1`, `CONFIG_$1`; for a templated one add a constexpr config table
+   (one row per instantiation) and `$1_entries()`. Each entry's config JSON must
+   state every template parameter.
+3. Add the file to `aegis_kernels` in `CMakeLists.txt` and every impl name to
+   `AEGIS_IMPLS` (the ctest list).
+4. Add its entries to `registry()` in `src/gemm/registry.cu`. Check with
+   `./build/bench_gemm --list`.
+5. Add every impl name to `IMPLS` in `tools/sweep.py`.
 6. Build, then run `ctest --test-dir build --output-on-failure`. All shapes,
    including the odd ones, must pass. Fix before going further.
 7. Run `tools/sass_dump.sh` and report: registers, local (spill) bytes, and the

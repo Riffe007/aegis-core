@@ -26,6 +26,9 @@ IMPLS = {
     "cublas": {"reps": 50},
     "naive": {"reps": 5, "max_flops": 2 * 2048 ** 3},  # skip naive above 2048^3
     "tiled": {"reps": 20},
+    "regblock_64x64x8_4x4": {"reps": 20},
+    "regblock_128x128x8_8x8": {"reps": 20},
+    "regblock_128x64x16_8x4": {"reps": 20},
 }
 
 # Square shapes for the roofline, plus Qwen2.5-0.5B projection shapes

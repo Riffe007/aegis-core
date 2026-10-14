@@ -17,12 +17,15 @@ cuobjdump -res-usage "$BIN" > "$OUT/resource-usage.txt" 2>&1 || true
 # Kernel symbols that belong to us (skip cuBLAS, which is a shared library anyway).
 mapfile -t KERNELS < <(cuobjdump -sass "$BIN" | grep -oP '(?<=Function : )\S+' | grep -i aegis | sort -u)
 
+# Short display name: drop the namespace and return type, keep template args.
+short() { c++filt | sed -E 's/^void //; s/aegis::gemm::\(anonymous namespace\):://; s/\(.*$//'; }
+
 printf "%-60s %6s %6s %6s %6s %6s\n" kernel HMMA LDSM LDGSTS LDG STS > "$OUT/instruction-mix.txt"
 for k in "${KERNELS[@]}"; do
   pretty="$(echo "$k" | c++filt | sed 's/[^A-Za-z0-9_]/_/g' | cut -c1-120)"
   cuobjdump -sass -fun "$k" "$BIN" > "$OUT/$pretty.sass"
   count() { grep -cE "\\b$1" "$OUT/$pretty.sass" || true; }
-  printf "%-60s %6s %6s %6s %6s %6s\n" "$(echo "$k" | c++filt | cut -c1-60)" \
+  printf "%-60s %6s %6s %6s %6s %6s\n" "$(echo "$k" | short)" \
     "$(count HMMA)" "$(count LDSM)" "$(count LDGSTS)" "$(count 'LDG\.')" "$(count 'STS')" \
     >> "$OUT/instruction-mix.txt"
 done
