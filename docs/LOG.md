@@ -293,3 +293,40 @@ shapes.
   16x896x896; the ties that remain are 512x896x{896,4864}, 1024³, 2048³, 4096³
   and those two, i.e. mostly large shapes where the winner's p90 tail is wide.
 - **Overall level:** v1's 55–110% of cuBLAS becomes 59–96% of cublaslt_best.
+
+### ldmatrix x4, 8 vs 16 warps/SM — counters (step 2)
+
+`microbench/profile_ldmatrix.sh` (now 5 runs per point, `--clock-control
+none`), `RmProfilingAdminOnly: 0`, remote desktop stopped. Counters per SM,
+identical across the 5 runs at each point (ranges shown where they moved):
+
+| Counter | 8 warps | 16 warps |
+|---|---|---|
+| shared-load bank conflicts | 0 | 0 |
+| LSU shared-load wavefronts / LDSM.x4 | 4.0 | 4.0 |
+| LSU writeback active, % of active cycles | 99.86–99.96 | 99.98 |
+| LSU pipe inst issued, % of peak | 49.94–49.99 | 49.99 |
+| implied B/clk/SM (wavefronts x 128 B / active cycles) | 127.9 | 127.97 |
+| warps active, % of max (48) | 16.7 | 33.4 |
+| stall mio_throttle per issue | 1.43–1.58 | 11.34 |
+| stall short_scoreboard per issue | 5.35–5.38 | 4.40–4.42 |
+| stall not_selected per issue | 0.08 | 0.66–0.68 |
+| issue active, % | 21.1 | 21.1 |
+| sm cycles elapsed, max − min across SMs | ≤ 21k of 4.2M | ≤ 23k of 8.4M (one run 211k) |
+
+The probe's own number (block 0's clock64 window), separately, 15 runs each
+without ncu: 8 warps 128.0 every run; 16 warps 128.0 in 14 runs, 120.0 once.
+Under ncu it printed 115.4 once at 16 warps, but ncu replays the kernel over
+several passes and that line may come from a different pass than the counters.
+With remote desktop running (previous entry) 16 warps read 99–128.
+
+**Cause: unexplained.** No counter shows a throughput loss at 16 warps: no
+bank conflicts, ideal wavefronts, the LSU writeback path busy 99.98% of active
+cycles, active cycles proportional to the work in every profiled pass. The
+extra warps only queue: mio_throttle stalls go from ~1.5 to 11.3 per issue at
+identical throughput, so 8 warps already saturate ldmatrix at 128 B/clk/SM.
+The intermittent low readings are seen only by the probe's clock64 window,
+and are rarer with remote desktop off (1/15) than on (3/5). Hypothesis, not
+tested: another GPU context (the desktop) occasionally preempts or shares the
+SM during block 0's window, which clock64 counts. A test would read
+%globaltimer and per-SM active cycles alongside clock64 in the probe.
