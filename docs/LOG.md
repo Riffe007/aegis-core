@@ -615,5 +615,6 @@ Against the winner's warm v2 per-launch time from decode run `6e1000a59892`
 small: graph replay is 0.3–0.4 µs faster than the runtime launch at the median
 and has the lowest p99 on the two short shapes; the driver API saves ~0.2 µs;
 `aegis::matmul`'s winner lookup adds ~0.1 µs over a direct registry launch.
-At 1x896x896 the fixed cost is ~1/3 of the end-to-end time, so for decode
-the launch path matters about as much as the remaining gap to cublaslt_best.
+At 1x896x896 the fixed cost is ~1/3 of the end-to-end time: larger than the
+winner's cold kernel gap to cublaslt_best (10.76 vs 8.83 µs, 1.9 µs) and
+smaller than its warm gap (9.47 vs 3.21 µs, 6.3 µs).
