@@ -31,8 +31,8 @@ int main() {
   mb::prove("mb_mma_latency", {{"HMMA", kUnroll}});
   float* sink;
   long long* dcycles;
-  MB_CHECK(cudaMalloc(&sink, 32 * sizeof(float)));
-  MB_CHECK(cudaMalloc(&dcycles, sizeof(long long)));
+  MB_CHECK(aegis::budget::gpu_malloc(&sink, 32 * sizeof(float)));
+  MB_CHECK(aegis::budget::gpu_malloc(&dcycles, sizeof(long long)));
   const int iters = 1 << 16;
   mb_mma_latency<<<1, 32>>>(0x3c003c00u, iters, sink, dcycles);  // warm-up
   MB_CHECK(cudaDeviceSynchronize());

@@ -49,4 +49,12 @@ inline bool c_pairs_ok(const GemmParams& p) {
   return aligned_to(p.C, 4) && p.ldc % 2 == 0 && (p.batch <= 1 || p.stride_c % 2 == 0);
 }
 
+
+// Grid within device limits (x < 2^31, y and z <= 65535). Launchers check it
+// before launching, so an oversized problem returns cudaErrorInvalidValue
+// without a failed CUDA API call (clean under compute-sanitizer).
+inline bool grid_ok(const dim3& g) {
+  return g.x >= 1 && g.x <= 2147483647u && g.y >= 1 && g.y <= 65535u && g.z >= 1 && g.z <= 65535u;
+}
+
 }  // namespace aegis::gemm

@@ -51,8 +51,8 @@ int main(int argc, char** argv) {
   const int sms = dev.prop.multiProcessorCount;
   uint32_t* sink;
   long long* dcycles;
-  MB_CHECK(cudaMalloc(&sink, size_t(sms) * 1024 * sizeof(uint32_t)));
-  MB_CHECK(cudaMalloc(&dcycles, sizeof(long long)));
+  MB_CHECK(aegis::budget::gpu_malloc(&sink, size_t(sms) * 1024 * sizeof(uint32_t)));
+  MB_CHECK(aegis::budget::gpu_malloc(&dcycles, sizeof(long long)));
   const int iters = 1 << 14;
   for (int warps : points) {
     mb_ldmatrix_x4<<<sms, warps * 32>>>(16, sink, dcycles);

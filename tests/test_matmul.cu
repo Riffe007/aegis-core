@@ -10,6 +10,7 @@
 #include <cublas_v2.h>
 
 #include "aegis/common.cuh"
+#include "bench/gpu_budget.h"
 #include "aegis/matmul.h"
 
 namespace {
@@ -25,10 +26,10 @@ bool check(int M, int N, int K) {
   for (auto& x : hB) x = __float2half(d(rng));
 
   __half *A, *B, *C, *R;
-  AEGIS_CUDA_CHECK(cudaMalloc(&A, nA * 2));
-  AEGIS_CUDA_CHECK(cudaMalloc(&B, nB * 2));
-  AEGIS_CUDA_CHECK(cudaMalloc(&C, nC * 2));
-  AEGIS_CUDA_CHECK(cudaMalloc(&R, nC * 2));
+  AEGIS_CUDA_CHECK(aegis::budget::gpu_malloc(&A, nA * 2));
+  AEGIS_CUDA_CHECK(aegis::budget::gpu_malloc(&B, nB * 2));
+  AEGIS_CUDA_CHECK(aegis::budget::gpu_malloc(&C, nC * 2));
+  AEGIS_CUDA_CHECK(aegis::budget::gpu_malloc(&R, nC * 2));
   AEGIS_CUDA_CHECK(cudaMemcpy(A, hA.data(), nA * 2, cudaMemcpyHostToDevice));
   AEGIS_CUDA_CHECK(cudaMemcpy(B, hB.data(), nB * 2, cudaMemcpyHostToDevice));
 
@@ -53,7 +54,7 @@ bool check(int M, int N, int K) {
   std::printf("%-5s %5dx%5dx%5d  %-30s rel_err=%.3g\n", ok ? "ok" : "FAIL", M, N, K,
               aegis::matmul_choice(M, N, K), rel);
   cublasDestroy(h);
-  cudaFree(A); cudaFree(B); cudaFree(C); cudaFree(R);
+  aegis::budget::gpu_free(A); aegis::budget::gpu_free(B); aegis::budget::gpu_free(C); aegis::budget::gpu_free(R);
   return ok;
 }
 

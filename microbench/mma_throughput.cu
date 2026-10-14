@@ -57,8 +57,8 @@ int main() {
   const int sms = dev.prop.multiProcessorCount;
   float* sink;
   long long* dcycles;
-  MB_CHECK(cudaMalloc(&sink, size_t(sms) * 1024 * sizeof(float)));
-  MB_CHECK(cudaMalloc(&dcycles, sizeof(long long)));
+  MB_CHECK(aegis::budget::gpu_malloc(&sink, size_t(sms) * 1024 * sizeof(float)));
+  MB_CHECK(aegis::budget::gpu_malloc(&dcycles, sizeof(long long)));
   const int iters = 4096;
 
   for (int warps : {1, 2, 4, 8, 16, 32}) {

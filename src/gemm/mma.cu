@@ -98,6 +98,7 @@ cudaError_t launch_layout(const GemmParams& gp, cudaStream_t stream) {
       gemm_mma_kernel<T>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(T::STAGE_BYTES));
   if (configured != cudaSuccess) return configured;
   const dim3 grid(ceil_div(gp.N, T::BN), ceil_div(gp.M, T::BM), gp.batch);
+  if (!grid_ok(grid)) return cudaErrorInvalidValue;
   gemm_mma_kernel<T><<<grid, T::THREADS, T::STAGE_BYTES, stream>>>(to_kparams(gp), vec16_ok(gp),
                                                                    c_pairs_ok(gp));
   return cudaGetLastError();

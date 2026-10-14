@@ -68,9 +68,9 @@ int main() {
   for (const Shape sh : {Shape{1, 896, 896}, Shape{1, 4864, 896}, Shape{1, 896, 4864}}) {
     const size_t nA = size_t(sh.M) * sh.K, nB = size_t(sh.K) * sh.N, nC = size_t(sh.M) * sh.N;
     __half *A, *B, *C;
-    MB_CHECK(cudaMalloc(&A, nA * sizeof(__half)));
-    MB_CHECK(cudaMalloc(&B, nB * sizeof(__half)));
-    MB_CHECK(cudaMalloc(&C, nC * sizeof(__half)));
+    MB_CHECK(aegis::budget::gpu_malloc(&A, nA * sizeof(__half)));
+    MB_CHECK(aegis::budget::gpu_malloc(&B, nB * sizeof(__half)));
+    MB_CHECK(aegis::budget::gpu_malloc(&C, nC * sizeof(__half)));
     MB_CHECK(cudaMemset(A, 0, nA * sizeof(__half)));
     MB_CHECK(cudaMemset(B, 0, nB * sizeof(__half)));
     const char* choice = aegis::matmul_choice(sh.M, sh.N, sh.K);
@@ -130,9 +130,9 @@ int main() {
     }
     MB_CHECK(cudaGraphExecDestroy(exec));
     MB_CHECK(cudaGraphDestroy(graph));
-    MB_CHECK(cudaFree(C));
-    MB_CHECK(cudaFree(B));
-    MB_CHECK(cudaFree(A));
+    MB_CHECK(aegis::budget::gpu_free(C));
+    MB_CHECK(aegis::budget::gpu_free(B));
+    MB_CHECK(aegis::budget::gpu_free(A));
   }
   return 0;
 }

@@ -189,6 +189,7 @@ template <int BM, int BN, int BK, int TM, int TN, Layout LA, Layout LB>
 cudaError_t launch_layout(const GemmParams& gp, cudaStream_t stream) {
   const dim3 block((BM / TM) * (BN / TN));
   const dim3 grid(ceil_div(gp.N, BN), ceil_div(gp.M, BM), gp.batch);
+  if (!grid_ok(grid)) return cudaErrorInvalidValue;
   gemm_regblock_kernel<BM, BN, BK, TM, TN, LA, LB><<<grid, block, 0, stream>>>(to_kparams(gp), vec16_ok(gp));
   return cudaGetLastError();
 }

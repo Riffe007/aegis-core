@@ -93,8 +93,8 @@ int main() {
 
   unsigned long long* sink;
   long long* dcycles;
-  MB_CHECK(cudaMalloc(&sink, sizeof *sink));
-  MB_CHECK(cudaMalloc(&dcycles, sizeof *dcycles));
+  MB_CHECK(aegis::budget::gpu_malloc(&sink, sizeof *sink));
+  MB_CHECK(aegis::budget::gpu_malloc(&dcycles, sizeof *dcycles));
   const int steps = 1 << 17;
 
   for (const bool page_local : {false, true}) {
@@ -103,7 +103,7 @@ int main() {
     for (size_t ws = size_t(4) << 10; ws <= size_t(512) << 20; ws *= 2, ++ws_index) {
       const size_t nodes = ws / kStride;
       char* buf;
-      MB_CHECK(cudaMalloc(&buf, ws));
+      MB_CHECK(aegis::budget::gpu_malloc(&buf, ws));
       const auto base = reinterpret_cast<unsigned long long>(buf);
       std::vector<unsigned long long> host(ws / sizeof(unsigned long long), 0);
       std::vector<double> cyc;
@@ -123,7 +123,7 @@ int main() {
         MB_CHECK(cudaMemcpy(&cycles, dcycles, sizeof cycles, cudaMemcpyDeviceToHost));
         cyc.push_back(double(cycles) / steps);
       }
-      MB_CHECK(cudaFree(buf));
+      MB_CHECK(aegis::budget::gpu_free(buf));
       const std::string head = "{\"working_set_bytes\":" + std::to_string(ws) + ",\"variant\":\"" +
                                variant + "\",\"repeats\":" + std::to_string(kRepeats) + ",\"stat\":";
       const double med = percentile(cyc, 0.5);

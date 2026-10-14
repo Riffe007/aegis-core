@@ -1,6 +1,7 @@
 // The AEGIS timing protocol (see harness.h), protocol v1 and v2, the timer
 // resolution probe and the NVML idle guard.
 #include "harness.h"
+#include "gpu_budget.h"
 
 #include <algorithm>
 #include <chrono>
@@ -45,10 +46,10 @@ Problem::Problem(int M_, int N_, int K_, unsigned seed) : M(M_), N(N_), K(K_) {
   std::uniform_real_distribution<float> dist(-1.f, 1.f);
   for (auto& x : hA) x = __float2half(dist(rng));
   for (auto& x : hB) x = __float2half(dist(rng));
-  AEGIS_CUDA_CHECK(cudaMalloc(&A, nA * sizeof(__half)));
-  AEGIS_CUDA_CHECK(cudaMalloc(&B, nB * sizeof(__half)));
-  AEGIS_CUDA_CHECK(cudaMalloc(&C, nC * sizeof(__half)));
-  AEGIS_CUDA_CHECK(cudaMalloc(&Ref, nC * sizeof(__half)));
+  AEGIS_CUDA_CHECK(aegis::budget::gpu_malloc(&A, nA * sizeof(__half)));
+  AEGIS_CUDA_CHECK(aegis::budget::gpu_malloc(&B, nB * sizeof(__half)));
+  AEGIS_CUDA_CHECK(aegis::budget::gpu_malloc(&C, nC * sizeof(__half)));
+  AEGIS_CUDA_CHECK(aegis::budget::gpu_malloc(&Ref, nC * sizeof(__half)));
   AEGIS_CUDA_CHECK(cudaMemcpy(A, hA.data(), nA * sizeof(__half), cudaMemcpyHostToDevice));
   AEGIS_CUDA_CHECK(cudaMemcpy(B, hB.data(), nB * sizeof(__half), cudaMemcpyHostToDevice));
 }
@@ -61,9 +62,9 @@ void Problem::ensure_sets(int k) {
   const size_t nA = size_t(M) * K, nB = size_t(K) * N, nC = size_t(M) * N;
   while (int(extra_.size()) + 1 < k) {
     BufferSet s;
-    AEGIS_CUDA_CHECK(cudaMalloc(&s.A, nA * sizeof(__half)));
-    AEGIS_CUDA_CHECK(cudaMalloc(&s.B, nB * sizeof(__half)));
-    AEGIS_CUDA_CHECK(cudaMalloc(&s.C, nC * sizeof(__half)));
+    AEGIS_CUDA_CHECK(aegis::budget::gpu_malloc(&s.A, nA * sizeof(__half)));
+    AEGIS_CUDA_CHECK(aegis::budget::gpu_malloc(&s.B, nB * sizeof(__half)));
+    AEGIS_CUDA_CHECK(aegis::budget::gpu_malloc(&s.C, nC * sizeof(__half)));
     AEGIS_CUDA_CHECK(cudaMemcpy(s.A, A, nA * sizeof(__half), cudaMemcpyDeviceToDevice));
     AEGIS_CUDA_CHECK(cudaMemcpy(s.B, B, nB * sizeof(__half), cudaMemcpyDeviceToDevice));
     extra_.push_back(s);
@@ -76,14 +77,14 @@ BufferSet Problem::set(int i) const {
 
 Problem::~Problem() {
   for (const BufferSet& s : extra_) {
-    cudaFree(s.C);
-    cudaFree(s.B);
-    cudaFree(s.A);
+    aegis::budget::gpu_free(s.C);
+    aegis::budget::gpu_free(s.B);
+    aegis::budget::gpu_free(s.A);
   }
-  cudaFree(Ref);
-  cudaFree(C);
-  cudaFree(B);
-  cudaFree(A);
+  aegis::budget::gpu_free(Ref);
+  aegis::budget::gpu_free(C);
+  aegis::budget::gpu_free(B);
+  aegis::budget::gpu_free(A);
 }
 
 namespace {
@@ -146,22 +147,22 @@ Harness::Harness() {
   AEGIS_CUBLAS_CHECK(cublasSetStream(cublas_, stream_));
   // cuBLAS must not allocate while a graph is being captured.
   constexpr size_t kCublasWorkspace = size_t(32) << 20;
-  AEGIS_CUDA_CHECK(cudaMalloc(&cublas_ws_, kCublasWorkspace));
+  AEGIS_CUDA_CHECK(aegis::budget::gpu_malloc(&cublas_ws_, kCublasWorkspace));
   AEGIS_CUBLAS_CHECK(cublasSetWorkspace(cublas_, cublas_ws_, kCublasWorkspace));
   AEGIS_CUBLAS_CHECK(cublasLtCreate(&lt_));
   lt_ws_bytes_ = kCublasWorkspace;
-  AEGIS_CUDA_CHECK(cudaMalloc(&lt_ws_, lt_ws_bytes_));
+  AEGIS_CUDA_CHECK(aegis::budget::gpu_malloc(&lt_ws_, lt_ws_bytes_));
   // L2 flush buffer: 2x L2 so nothing from the previous rep survives.
   flush_bytes_ = std::max<size_t>(size_t(prop_.l2CacheSize) * 2, 1 << 20);
-  AEGIS_CUDA_CHECK(cudaMalloc(&flush_, flush_bytes_));
+  AEGIS_CUDA_CHECK(aegis::budget::gpu_malloc(&flush_, flush_bytes_));
   timer_ = measure_timer_resolution(stream_);
 }
 
 Harness::~Harness() {
-  cudaFree(flush_);
+  aegis::budget::gpu_free(flush_);
   cublasDestroy(cublas_);
-  cudaFree(cublas_ws_);
-  cudaFree(lt_ws_);
+  aegis::budget::gpu_free(cublas_ws_);
+  aegis::budget::gpu_free(lt_ws_);
   cublasLtDestroy(lt_);
   cudaStreamDestroy(stream_);
 }

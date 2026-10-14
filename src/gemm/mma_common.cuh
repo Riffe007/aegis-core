@@ -52,11 +52,20 @@ __device__ __forceinline__ void mma_16816(float (&d)[4], const uint32_t (&a)[4],
 __device__ __forceinline__ void cp_async_16(uint32_t dst, const void* src) {
   asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(dst), "l"(src));
 }
-// Predicated form: copies src_bytes (0..16) and zero-fills the rest of the 16
-// bytes; src_bytes = 0 reads nothing (out-of-bounds chunks, K tail).
-__device__ __forceinline__ void cp_async_16_zfill(uint32_t dst, const void* src, int src_bytes) {
-  asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n"
-               ::"r"(dst), "l"(src), "r"(src_bytes));
+// 16-byte shared store (zero or partial chunks of the boundary path).
+__device__ __forceinline__ void st_shared_16(uint32_t dst, uint4 v) {
+  asm volatile("st.shared.v4.u32 [%0], {%1,%2,%3,%4};\n" ::"r"(dst), "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w)
+               : "memory");
+}
+
+// The first `bytes` (2..14) bytes of a chunk from global, the rest exactly 0.
+// Reads only the valid halves: nothing past the logical matrix is touched.
+__device__ __forceinline__ uint4 load_partial_16(const __half* src, int bytes) {
+  union { uint4 v; __half h[8]; } u;
+  const __half zero = __float2half(0.f);
+#pragma unroll
+  for (int j = 0; j < 8; ++j) u.h[j] = j * 2 < bytes ? src[j] : zero;
+  return u.v;
 }
 __device__ __forceinline__ void cp_async_commit() {
   asm volatile("cp.async.commit_group;\n" ::);
@@ -133,7 +142,6 @@ struct OperandPlan {
                 "every thread copies the same number of chunks, one chunk column");
   static_assert(ITERS <= 32, "row mask is 32 bits");
 
-  const __half* base;    // the operand's matrix (a valid address for 0-byte copies)
   const __half* g;       // this thread's chunk 0 of the current k-tile
   long long row_step;    // ROW_STEP rows, in elements
   long long k_advance;   // one k-tile, in elements
@@ -146,7 +154,6 @@ struct OperandPlan {
     const int tid = threadIdx.x;
     row0 = tid / CHUNKS;
     col0 = (tid % CHUNKS) * 8;
-    base = X;
     row_step = (long long)ROW_STEP * ld;
     s_off = uint32_t(row0 * LD_S + col0) * sizeof(__half);
     if constexpr (K_IS_ROW) {  // rows = k (start 0), cols = mn
@@ -193,8 +200,17 @@ struct OperandPlan {
       if constexpr (!MASK_MN && !MASK_K) {
         cp_async_16(dst, src);
       } else {
+        // Boundary chunks never read past the valid elements: whole chunks
+        // copy asynchronously; empty ones are zero-stored without touching
+        // global memory; partial ones load only their valid halves and store
+        // explicit zeros for the rest (so NaN-patterned bytes past K, M or N
+        // can never reach a product, e.g. NaN * 0). The consumer's barrier
+        // orders these plain stores like the cp.async ones.
         const int bytes = chunk_bytes<MASK_MN, MASK_K>(i, k0, K);
-        cp_async_16_zfill(dst, bytes > 0 ? src : base, bytes);
+        if (bytes == 16)
+          cp_async_16(dst, src);
+        else
+          st_shared_16(dst, bytes == 0 ? make_uint4(0, 0, 0, 0) : load_partial_16(src, bytes));
       }
     }
   }

@@ -917,3 +917,111 @@ Hypotheses for the next experiments (none tested):
    `cp.async.bulk.tensor` against the PTX ISA for sm_120/sm_121 before use.
 4. 2048³: wave quantization with 1 block per SM (2.67 waves); a split-K or
    persistent schedule, or a 192-tile grid like cublaslt_best's, would test it.
+
+## 2026-10-15 — Phase A: correctness hardening
+
+Commits: `2a60073` (API, ABI 1.2, predicated kernels), `8ac64d4` (reference,
+tolerance c = 2), `3fa89b3` (fuzzer, BLAS alpha == 0), and the sanitizer step
+below. Baseline for before/after: worktree `aegis-baseline-e8d7e6b` (the commit
+before Phase A), built separately.
+
+**Fuzzer results.** `fuzz_2000` (seed 1) 0 failures; nightly 50,000 cases
+(seed 20261015) 0 failures (2,501 with NaN/Inf, 24,499 misaligned). Found
+along the way: alpha == 0 with NaN/Inf in A or B. Our kernels computed
+0 * NaN = NaN; cuBLASLt and cuBLAS are inconsistent there (some algorithms give
+beta*C, others NaN). Semantics are now BLAS everywhere (A*B does not contribute
+when alpha == 0); `aegis::matmul` handles alpha == 0 with a C = beta*C kernel.
+
+**Boundary loads never read past the logical matrix.** The first version used
+cp.async with a src-size operand (zero-fill), which PTX defines as reading only
+src-size bytes, but initcheck reported those as 16-byte reads of memory past the
+matrix, and empty chunks still passed a global address. Boundary chunks now:
+whole -> cp.async; empty -> a 16-byte zero store to smem, no global access;
+partial -> only the valid halves are loaded, the rest stored as exact zeros.
+Interior CTAs are unchanged (unpredicated cp.async).
+
+**NaN-poison fuzzer mode** (`--poison`, ctest `fuzz_poison`, and the nightly
+target): every element outside the logical matrices (ld padding, batch gaps,
+the tail) is NaN, plus 64-element NaN guard regions around each allocation; C
+is all NaN when beta == 0. 2,000 cases (seed 21): 0 failures. Sensitivity
+check: with a deliberate over-read reintroduced (partial chunks reading all 8
+halves), poison mode fails 5 of the 2,000 cases while the normal mode passes
+all 2,000 — poison mode catches exactly this class of bug.
+
+**Instructions at 4096³** (ncu, `mma_pipe_128x256x32_2x4_s3`, row-major NN):
+184.8 M before Phase A, 106.0 M after (5.51 -> 3.16 per HMMA). HMMA count is
+unchanged (33.55 M); the removed work is per-load predicates and address math
+on the interior path: IMAD 22.6 -> 8.0 M, LEA 10.1 -> 2.7 M, ISETP 9.7 -> 2.1 M,
+LDS 9.4 -> 1.6 M, MOV 9.7 M -> below the top 14, BSSY/BSYNC gone. NOPs remain
+(29.4 -> 29.9 M).
+
+### OOM incident (2026-10-14 15:08 / 15:11) and the guards
+
+The interrupted tool calls were the kernel OOM killer: `journalctl -k` shows
+NVRM `NV_ERR_NO_MEMORY` allocation failures, a global OOM, and `claude`
+(oom_score_adj 200) killed in the gnome-terminal scope, plus two
+`bench_gemm`s. Both times the running job was `compute-sanitizer --tool
+synccheck --num-cuda-barriers N` around `bench_gemm --check`; raising the
+barrier limit makes the sanitizer allocate tracking state, which on GB10's
+unified memory comes out of host RAM. The barrier-table overflow it was meant
+to fix came from cuBLAS kernels (cuda::barrier), not ours. Fixes:
+- CLAUDE.md rule 12: never `--num-cuda-barriers`.
+- synccheck never runs cuBLAS: `bench_gemm --check none`, `aegis_fuzz
+  --cpu-ref-only`, cuBLAS-using tests excluded (Benchmark policy, Sanitizer scope).
+- `tools/gpu_job.sh` wraps every long GPU job (sanitizers, tune, sweep,
+  paired-ab, nightly fuzz, the memcheck ctests): oom_score_adj 1000 + systemd
+  scope MemoryMax (AEGIS_MEM_MAX, 24G). Measured limit of the cap: GB10's driver
+  does not charge cudaMalloc to the job's cgroup (3 GiB cudaMalloc + memset
+  succeeds under MemoryMax=1G), so MemoryMax caps host memory only; the
+  OOM-priority setting is what protects the session from GPU allocations.
+- sanitize.sh: one tool per invocation, never nested, JOBS 1 (racecheck,
+  initcheck, synccheck) / 2 (memcheck).
+- Pre-run health check (nvidia-smi, orphans, new Xid/NVRM) in the Benchmark policy.
+
+### NOPs after HMMA (input to Phase B a)
+
+Our 4096³ kernel issues a NOP after almost every HMMA (29.9 M NOPs / 33.55 M
+HMMA). Compile-only experiments (scratch kernels with the same fragments and
+MMA loop): consecutive HMMAs already target different accumulators, and loop
+order (mi-outer, ni-outer, serpentine) does not change the count; the same
+source has ~0 NOPs for sm_80 / sm_87 / sm_90 / sm_100 / sm_110 but ~0.83 per
+HMMA for sm_120 / sm_121 (incl. the a variants); with independent
+instructions between the HMMAs, ptxas uses them and the NOPs mostly vanish.
+cuBLASLt's nvjet kernel issues HMMA.16816.F32 back to back on sm_121, so this
+is **a property of our code shape under ptxas for sm_12x** (nothing
+independent to schedule between consecutive HMMAs), not an absolute ptxas rule.
+Candidate: fragment double buffering (load k-step s+1's ldmatrix fragments
+while step s's HMMAs issue): in the scratch kernel NOPs 365 -> 155 per 448 HMMA
+(-58%) at 168 -> 206 registers. Not yet measured in the real kernel.
+
+### 5. compute-sanitizer: all four tools clean on our kernels
+
+`tools/sanitize.sh`, one tool per invocation, under `tools/gpu_job.sh`, with a
+health check (nvidia-smi, orphans, Xid/NVRM) before each:
+
+| Tool | Tests | JOBS | Reports | Scope notes |
+|---|---|---|---|---|
+| memcheck | 131 | 2 | 0 | whole suite (GEMM tests incl. cuBLAS --check, fuzz 100 cases <= 512, C ABI, dispatch) |
+| racecheck | 131 | 1 | 0 hazards | same |
+| initcheck | 131 | 1 | 0 | same; ran after the boundary-load fix (the first version's report is gone) |
+| synccheck | 128 | 1 | 0 | our kernels only: `bench_gemm --check none`, `aegis_fuzz --cpu-ref-only`, capi/dispatch tests excluded; no `--num-cuda-barriers` |
+
+Skipped by every tool: `sm87_gate` and `gpu_budget_*` (no kernels; the budget
+tests need their ctest environment, and the default-mode test makes no CUDA
+call, which compute-sanitizer reports as "terminated before first
+instrumented API call") and the `memcheck_*` ctests (they already run
+memcheck; nesting is not supported). racecheck ran on the build before the GPU
+budget wrapper; the kernel SASS of that build and the final one is identical
+(cuobjdump diff without paths: 0 lines). Also: the launchers check grid limits
+before launching (an oversized grid returns cudaErrorInvalidValue without a
+failed CUDA call, which memcheck reported), and ctest gains `memcheck_fuzz`,
+`memcheck_capi`, `memcheck_bench_odd`, `memcheck_bench_scalar`.
+
+**In-process GPU budget** (rule 13, `src/bench/gpu_budget.h`): every device
+allocation in the harness, aegis_tune, the fuzzer, the references, test_matmul
+and the microbenchmarks goes through `aegis::budget::gpu_malloc`, which refuses
+past `AEGIS_GPU_BUDGET` (16 GiB) or below `AEGIS_GPU_MIN_FREE` (16 GiB) free per
+`cudaMemGetInfo` (111.7 GiB reported vs `free` 112 GiB: it measures host RAM).
+ctest `gpu_budget_*`: 17 GiB refused by default; 64 MiB budget: 32 MiB ok,
++48 MiB refused, ok after the free, 1 TiB refused; min-free floor above RAM:
+1 MiB refused.

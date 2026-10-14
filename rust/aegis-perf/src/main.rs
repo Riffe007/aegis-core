@@ -10,8 +10,11 @@
 //!     aegis-perf emit-header [--arch 121]
 //!     aegis-perf roofline --arch 121 [--out results/roofline-sm121.svg]
 //!     aegis-perf emit-arch --arch 121 [--ptr-chase RUN[:LAYOUT]]...
+//!     aegis-perf paired-ab --a OLD/build/bench_gemm --b build/bench_gemm --impl X --shape M N K
+mod ab;
 mod arch;
 mod db;
+mod gpujob;
 mod params;
 mod pyjson;
 mod roofline;
@@ -111,6 +114,29 @@ enum Cmd {
         #[arg(long, default_value = "results")]
         results_dir: PathBuf,
     },
+    /// Same impl from two builds, alternating processes: paired ratio B/A with a bootstrap CI.
+    PairedAb {
+        /// bench_gemm of build A (e.g. the tree before a change).
+        #[arg(long)]
+        a: PathBuf,
+        /// bench_gemm of build B.
+        #[arg(long)]
+        b: PathBuf,
+        #[arg(long = "impl")]
+        impl_: String,
+        /// Impl name in build B if it differs from A's.
+        #[arg(long)]
+        impl_b: Option<String>,
+        #[arg(long, num_args = 3, value_names = ["M", "N", "K"])]
+        shape: Vec<i64>,
+        #[arg(long, default_value_t = 30)]
+        pairs: usize,
+        /// Timed windows per process.
+        #[arg(long, default_value_t = 10)]
+        reps: u32,
+        #[arg(long, default_value = "cold")]
+        cache: String,
+    },
     /// Measured machine parameters (L2/DRAM latency, DRAM bandwidth, mma peak)
     /// -> include/aegis/arch/sm_<arch>.json, for the cost model.
     EmitArch {
@@ -180,6 +206,16 @@ fn main() -> Result<()> {
         Cmd::EmitHeader { arch, out, results_dir } => {
             tune::cmd_emit_header(&cli.db, arch, &results_dir, out.as_deref())
         }
+        Cmd::PairedAb { a, b, impl_, impl_b, shape, pairs, reps, cache } => ab::cmd_paired_ab(&ab::AbArgs {
+            a: &a,
+            b: &b,
+            impl_a: &impl_,
+            impl_b: impl_b.as_deref().unwrap_or(&impl_),
+            shape: (shape[0], shape[1], shape[2]),
+            pairs,
+            reps,
+            cache: &cache,
+        }),
         Cmd::EmitArch { arch, ptr_chase, out, results_dir } => {
             arch::cmd_emit_arch(&cli.db, arch, &ptr_chase, &results_dir, out.as_deref())
         }

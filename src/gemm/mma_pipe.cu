@@ -17,8 +17,9 @@
 //   - vec (16 B-compatible pointers, ld and strides; vec16_ok): the pipeline.
 //     Interior CTAs (tile wholly inside M x N) copy unpredicated; boundary
 //     CTAs use row/column masks built once per CTA (OperandPlan). When K is
-//     not a multiple of BK only the last k-tile is copied with a k mask
-//     (cp.async zero-fill sizes).
+//     not a multiple of BK only the last k-tile is copied with a k mask.
+//     Boundary chunks never read past the valid elements (whole chunks:
+//     cp.async; empty: zero store; partial: valid halves + explicit zeros).
 //   - otherwise (misaligned): tier 3's synchronous loop with the scalar,
 //     element-wise bounds-checked loader.
 // Smem layout per operand layout, padding and compute: mma_common.cuh.
@@ -122,6 +123,7 @@ cudaError_t launch_layout(const GemmParams& gp, cudaStream_t stream) {
       gemm_mma_pipe_kernel<T, STAGES>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(smem));
   if (configured != cudaSuccess) return configured;
   const dim3 grid(ceil_div(gp.N, T::BN), ceil_div(gp.M, T::BM), gp.batch);
+  if (!grid_ok(grid)) return cudaErrorInvalidValue;
   gemm_mma_pipe_kernel<T, STAGES><<<grid, T::THREADS, smem, stream>>>(to_kparams(gp), vec16_ok(gp),
                                                                        c_pairs_ok(gp));
   return cudaGetLastError();

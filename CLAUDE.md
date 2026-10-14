@@ -49,6 +49,11 @@ rust/target/release/aegis-perf roofline --arch 121  # results/roofline-sm121.svg
 rust/target/release/aegis-perf emit-arch --arch 121  # include/aegis/arch/sm_121.json: measured L2/DRAM latency, DRAM bw, mma peak
 tools/sass_dump.sh                                # SASS + register usage per kernel
 microbench/run_all.sh                             # hardware probes -> perf DB microbench table
+./build/aegis_fuzz --cases 2000 --seed 1          # randomized correctness vs FP64 / cuBLASLt (ctest fuzz_2000)
+cmake --build build --target fuzz_nightly         # 50,000 fuzz cases
+tools/sanitize.sh                                 # ctest suite under compute-sanitizer memcheck/racecheck/initcheck/synccheck
+tools/ncu_gemm.sh IMPL M N K; tools/ncu_summary.sh artifacts/ncu/*.ncu-rep   # Nsight profile + key metrics
+rust/target/release/aegis-perf paired-ab --a OLD/bench_gemm --b build/bench_gemm --impl X --shape M N K  # A/B across builds
 ```
 
 Once per clone: `git config core.hooksPath .githooks` (pre-commit builds and runs
@@ -136,6 +141,23 @@ docs/               LOG.md (dated run log), analysis/ (consolidated analyses, e.
    records `tied`, `tie_set`, `pick_reason`, `tie_method` and the CIs
    (`ratio_ci_lo/hi`, `lt_ratio_ci_lo/hi` vs cublaslt_best); `emit-header` writes
    them as comments. Never hand-edit a winner.
+12. **Never pass `--num-cuda-barriers` to compute-sanitizer.** GB10 memory is
+   unified: the sanitizer's tracking allocations come out of host RAM. On
+   2026-10-14 synccheck runs with a raised barrier limit drove the machine into
+   a global OOM and the kernel killed the interactive session (claude,
+   gnome-terminal scope). The barrier-table overflow came from cuBLAS kernels
+   (`cuda::barrier`), not ours, so synccheck never runs cuBLAS instead (see
+   Benchmark policy).
+13. **Every device allocation in bench, tool, test and microbench code goes
+   through the in-process GPU budget** (`src/bench/gpu_budget.h`:
+   `aegis::budget::gpu_malloc` / `gpu_free`), never raw `cudaMalloc`. It
+   refuses, with `cudaErrorMemoryAllocation` and the reason on stderr, any
+   allocation that would take the process past `AEGIS_GPU_BUDGET` (default
+   16 GiB) or leave less than `AEGIS_GPU_MIN_FREE` (default 16 GiB) free
+   system-wide per `cudaMemGetInfo` (which on GB10 reports host RAM: 111.7 GiB
+   free when `free` said 112). This, not the cgroup cap, is the real protection
+   on unified memory: the driver does not charge device allocations to the
+   job's cgroup. Tests: ctest `gpu_budget_*` (deliberate oversize requests).
 
 ## Production bar (minimum for "done")
 
@@ -211,6 +233,29 @@ only to compare with old rows (`--protocol 1`).
   `tegrastats` GR3D_FREQ. The source is logged.
   `--allow-busy` overrides and marks every row (`allow_busy`, `idle_util_pct`);
   marked rows are not evidence for a performance claim.
+- **GPU memory.** First line of defence: the in-process GPU budget (rule 13),
+  which refuses oversize device allocations before they happen. Second line:
+  the guarded-job wrapper (next item).
+- **Guarded GPU jobs.** Every long-running GPU job (sanitizers, `aegis-perf
+  tune` / `sweep` / `paired-ab`, the nightly fuzz) runs through
+  `tools/gpu_job.sh`: `oom_score_adj` 1000, so in any OOM the job dies first and
+  its GPU memory is freed, plus a systemd `--user` scope with
+  `MemoryMax=${AEGIS_MEM_MAX:-24G}` and no swap. The cap covers the job's host
+  memory only: GB10's driver does not charge `cudaMalloc` to the job's cgroup
+  (a 3 GiB cudaMalloc succeeds under MemoryMax=1G); the budget (rule 13) and
+  the OOM priority are what stand between a runaway allocation and the session.
+- **Before any run:** `nvidia-smi` answers, no orphaned `bench_gemm`,
+  `aegis_fuzz`, `aegis_tune` or `compute-sanitizer` processes, and no new
+  `Xid` / `NVRM` errors in `dmesg` / `journalctl -k`. If anything looks wrong,
+  stop.
+- **Sanitizer scope** (`tools/sanitize.sh`): one tool per invocation, never
+  nested (the `memcheck_*` ctests are skipped by the script, as are `sm87_gate`
+  and `gpu_budget_*`, which launch no kernels); JOBS 1 for
+  racecheck, initcheck and synccheck, at most 2 for memcheck; fuzz tests at 100
+  cases with dims <= 512. synccheck runs our kernels only and no cuBLAS /
+  cuBLASLt kernel at all: `bench_gemm --check none`, `aegis_fuzz
+  --cpu-ref-only`, and the cuBLAS-using tests (`capi_*`, `matmul_dispatch`)
+  excluded. memcheck, racecheck and initcheck cover the whole suite.
 - **Baselines.** `cublas` (cublasGemmEx, default algorithm) and
   `cublaslt_best`: up to 8 cuBLASLt heuristic algorithms, each checked against
   cuBLAS and timed under the same protocol; the fastest passing one is the row

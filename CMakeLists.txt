@@ -57,10 +57,11 @@ add_executable(aegis_tune tools/aegis_tune.cu)
 target_link_libraries(aegis_tune PRIVATE aegis_bench_harness)
 
 # Randomized correctness fuzzer (Production bar): 2,000 cases in ctest, 50,000 in
-# the fuzz_nightly target.
+# the fuzz_nightly target (NaN-poisoned memory, under tools/gpu_job.sh).
 add_executable(aegis_fuzz tools/aegis_fuzz.cu)
 target_link_libraries(aegis_fuzz PRIVATE aegis_bench_harness aegis)
-add_custom_target(fuzz_nightly COMMAND aegis_fuzz --cases 50000 --seed 20261015
+add_custom_target(fuzz_nightly COMMAND ${CMAKE_SOURCE_DIR}/tools/gpu_job.sh $<TARGET_FILE:aegis_fuzz>
+                                       --cases 50000 --seed 20261015 --poison
                   DEPENDS aegis_fuzz USES_TERMINAL
                   COMMENT "aegis_fuzz: 50,000 cases")
 
@@ -131,6 +132,7 @@ add_test(NAME capi_static COMMAND capi_test_static)
 add_test(NAME capi_shared COMMAND capi_test_shared)
 add_test(NAME fuzz_2000 COMMAND aegis_fuzz --cases 2000 --seed 1)
 add_test(NAME fuzz_selftest COMMAND aegis_fuzz --cases 200 --seed 3 --corrupt)
+add_test(NAME fuzz_poison COMMAND aegis_fuzz --cases 2000 --seed 21 --poison)
 
 # sm_87 compile gate (Jetson Orin; CLAUDE.md Decisions: compile only, nothing
 # runs for sm_87 until the Jetson port). Every source with kernels is compiled
@@ -159,3 +161,33 @@ if(AEGIS_SM87_GATE)
   add_test(NAME sm87_gate
            COMMAND ${CMAKE_SOURCE_DIR}/tools/sm87_gate.sh ${CMAKE_BINARY_DIR}/sm87_gate_objects.txt)
 endif()
+
+# compute-sanitizer memcheck on a subset (Production bar; the full suite under
+# all four tools: tools/sanitize.sh).
+find_program(AEGIS_COMPUTE_SANITIZER compute-sanitizer HINTS ${CUDAToolkit_BIN_DIR})
+if(AEGIS_COMPUTE_SANITIZER)
+  add_test(NAME memcheck_fuzz
+           COMMAND ${CMAKE_SOURCE_DIR}/tools/gpu_job.sh ${AEGIS_COMPUTE_SANITIZER} --tool memcheck --error-exitcode 99
+                   $<TARGET_FILE:aegis_fuzz> --cases 60 --seed 5 --max-dim 512)
+  add_test(NAME memcheck_capi
+           COMMAND ${CMAKE_SOURCE_DIR}/tools/gpu_job.sh ${AEGIS_COMPUTE_SANITIZER} --tool memcheck --error-exitcode 99 $<TARGET_FILE:capi_test_shared>)
+  add_test(NAME memcheck_bench_odd
+           COMMAND ${CMAKE_SOURCE_DIR}/tools/gpu_job.sh ${AEGIS_COMPUTE_SANITIZER} --tool memcheck --error-exitcode 99
+                   $<TARGET_FILE:bench_gemm> --impl mma_pipe_128x256x32_2x4_s3 --m 200 --n 136 --k 72
+                   --reps 1 --warmup 0 --check)
+  add_test(NAME memcheck_bench_scalar
+           COMMAND ${CMAKE_SOURCE_DIR}/tools/gpu_job.sh ${AEGIS_COMPUTE_SANITIZER} --tool memcheck --error-exitcode 99
+                   $<TARGET_FILE:bench_gemm> --impl mma_pipe_64x64x32_2x2_s4 --m 127 --n 129 --k 65
+                   --reps 1 --warmup 0 --check)
+endif()
+
+# The in-process GPU allocation budget (src/bench/gpu_budget.h, CLAUDE.md rule 13).
+add_executable(test_gpu_budget tests/test_gpu_budget.cu)
+target_include_directories(test_gpu_budget PRIVATE src)
+target_link_libraries(test_gpu_budget PRIVATE CUDA::cudart)
+target_include_directories(test_matmul PRIVATE src)
+add_test(NAME gpu_budget_default COMMAND test_gpu_budget default)
+add_test(NAME gpu_budget_budget COMMAND test_gpu_budget budget)
+set_tests_properties(gpu_budget_budget PROPERTIES ENVIRONMENT "AEGIS_GPU_BUDGET=64M")
+add_test(NAME gpu_budget_minfree COMMAND test_gpu_budget minfree)
+set_tests_properties(gpu_budget_minfree PROPERTIES ENVIRONMENT "AEGIS_GPU_MIN_FREE=1000000G")

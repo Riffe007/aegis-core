@@ -15,6 +15,7 @@
 //
 // Timed kernels are extern "C" so cuobjdump -fun can find them by name.
 #include <cuda_runtime.h>
+
 #include <limits.h>
 #include <unistd.h>
 
@@ -28,6 +29,8 @@
 #include <string>
 #include <utility>
 #include <vector>
+
+#include "bench/gpu_budget.h"  // every probe allocates through the GPU budget (CLAUDE.md rule 13)
 
 #define MB_CHECK(expr)                                                         \
   do {                                                                         \
@@ -170,7 +173,7 @@ __global__ void spin_kernel(long long cycles, long long* out) {
 // it with events. Datasheet clocks are not used.
 inline double sm_clock_mhz() {
   long long* d;
-  MB_CHECK(cudaMalloc(&d, sizeof(long long)));
+  MB_CHECK(aegis::budget::gpu_malloc(&d, sizeof(long long)));
   spin_kernel<<<1, 1>>>(1000000, d);  // warm up clocks
   cudaEvent_t a, b;
   MB_CHECK(cudaEventCreate(&a));
@@ -183,7 +186,7 @@ inline double sm_clock_mhz() {
   long long cycles = 0;
   MB_CHECK(cudaEventElapsedTime(&ms, a, b));
   MB_CHECK(cudaMemcpy(&cycles, d, sizeof cycles, cudaMemcpyDeviceToHost));
-  cudaFree(d);
+  aegis::budget::gpu_free(d);
   cudaEventDestroy(a);
   cudaEventDestroy(b);
   return cycles / (ms * 1e3);

@@ -32,6 +32,7 @@ template <Layout LA, Layout LB>
 cudaError_t launch_layout(const GemmParams& gp, cudaStream_t stream) {
   const dim3 block(16, 16);
   const dim3 grid(ceil_div(gp.N, block.x), ceil_div(gp.M, block.y), gp.batch);
+  if (!grid_ok(grid)) return cudaErrorInvalidValue;
   gemm_naive_kernel<LA, LB><<<grid, block, 0, stream>>>(to_kparams(gp));
   return cudaGetLastError();  // launch-configuration errors; never exits
 }

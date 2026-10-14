@@ -1,7 +1,7 @@
 // bench_gemm: time one GEMM implementation on one shape and emit one JSON line.
 //
 //   bench_gemm --impl tiled --m 4096 --n 4096 --k 4096 [--reps 20] [--warmup 3]
-//              [--protocol 2] [--cache cold|warm] [--check] [--seed 42]
+//              [--protocol 2] [--cache cold|warm] [--check [none]] [--seed 42]
 //   bench_gemm --impl cublaslt_best ...  fastest passing cuBLASLt heuristic algorithm (of 8);
 //              [--lt-rank R]           only the algorithm at heuristic rank R (no selection)
 //   bench_gemm --list                  registered impls as JSON lines
@@ -13,7 +13,8 @@
 //
 // The timing protocol and JSON row live in src/bench/harness.{h,cu}, shared
 // with aegis_tune. --check exits 1 if max_abs_err / max|ref| exceeds the
-// tolerance in CLAUDE.md.
+// tolerance in CLAUDE.md. --check none runs no reference, so no cuBLAS kernel
+// launches at all (tools/sanitize.sh uses it under synccheck).
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -54,7 +55,16 @@ Args parse(int argc, char** argv) {
     else if (k == "--protocol") a.protocol = std::atoi(next());
     else if (k == "--cache") a.cache = next();
     else if (k == "--seed") a.seed = static_cast<unsigned>(std::atoi(next()));
-    else if (k == "--check") a.check = true;
+    else if (k == "--check") {
+      // "--check none": explicitly no reference run, so no cuBLAS kernel launches
+      // (tools/sanitize.sh uses it for synccheck; see CLAUDE.md Benchmark policy).
+      if (i + 1 < argc && std::string(argv[i + 1]) == "none") {
+        a.check = false;
+        ++i;
+      } else {
+        a.check = true;
+      }
+    }
     else if (k == "--list") a.list = true;
     else if (k == "--idle-check") a.idle_check = true;
     else if (k == "--allow-busy") a.allow_busy = true;

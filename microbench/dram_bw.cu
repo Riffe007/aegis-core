@@ -53,12 +53,12 @@ int main() {
   mb::prove("mb_dram_read_v4", {{"LDG.E.128", 4}});
 
   void *src = nullptr, *dst = nullptr;
-  MB_CHECK(cudaMalloc(&src, kBytes));
-  MB_CHECK(cudaMalloc(&dst, kBytes));
+  MB_CHECK(aegis::budget::gpu_malloc(&src, kBytes));
+  MB_CHECK(aegis::budget::gpu_malloc(&dst, kBytes));
   MB_CHECK(cudaMemset(src, 1, kBytes));
   const int blocks = dev.prop.multiProcessorCount * kBlocksPerSm;
   uint32_t* sink = nullptr;
-  MB_CHECK(cudaMalloc(&sink, size_t(blocks) * kThreads * sizeof(uint32_t)));
+  MB_CHECK(aegis::budget::gpu_malloc(&sink, size_t(blocks) * kThreads * sizeof(uint32_t)));
   cudaEvent_t a, b;
   MB_CHECK(cudaEventCreate(&a));
   MB_CHECK(cudaEventCreate(&b));

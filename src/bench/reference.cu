@@ -19,6 +19,8 @@
 // ~0.6 per element, so a dropped k-slice is caught on almost every element.
 #include "reference.h"
 
+#include "gpu_budget.h"
+
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -88,11 +90,11 @@ void cpu_reference(const HostGemm& g, std::vector<double>& out) {
 LtReference::LtReference() {
   AEGIS_LT_CHECK(cublasLtCreate(&lt_));
   ws_bytes_ = size_t(32) << 20;
-  AEGIS_CUDA_CHECK(cudaMalloc(&ws_, ws_bytes_));
+  AEGIS_CUDA_CHECK(aegis::budget::gpu_malloc(&ws_, ws_bytes_));
 }
 
 LtReference::~LtReference() {
-  cudaFree(ws_);
+  aegis::budget::gpu_free(ws_);
   cublasLtDestroy(lt_);
 }
 

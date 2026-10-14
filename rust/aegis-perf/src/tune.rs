@@ -42,7 +42,7 @@ pub fn cmd_tune(a: &TuneArgs) -> Result<()> {
 
     let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
     let out_path = a.results.join(format!("tune-{host}-{stamp}.jsonl"));
-    let mut cmd = Command::new(&exe);
+    let mut cmd = crate::gpujob::command(&exe)?;
     cmd.arg("--shapes").arg(a.shapes);
     if let Some(s) = a.seed {
         cmd.args(["--seed", &s.to_string()]);

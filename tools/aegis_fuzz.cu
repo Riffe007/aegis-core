@@ -1,7 +1,7 @@
 // aegis_fuzz: randomized GEMM correctness against a reference (Production bar).
 //
 //   aegis_fuzz [--cases 2000] [--seed 1] [--case I] [--impls naive,regblock_,mma_,mma_pipe_,matmul]
-//              [--max-dim 4096] [--calibrate] [--verbose] [--corrupt]
+//              [--max-dim 4096] [--calibrate] [--verbose] [--corrupt] [--poison] [--cpu-ref-only]
 //
 // Case i draws everything from mt19937_64(seed * 1000003 + i), so a failure
 // is reproduced alone with --seed S --case I. Per case:
@@ -20,6 +20,15 @@
 //            NaN / +Inf / -Inf into A or B
 // Reference: FP64 CPU when M*N*K*batch <= 2^24, else cuBLASLt (2x tolerance);
 // see src/bench/reference.h. Exit 1 on any failure.
+//
+// --poison: every element outside the logical matrices (ld padding, batch
+// gaps, the tail) is NaN, plus NaN guard regions around each allocation; with
+// beta == 0 all of C is NaN anyway. Must pass with 0 failures: no kernel may
+// read past K, M or N into a product, and beta == 0 must not read C.
+//
+// --cpu-ref-only: no cuBLAS / cuBLASLt kernel ever runs: cases capped at 2^24
+// MACs (FP64 CPU reference only), no aegis::matmul target (its fallback is
+// cuBLAS). For compute-sanitizer synccheck (tools/sanitize.sh).
 //
 // --corrupt: self-test of the checker. Each result gets one element pushed
 // 4x past the allowed error (or a NaN expectation replaced by 0); the run
@@ -41,6 +50,7 @@
 #include "aegis/common.cuh"
 #include "aegis/gemm.h"
 #include "aegis/matmul.h"
+#include "bench/gpu_budget.h"
 #include "bench/reference.h"
 
 namespace {
@@ -56,7 +66,7 @@ struct Args {
   long long only_case = -1;
   std::vector<std::string> impls = {"naive", "regblock_", "mma_", "mma_pipe_", "matmul"};
   int max_dim = 4096;
-  bool calibrate = false, verbose = false, corrupt = false;
+  bool calibrate = false, verbose = false, corrupt = false, poison = false, cpu_ref_only = false;
 };
 
 std::vector<std::string> split(const std::string& s) {
@@ -88,6 +98,8 @@ Args parse(int argc, char** argv) {
     else if (k == "--calibrate") a.calibrate = true;
     else if (k == "--verbose") a.verbose = true;
     else if (k == "--corrupt") a.corrupt = true;
+    else if (k == "--poison") a.poison = true;
+    else if (k == "--cpu-ref-only") a.cpu_ref_only = true;
     else { std::fprintf(stderr, "unknown arg %s\n", k.c_str()); std::exit(2); }
   }
   return a;
@@ -142,13 +154,14 @@ struct Case {
 };
 
 Case make_case(std::mt19937_64& rng, const std::vector<Target>& targets, int max_dim,
-               const std::vector<int>& primes, bool calibrate) {
+               const std::vector<int>& primes, bool calibrate, bool cpu_ref_only) {
   std::uniform_real_distribution<double> u(0, 1);
   Case c;
   c.target = targets[std::uniform_int_distribution<size_t>(0, targets.size() - 1)(rng)];
   GemmParams& p = c.g.p;
   p.batch = u(rng) < 0.15 ? std::uniform_int_distribution<int>(2, 4)(rng) : 1;
-  const double cap = c.target.name == "naive" ? std::ldexp(1.0, 27) : std::ldexp(1.0, 32);
+  double cap = c.target.name == "naive" ? std::ldexp(1.0, 27) : std::ldexp(1.0, 32);
+  if (cpu_ref_only) cap = std::ldexp(1.0, 24);  // every case on the FP64 CPU reference
   for (;;) {
     p.M = draw_dim(rng, max_dim, primes);
     p.N = draw_dim(rng, max_dim, primes);
@@ -216,10 +229,31 @@ Case make_case(std::mt19937_64& rng, const std::vector<Target>& targets, int max
   return c;
 }
 
+// --poison: every element outside the logical matrices (ld padding, gaps
+// between batches, the tail after the last row) becomes NaN on the host, and
+// the device allocations get NaN guard regions before and after. Any read of
+// a non-logical element that reached a product or the output would show up as
+// NaN in a checked element (NaN * 0 = NaN).
+void poison_outside(std::vector<__half>& v, bool row_major, int rows, int cols, long long ld, long long stride,
+                    int batch) {
+  std::vector<__half> p(v.size(), __float2half(NAN));
+  for (int b = 0; b < batch; ++b)
+    for (int r = 0; r < rows; ++r)
+      for (int c = 0; c < cols; ++c) {
+        const size_t i = size_t(b * stride + (row_major ? r * ld + c : r + c * ld));
+        p[i] = v[i];
+      }
+  v.swap(p);
+}
+
+constexpr int kGuard = 64;  // NaN elements before and after each poisoned allocation
+
 template <class T>
-T* device_copy(const std::vector<T>& h, int offset, T** base) {
-  AEGIS_CUDA_CHECK(cudaMalloc(base, (h.size() + 16) * sizeof(T)));
-  T* p = *base + offset;
+T* device_copy(const std::vector<T>& h, int offset, T** base, bool poison) {
+  const size_t n = h.size() + 16 + (poison ? 2 * kGuard : 0);
+  AEGIS_CUDA_CHECK(aegis::budget::gpu_malloc(base, n * sizeof(T)));
+  if (poison) AEGIS_CUDA_CHECK(cudaMemset(*base, 0x7e, n * sizeof(T)));  // 0x7e7e: an FP16 NaN
+  T* p = *base + (poison ? kGuard : 0) + offset;
   if (!h.empty()) AEGIS_CUDA_CHECK(cudaMemcpy(p, h.data(), h.size() * sizeof(T), cudaMemcpyHostToDevice));
   return p;
 }
@@ -234,7 +268,9 @@ int main(int argc, char** argv) {
     for (const std::string& pre : a.impls)
       if (pre != "matmul" && std::string(e.name).rfind(pre, 0) == 0) { targets.push_back({e.name, &e}); break; }
   }
-  if (std::find(a.impls.begin(), a.impls.end(), "matmul") != a.impls.end()) targets.push_back({"matmul", nullptr});
+  // --cpu-ref-only drops aegis::matmul: it falls back to cuBLAS on untuned shapes.
+  if (!a.cpu_ref_only && std::find(a.impls.begin(), a.impls.end(), "matmul") != a.impls.end())
+    targets.push_back({"matmul", nullptr});
   if (targets.empty()) { std::fprintf(stderr, "no targets\n"); return 2; }
   const std::vector<int> primes = primes_upto(a.max_dim);
   aegis::bench::LtReference lt;
@@ -251,16 +287,21 @@ int main(int argc, char** argv) {
   const long long last = a.only_case >= 0 ? a.only_case + 1 : a.cases;
   for (long long ci = first; ci < last; ++ci) {
     std::mt19937_64 rng(a.seed * 1000003ull + (unsigned long long)ci);
-    Case c = make_case(rng, targets, a.max_dim, primes, a.calibrate);
+    Case c = make_case(rng, targets, a.max_dim, primes, a.calibrate, a.cpu_ref_only);
     GemmParams& hp = c.g.p;
     injected += c.injected;
     misaligned += (c.off_a || c.off_b || c.off_c) ? 1 : 0;
 
     __half *ba, *bb, *bc;
     GemmParams dp = hp;
-    dp.A = device_copy(c.g.A, c.off_a, &ba);
-    dp.B = device_copy(c.g.B, c.off_b, &bb);
-    dp.C = device_copy(c.g.C0, c.off_c, &bc);
+    if (a.poison) {
+      poison_outside(c.g.A, hp.layout_a == Layout::RowMajor, hp.M, hp.K, hp.lda, hp.stride_a, hp.batch);
+      poison_outside(c.g.B, hp.layout_b == Layout::RowMajor, hp.K, hp.N, hp.ldb, hp.stride_b, hp.batch);
+      if (hp.beta != 0.f) poison_outside(c.g.C0, true, hp.M, hp.N, hp.ldc, hp.stride_c, hp.batch);
+    }
+    dp.A = device_copy(c.g.A, c.off_a, &ba, a.poison);
+    dp.B = device_copy(c.g.B, c.off_b, &bb, a.poison);
+    dp.C = device_copy(c.g.C0, c.off_c, &bc, a.poison);
     const cudaError_t e = c.target.entry ? c.target.entry->run(dp, stream) : aegis::matmul(dp, stream);
     const cudaError_t s = e == cudaSuccess ? cudaStreamSynchronize(stream) : e;
     std::vector<__half> out(c.g.C0.size());
@@ -273,6 +314,10 @@ int main(int argc, char** argv) {
     const bool use_cpu = macs <= std::ldexp(1.0, 24) || hp.alpha == 0.f;
     std::vector<double> ref;
     std::vector<__half> lt_out;
+    if (a.cpu_ref_only && !use_cpu) {
+      std::fprintf(stderr, "aegis_fuzz: --cpu-ref-only case %lld needs cuBLASLt\n", ci);
+      return 2;
+    }
     if (use_cpu) {
       ++cpu_ref;
       aegis::bench::cpu_reference(c.g, ref);
@@ -332,9 +377,9 @@ int main(int argc, char** argv) {
       std::printf("ok   case %lld: %s  max_ratio %.3f%s\n", ci, c.describe().c_str(), cmp.max_ratio,
                   use_cpu ? "" : " [lt]");
     }
-    cudaFree(ba);
-    cudaFree(bb);
-    cudaFree(bc);
+    aegis::budget::gpu_free(ba);
+    aegis::budget::gpu_free(bb);
+    aegis::budget::gpu_free(bc);
   }
   const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
   std::printf("aegis_fuzz: %lld cases, %lld %s (%lld CPU-FP64 reference, %lld cuBLASLt; %lld with NaN/Inf, "

@@ -78,7 +78,7 @@ int main() {
   const int sms = dev.prop.multiProcessorCount;
   const int blocks = sms * 3;  // 32 KiB smem per block
   uint32_t* sink;
-  MB_CHECK(cudaMalloc(&sink, size_t(blocks) * kThreads * sizeof(uint32_t)));
+  MB_CHECK(aegis::budget::gpu_malloc(&sink, size_t(blocks) * kThreads * sizeof(uint32_t)));
 
   struct Set { const char* name; size_t bytes; int passes; };
   const size_t l2_half = size_t(dev.prop.l2CacheSize) / 2;
@@ -87,7 +87,7 @@ int main() {
     const size_t per_block = (s.bytes / blocks) / kTileBytes * kTileBytes;  // whole tiles
     const size_t total = per_block * blocks;
     uint4* src;
-    MB_CHECK(cudaMalloc(&src, total));
+    MB_CHECK(aegis::budget::gpu_malloc(&src, total));
     MB_CHECK(cudaMemset(src, 0x5a, total));
     for (const char* mode : {"cp_async", "ld_st"}) {
       auto k = std::string(mode) == "cp_async" ? mb_copy_cp_async : mb_copy_ld_st;
@@ -100,7 +100,7 @@ int main() {
                    ",\"blocks\":" + std::to_string(blocks) + ",\"vec_bytes\":16}",
                gbps, "GB/s");
     }
-    MB_CHECK(cudaFree(src));
+    MB_CHECK(aegis::budget::gpu_free(src));
   }
   return 0;
 }

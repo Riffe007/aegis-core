@@ -83,7 +83,7 @@ fn run_one(
     reps: u32,
     busy: Option<f64>,
 ) -> Result<Option<(Value, String)>> {
-    let mut cmd = Command::new(bench);
+    let mut cmd = crate::gpujob::command(bench)?;
     cmd.args(["--impl", impl_, "--m", &m.to_string(), "--n", &n.to_string(), "--k", &k.to_string(),
               "--reps", &reps.to_string(), "--warmup", "3", "--check"]);
     if let Some(u) = busy {
