@@ -9,7 +9,7 @@ use std::process::{Command, Stdio};
 
 use anyhow::{bail, Context, Result};
 use rusqlite::types::Value as SqlValue;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OpenFlags};
 use serde_json::Value;
 use sha1::{Digest, Sha1};
 
@@ -25,6 +25,30 @@ pub fn connect(db: &Path) -> Result<Connection> {
     let con = Connection::open(db).with_context(|| format!("open {}", db.display()))?;
     con.execute_batch(SCHEMA)?;
     migrate(&con)?;
+    Ok(con)
+}
+
+/// Open an existing perf DB read-only (SQLite URI `mode=ro`), for viewers: no
+/// schema creation, no migration, never a write, so a running tune or sweep
+/// is never blocked. Refuses a DB whose schema predates the columns this
+/// crate reads (run any writing aegis-perf command on it once to migrate).
+pub fn connect_ro(db: &Path) -> Result<Connection> {
+    let path = db.to_str().with_context(|| format!("non-UTF-8 path {}", db.display()))?;
+    let uri = format!("file:{}?mode=ro", path.replace('%', "%25").replace('?', "%3f").replace('#', "%23"));
+    let con = Connection::open_with_flags(
+        &uri,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| format!("open {} read-only", db.display()))?;
+    for (table, column, _) in ADDED_COLUMNS {
+        let exists: bool = con
+            .prepare(&format!("SELECT 1 FROM pragma_table_info('{table}') WHERE name = ?"))?
+            .exists([column])
+            .with_context(|| format!("{} is not an AEGIS perf DB", db.display()))?;
+        if !exists {
+            bail!("{}: {table}.{column} missing; the DB predates this aegis-perf (migrate it with aegis-perf init)", db.display());
+        }
+    }
     Ok(con)
 }
 
@@ -79,7 +103,7 @@ impl Selection {
         Selection { protocol: 2, cache: "cold".to_string(), include_busy: false }
     }
 
-    fn sql(&self) -> String {
+    pub(crate) fn sql(&self) -> String {
         let mut s = format!(" AND m.protocol_version = {}", self.protocol);
         if self.protocol >= 2 {
             s += &format!(" AND m.cache_mode = '{}'", self.cache.replace('\'', "''"));
@@ -378,7 +402,7 @@ pub struct Latest {
 /// Most recent measurement per (arch, kernel, shape); only checked+passing rows
 /// are eligible, except cuBLAS which is the reference itself. Keeps Python's
 /// dict semantics: first-seen key order, later runs overwrite values.
-fn latest_per_kernel_shape(con: &Connection, arch: Option<i64>, sel: &Selection) -> Result<Vec<Latest>> {
+pub fn latest_per_kernel_shape(con: &Connection, arch: Option<i64>, sel: &Selection) -> Result<Vec<Latest>> {
     let arch = arch.filter(|&a| a != 0); // Python: `if arch`
     let q = format!(
         "SELECT r.sm_arch, k.op, m.dtype, m.m, m.n, m.k, k.impl, k.kernel_id, m.run_id, \

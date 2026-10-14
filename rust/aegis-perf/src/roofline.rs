@@ -14,14 +14,28 @@ use rusqlite::Connection;
 
 use crate::db;
 
-struct Point {
-    label: String,
-    ai: f64,
-    tflops: f64,
-    roof: params::Roof,
+/// One roofline point: a shape's AEGIS winner or its cublaslt_best baseline.
+#[derive(Clone, Debug)]
+pub struct Point {
+    /// "<shape_bucket> <impl>", as `aegis-perf roofline` prints it.
+    pub label: String,
+    pub shape_bucket: String,
+    pub m: i64,
+    pub n: i64,
+    pub k: i64,
+    pub impl_: String,
+    /// true: cublaslt_best; false: the winner.
+    pub baseline: bool,
+    pub median_us: f64,
+    pub ai: f64,
+    pub tflops: f64,
+    /// Against the shape's memory roof (read for M <= 16, copy otherwise).
+    pub roof: params::Roof,
 }
 
-fn points(con: &Connection, arch: i64, p: &ArchParams) -> Result<Vec<Point>> {
+/// The points `aegis-perf roofline` plots for an arch: per winner shape, the
+/// winner and the latest cublaslt_best row of the same protocol (cold, idle).
+pub fn points(con: &Connection, arch: i64, p: &ArchParams) -> Result<Vec<Point>> {
     let mut stmt = con.prepare(
         "SELECT w.shape_bucket, k.impl, w.median_us, \
                 (SELECT m.median_us FROM measurements m JOIN kernels kc USING(kernel_id) JOIN runs r USING(run_id) \
@@ -37,14 +51,27 @@ fn points(con: &Connection, arch: i64, p: &ArchParams) -> Result<Vec<Point>> {
         Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, f64>(2)?, r.get::<_, Option<f64>>(3)?))
     })? {
         let (bucket, impl_, ours_us, cublas_us) = row?;
-        let d: Vec<f64> = bucket.split('x').map(str::parse).collect::<Result<_, _>>().context("shape_bucket")?;
-        let (m, n, k) = (d[0], d[1], d[2]);
+        let d: Vec<i64> = bucket.split('x').map(str::parse).collect::<Result<_, _>>().context("shape_bucket")?;
+        let (mi, ni, ki) = (d[0], d[1], d[2]);
+        let (m, n, k) = (mi as f64, ni as f64, ki as f64);
         let flops = 2.0 * m * n * k;
         let ai = flops / (2.0 * (m * k + k * n + m * n));
-        let pt = |label: String, us: f64| Point { label, ai, tflops: flops / (us * 1e-6) / 1e12, roof: p.roof(m, n, k, us) };
-        out.push(pt(format!("{bucket} {impl_}"), ours_us));
+        let pt = |impl_: &str, baseline: bool, us: f64| Point {
+            label: format!("{bucket} {impl_}"),
+            shape_bucket: bucket.clone(),
+            m: mi,
+            n: ni,
+            k: ki,
+            impl_: impl_.to_string(),
+            baseline,
+            median_us: us,
+            ai,
+            tflops: flops / (us * 1e-6) / 1e12,
+            roof: p.roof(m, n, k, us),
+        };
+        out.push(pt(&impl_, false, ours_us));
         if let Some(c) = cublas_us {
-            out.push(pt(format!("{bucket} cublaslt_best"), c));
+            out.push(pt("cublaslt_best", true, c));
         }
     }
     Ok(out)
@@ -99,8 +126,8 @@ pub fn cmd_roofline(db_path: &Path, arch: i64, out: &Path, arch_file: Option<&Pa
         .label(format!("roof (GEMV/decode, M <= 16): read {read_bw:.1} GB/s, ridge {ridge_r:.0} FLOP/B"))
         .legend(move |(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], grey.stroke_width(2)));
 
-    let ours: Vec<&Point> = pts.iter().filter(|p| !p.label.ends_with(" cublaslt_best")).collect();
-    let cub: Vec<&Point> = pts.iter().filter(|p| p.label.ends_with(" cublaslt_best")).collect();
+    let ours: Vec<&Point> = pts.iter().filter(|p| !p.baseline).collect();
+    let cub: Vec<&Point> = pts.iter().filter(|p| p.baseline).collect();
     chart
         .draw_series(cub.iter().map(|p| Cross::new((p.ai, p.tflops), 5, RED.stroke_width(2))))?
         .label("cublaslt_best")

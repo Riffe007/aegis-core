@@ -11,18 +11,9 @@
 //!     aegis-perf roofline --arch 121 [--out results/roofline-sm121.svg]
 //!     aegis-perf emit-arch --arch 121 [--ptr-chase RUN[:LAYOUT]]...
 //!     aegis-perf paired-ab --a OLD/build/bench_gemm --b build/bench_gemm --impl X --shape M N K
-mod ab;
-mod arch;
-mod db;
-mod gpujob;
-mod params;
-mod pyjson;
-mod roofline;
-mod sweep;
-mod tune;
-
 use std::path::PathBuf;
 
+use aegis_perf::{ab, arch, db, roofline, sweep, tune};
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
