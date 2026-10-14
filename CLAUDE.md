@@ -85,6 +85,11 @@ docs/               LOG.md (dated run log), analysis/ (consolidated analyses, e.
 2. **Every kernel passes `--check` against cuBLAS before it is benchmarked.**
    Tolerance: max_abs_err / max|ref| <= 4e-3 (about 4 FP16 ulps). Odd shapes
    (non-multiples of the tile) must pass too; add them to `tests` in CMakeLists.
+   Correctness proper (layouts, ld, alpha/beta, batch, NaN/Inf) is the
+   Production-bar bound c * sqrt(K) * eps_fp16 * max|A| * max|B| (* |alpha|, + eps *
+   |beta| * max|C0|) with **c = 2** (`src/bench/reference.{h,cu}`, measured with
+   `aegis_fuzz --calibrate`), checked by `aegis_fuzz` (ctest fuzz_2000; target
+   fuzz_nightly: 50,000 cases).
 3. **The baseline is cuBLAS, not naive.** Report results as % of
    `cublaslt_best` (protocol v2; % of plain `cublas` alongside) on the same
    shape, device and cache mode.
