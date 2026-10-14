@@ -826,3 +826,53 @@ Paired tests (ratio = B / A per pair, 95% CI, 30 pairs):
 (previous runs) to 0.662: 66% of cublaslt_best by paired ratio (63.6% by
 medians). **2048³: no gain; the old winner stays**, the best new config is
 2.2% slower. `winners/sm_121.h` regenerated (4096³ → `mma_pipe_128x256x32_2x4_s3`).
+
+### 4. Nsight: new winner vs old winner vs cublaslt_best
+
+Same `tools/ncu_gemm.sh` sections (base clocks, cold), new column for
+`mma_pipe_128x256x32_2x4_s3`; the same config at 2048³ is added because it
+lost there. (Idle guard read 8.2% just before this profile; counts below are
+deterministic, durations may carry it.)
+
+| 4096³ | old winner 128x128_s2 | **new winner 128x256_s3** | cublaslt_best |
+|---|---|---|---|
+| duration (ms, base clock) | 2.643 | **2.468** (−6.6%) | 1.659 |
+| grid / regs / dyn smem / blocks per SM | 1024 / 122 / 37.9 KB / 2 | 512 / 166 / 81.4 KB / 1 | 640 / 255 / 87.0 KB / 1 |
+| warps active, % | 31.8 | 14.7 | 13.6 |
+| **instructions executed** | 183.6 M | **184.8 M** | 64.5 M |
+| instructions per HMMA | 5.47 | 5.51 | 1.89 |
+| **tensor pipe active, %** | 49.6 | **53.0** | 80.3 |
+| issue active, % | 17.0 | 18.3 | 9.6 |
+| **L2 sectors** / hit rate | 102.8 M / 87.5% | **77.6 M** / 83.4% | 56.7 M / 89.0% |
+| **stalls per issue**: wait | 3.51 | **3.85** | 0.60 |
+| math_pipe_throttle | 3.42 | 2.53 | **13.06** |
+| long_scoreboard | **9.15** | 0.95 | 0.69 |
+| barrier | 2.68 | 0.68 | 0.02 |
+| mio_throttle | 1.57 | 0.37 | 0.77 |
+
+| 2048³ | old winner 128x128_s2 | 128x256_s3 | cublaslt_best |
+|---|---|---|---|
+| duration (µs) | 393 | 408 | 278 |
+| grid / waves per SM | 256 / 2.67 (2 blocks/SM) | 128 / 2.67 (1 block/SM) | 192 / 4.00 |
+| instructions | 23.4 M | 23.5 M | 9.1 M |
+| tensor pipe active, % | 42.5 | 40.4 | 61.2 |
+| L2 sectors | 13.1 M | 10.0 M | 7.9 M |
+| stalls: wait / math throttle / long_scoreboard / barrier | 3.49 / 3.45 / 9.04 / 2.90 | 3.82 / 2.48 / 1.86 / 1.20 | 0.78 / 11.42 / 1.19 / 0.04 |
+
+Executed instructions by opcode at 4096³ (ncu `sass__inst_executed_per_opcode`):
+
+| Opcode | old 128x128_s2 | new 128x256_s3 | cublaslt_best |
+|---|---|---|---|
+| HMMA | 33.55 M | 33.55 M | 34.08 M |
+| NOP | 29.36 M | 29.36 M | — (not in top 14) |
+| LDSM | 12.58 M | 8.39 M | 11.14 M |
+| IMAD / LEA / ISETP / IADD3 / MOV | 19.1 / 8.5 / 16.9 / 6.5 / 13.8 M | 22.6 / 10.1 / 9.7 / 8.5 / 9.7 M | UIMAD 3.65, UIADD3 2.98, UISETP 2.36, MOV 1.36, IMAD 0.72 M |
+| LDS | 6.34 M | 9.44 M | — |
+| global → smem | LDGSTS 4.19 M | (not in top 14) | UTMALDG 0.66 M (TMA) |
+
+The cublaslt_best kernel is `nvjet_sm121_hsh_mma_128x208x64_2_32x104x64_tmaAB_bz_NNNN`
+(algo 67): CTA tile 128x208x64, TMA loads of A and B. Its SASS issues the same
+`HMMA.16816.F32` back to back with no NOPs between them; ours has a `NOP`
+after every HMMA (e.g. `HMMA.16816.F32 R124, R148, R156, R124 ; NOP ;
+HMMA.16816.F32 R120, R140, R156, R120 ; NOP ; ...`), 0.875 NOPs per HMMA
+executed in both configs.
