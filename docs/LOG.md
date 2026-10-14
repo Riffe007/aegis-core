@@ -89,3 +89,35 @@ Gaps at or below 2.5% are inside run-to-run noise: those winners are not decisiv
 Build natively on the Orin Nano (sm_87), ctest, `aegis_manifest`, tune, emit
 `include/aegis/winners/sm_87.h`, run `microbench/run_all.sh`, compare winners
 with sm_121.
+
+## 2026-10-13 (later) — zero Python, in-process tuner
+
+Commits: `6146771` pre-commit hook + permissions, `98f4f26` first LOG entry,
+`9aac036` harness extraction, `7365a7b` aegis_tune, `00445da` aegis-perf
+tune/emit-header, `bb09d12` roofline, `4ea8a2a` Python deleted.
+
+- **Harness**: the timing protocol lives in `src/bench/harness.{h,cu}`.
+  bench_gemm output before vs after on 6 cases plus `--list`: byte-identical
+  except median/p10/p90/tflops/gbps.
+- **Tuning wall time, full shape set (14 shapes x 19 configs + cuBLAS, 280
+  timed rows)**: `tools/tune.py` (one bench_gemm process per row) **204 s**;
+  `aegis-perf tune` **9.1 s** total, of which `aegis_tune` itself **8.7 s**.
+- **emit-header**: Rust output matches the tune.py-generated `sm_121.h` byte
+  for byte from line 2 on (line 1 names generator and time).
+- **Fresh aegis_tune (run `dea3667f1ba1`, seed 20261013) vs logged tune.py
+  (`831e0287bf69`)**: same winner on 11/14 shapes. 256³ and 512x896x896 were
+  logged ties. 16x896x896 is the one strict miss: its logged 8.9% gap was
+  22.512 vs 24.512 µs.
+- **Finding: short timings are quantized to 2.048 µs on GB10.** Medians in
+  the aegis_tune run sit on multiples: 10.240, 12.288, 14.336, 22.528,
+  24.576, 26.624, 28.672, 30.720 µs. Every shape under ~50 µs (all decode
+  shapes, 256³, 512³) is ranked by timer ticks, not kernel speed. Fixing it
+  needs a protocol change (e.g. time N back-to-back launches per event pair);
+  not done, since the protocol is fixed unless agreed.
+- Roofline (`results/roofline-sm121.svg`): ridge 585 FLOP/B (214.7 GB/s,
+  125.5 TFLOPS mma.sync, both measured). Winners at 1024³–4096³ reach
+  30–44% of roof; cuBLAS 47–67%.
+- Python files tracked: 0. The hook refuses any `*.py` (tested).
+
+Open: timer quantization (above); 4096³ variance; the three microbench
+artifacts; no git remote.

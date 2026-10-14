@@ -18,7 +18,11 @@ if [[ ! -d build ]]; then
   exit 1
 fi
 echo "pre-commit: building and running ctest..." >&2
-cmake --build build -j >/dev/null
+if ! cmake --build build -j >/tmp/aegis-precommit-build.log 2>&1; then
+  grep -E "error|Error" /tmp/aegis-precommit-build.log | head -20 >&2
+  echo "pre-commit: build failed; commit refused (full log: /tmp/aegis-precommit-build.log)" >&2
+  exit 1
+fi
 if ! ctest --test-dir build --output-on-failure -j4 >/tmp/aegis-precommit-ctest.log 2>&1; then
   tail -40 /tmp/aegis-precommit-ctest.log >&2
   echo "pre-commit: ctest failed; commit refused (full log: /tmp/aegis-precommit-ctest.log)" >&2
