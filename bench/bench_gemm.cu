@@ -1,7 +1,7 @@
 // bench_gemm: time one GEMM implementation on one shape and emit one JSON line.
 //
-//   bench_gemm --impl tiled --m 4096 --n 4096 --k 4096 [--reps 50] [--warmup 5]
-//              [--check] [--seed 42]
+//   bench_gemm --impl tiled --m 4096 --n 4096 --k 4096 [--reps 20] [--warmup 3]
+//              [--protocol 2] [--check] [--seed 42]
 //   bench_gemm --list                  registered impls as JSON lines
 //
 // The timing protocol and JSON row live in src/bench/harness.{h,cu}, shared
@@ -19,7 +19,8 @@ namespace {
 struct Args {
   std::string impl = "tiled";
   int M = 1024, N = 1024, K = 1024;
-  int reps = 50, warmup = 5;
+  int reps = -1, warmup = -1;  // default: per protocol (v2 20 windows / 3; v1 50 / 5)
+  int protocol = 2;
   bool check = false;
   bool list = false;
   unsigned seed = 42;
@@ -39,13 +40,17 @@ Args parse(int argc, char** argv) {
     else if (k == "--k") a.K = std::atoi(next());
     else if (k == "--reps") a.reps = std::atoi(next());
     else if (k == "--warmup") a.warmup = std::atoi(next());
+    else if (k == "--protocol") a.protocol = std::atoi(next());
     else if (k == "--seed") a.seed = static_cast<unsigned>(std::atoi(next()));
     else if (k == "--check") a.check = true;
     else if (k == "--list") a.list = true;
     else { std::fprintf(stderr, "unknown arg %s\n", k.c_str()); std::exit(2); }
   }
-  if (a.M <= 0 || a.N <= 0 || a.K <= 0 || a.reps <= 0 || a.warmup < 0) {
-    std::fprintf(stderr, "invalid shape or rep count\n");
+  if (a.reps < 0) a.reps = a.protocol == 1 ? 50 : 20;
+  if (a.warmup < 0) a.warmup = a.protocol == 1 ? 5 : 3;
+  if (a.M <= 0 || a.N <= 0 || a.K <= 0 || a.reps <= 0 || a.warmup < 0 ||
+      (a.protocol != 1 && a.protocol != 2)) {
+    std::fprintf(stderr, "invalid shape, rep count or protocol\n");
     std::exit(2);
   }
   return a;
@@ -73,7 +78,11 @@ int main(int argc, char** argv) {
   aegis::bench::Problem p(a.M, a.N, a.K, a.seed);
   h.run_once(entry, p);
   const aegis::bench::Check c = a.check ? h.check(p) : aegis::bench::Check{};
-  const aegis::bench::Timing t = h.time(entry, p, a.warmup, a.reps);
+  aegis::bench::TimingOptions opt;
+  opt.protocol = a.protocol;
+  opt.warmup = a.warmup;
+  opt.reps = a.reps;
+  const aegis::bench::Timing t = h.time(entry, p, opt);
   std::printf("%s\n", h.json_row(a.impl.c_str(), entry, p, c, t).c_str());
 
   if (c.checked && !c.pass) {

@@ -1,14 +1,15 @@
 // aegis_tune: brute-force autotuner, in one process.
 //
 //   aegis_tune --shapes shapes/default.txt [--seed S] [--prefix regblock_,mma_,mma_pipe_]
-//              [--reps 20] [--cublas-reps 50] [--warmup 3] [--data-seed 42]
+//              [--reps 20] [--cublas-reps 50] [--warmup 3] [--data-seed 42] [--protocol 2]
 //
 // For each shape (from a file, "M N K" per line, # comments) it allocates the
 // problem once, then runs cuBLAS and every registered config whose name starts
 // with one of the prefixes, in an order shuffled per shape (seeded; the seed is
 // logged) so neither ordering nor thermal drift favours a config. Each config
 // gets the bench_gemm protocol (src/bench/harness.h): untimed run, --check
-// against cuBLAS, warmup, L2-flushed timed reps. Configs failing the check are
+// against cuBLAS, then timing (protocol v2 by default: batched windows; --reps
+// is the number of timed windows). Configs failing the check are
 // not timed and not emitted; they are listed on stderr.
 //
 // stdout: one JSON row per timed config, bench_gemm's schema plus
@@ -36,6 +37,7 @@ struct Args {
   std::vector<std::string> prefixes = {"regblock_", "mma_", "mma_pipe_"};
   int reps = 20, cublas_reps = 50, warmup = 3;
   unsigned data_seed = 42;
+  int protocol = 2;
 };
 
 std::vector<std::string> split(const std::string& s, char sep) {
@@ -61,10 +63,12 @@ Args parse(int argc, char** argv) {
     else if (k == "--cublas-reps") a.cublas_reps = std::stoi(next());
     else if (k == "--warmup") a.warmup = std::stoi(next());
     else if (k == "--data-seed") a.data_seed = static_cast<unsigned>(std::stoul(next()));
+    else if (k == "--protocol") a.protocol = std::stoi(next());
     else { std::fprintf(stderr, "unknown arg %s\n", k.c_str()); std::exit(2); }
   }
   if (a.shapes.empty()) { std::fprintf(stderr, "--shapes FILE is required\n"); std::exit(2); }
   if (a.reps <= 0 || a.cublas_reps <= 0 || a.warmup < 0) { std::fprintf(stderr, "invalid reps\n"); std::exit(2); }
+  if (a.protocol != 1 && a.protocol != 2) { std::fprintf(stderr, "--protocol must be 1 or 2\n"); std::exit(2); }
   if (!a.seed_given) a.seed = std::random_device{}();
   return a;
 }
@@ -132,14 +136,19 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "  SKIP %s (fails --check)\n", buf);
         continue;
       }
-      const aegis::bench::Timing t = h.time(e, p, a.warmup, e ? a.reps : a.cublas_reps);
+      aegis::bench::TimingOptions opt;
+      opt.protocol = a.protocol;
+      opt.warmup = a.warmup;
+      opt.reps = e ? a.reps : a.cublas_reps;
+      const aegis::bench::Timing t = h.time(e, p, opt);
       const std::string extra = ",\"tune\":{\"seed\":" + std::to_string(a.seed) +
                                 ",\"shape_seed\":" + std::to_string(shape_seed) +
                                 ",\"order\":" + std::to_string(oi) + "}";
       std::printf("%s\n", h.json_row(name, e, p, c, t, extra).c_str());
       std::fflush(stdout);
       ++timed;
-      std::fprintf(stderr, "  %-28s %5dx%5dx%5d  %10.1f us\n", name, s.M, s.N, s.K, t.median_us);
+      std::fprintf(stderr, "  %-28s %5dx%5dx%5d  %10.2f us  N=%lld\n", name, s.M, s.N, s.K, t.median_us,
+                   t.batch_n);
     }
   }
 

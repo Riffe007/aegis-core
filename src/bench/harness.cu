@@ -111,6 +111,10 @@ Harness::Harness() {
   AEGIS_CUDA_CHECK(cudaStreamCreate(&stream_));
   AEGIS_CUBLAS_CHECK(cublasCreate(&cublas_));
   AEGIS_CUBLAS_CHECK(cublasSetStream(cublas_, stream_));
+  // cuBLAS must not allocate while a graph is being captured.
+  constexpr size_t kCublasWorkspace = size_t(32) << 20;
+  AEGIS_CUDA_CHECK(cudaMalloc(&cublas_ws_, kCublasWorkspace));
+  AEGIS_CUBLAS_CHECK(cublasSetWorkspace(cublas_, cublas_ws_, kCublasWorkspace));
   // L2 flush buffer: 2x L2 so nothing from the previous rep survives.
   flush_bytes_ = std::max<size_t>(size_t(prop_.l2CacheSize) * 2, 1 << 20);
   AEGIS_CUDA_CHECK(cudaMalloc(&flush_, flush_bytes_));
@@ -120,6 +124,7 @@ Harness::Harness() {
 Harness::~Harness() {
   cudaFree(flush_);
   cublasDestroy(cublas_);
+  cudaFree(cublas_ws_);
   cudaStreamDestroy(stream_);
 }
 
@@ -155,15 +160,27 @@ Check Harness::check(Problem& p) {
   return c;
 }
 
-Timing Harness::time(const gemm::KernelEntry* e, Problem& p, int warmup, int reps) {
-  for (int i = 0; i < warmup; ++i) launch(e, p);
+Timing Harness::time(const gemm::KernelEntry* e, Problem& p, const TimingOptions& o) {
+  if (o.protocol == 1) return time_v1(e, p, o);
+  if (o.protocol == 2) return time_v2(e, p, o);
+  std::fprintf(stderr, "unknown timing protocol %d\n", o.protocol);
+  std::exit(2);
+}
+
+void Harness::flush_l2(int value) {
+  AEGIS_CUDA_CHECK(cudaMemsetAsync(flush_, value & 0xff, flush_bytes_, stream_));
+}
+
+Timing Harness::time_v1(const gemm::KernelEntry* e, Problem& p, const TimingOptions& o) {
+  const int reps = o.reps;
+  for (int i = 0; i < o.warmup; ++i) launch(e, p);
   std::vector<cudaEvent_t> starts(reps), stops(reps);
   for (int i = 0; i < reps; ++i) {
     AEGIS_CUDA_CHECK(cudaEventCreate(&starts[i]));
     AEGIS_CUDA_CHECK(cudaEventCreate(&stops[i]));
   }
   for (int i = 0; i < reps; ++i) {
-    AEGIS_CUDA_CHECK(cudaMemsetAsync(flush_, i & 0xff, flush_bytes_, stream_));
+    flush_l2(i);
     AEGIS_CUDA_CHECK(cudaEventRecord(starts[i], stream_));
     launch(e, p);
     AEGIS_CUDA_CHECK(cudaEventRecord(stops[i], stream_));
@@ -180,6 +197,96 @@ Timing Harness::time(const gemm::KernelEntry* e, Problem& p, int warmup, int rep
   t.median_us = percentile(ms, 0.5) * 1e3;
   t.p10_us = percentile(ms, 0.1) * 1e3;
   t.p90_us = percentile(ms, 0.9) * 1e3;
+  t.protocol_version = 1;
+  return t;
+}
+
+cudaGraphExec_t Harness::capture(const gemm::KernelEntry* e, Problem& p, long long n) {
+  cudaGraph_t graph = nullptr;
+  AEGIS_CUDA_CHECK(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeThreadLocal));
+  for (long long i = 0; i < n; ++i) launch(e, p);
+  AEGIS_CUDA_CHECK(cudaStreamEndCapture(stream_, &graph));
+  cudaGraphExec_t exec = nullptr;
+  AEGIS_CUDA_CHECK(cudaGraphInstantiate(&exec, graph, 0));
+  AEGIS_CUDA_CHECK(cudaGraphDestroy(graph));
+  AEGIS_CUDA_CHECK(cudaGraphUpload(exec, stream_));
+  return exec;
+}
+
+float Harness::timed_window(cudaGraphExec_t g) {
+  cudaEvent_t start, stop;
+  AEGIS_CUDA_CHECK(cudaEventCreate(&start));
+  AEGIS_CUDA_CHECK(cudaEventCreate(&stop));
+  flush_l2(0);
+  AEGIS_CUDA_CHECK(cudaEventRecord(start, stream_));
+  AEGIS_CUDA_CHECK(cudaGraphLaunch(g, stream_));
+  AEGIS_CUDA_CHECK(cudaEventRecord(stop, stream_));
+  AEGIS_CUDA_CHECK(cudaEventSynchronize(stop));
+  float ms = 0;
+  AEGIS_CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
+  cudaEventDestroy(start);
+  cudaEventDestroy(stop);
+  return ms;
+}
+
+Timing Harness::time_v2(const gemm::KernelEntry* e, Problem& p, const TimingOptions& o) {
+  const double target_ms =
+      std::max(o.min_window_ms, o.min_window_ticks * timer_.tick_ns * 1e-6);
+
+  // Calibrate N: grow the batch until one window reaches the target. Each
+  // candidate graph is replayed once untimed (first-replay costs) first.
+  long long n = 1;
+  cudaGraphExec_t g = nullptr;
+  for (int iter = 0;; ++iter) {
+    g = capture(e, p, n);
+    AEGIS_CUDA_CHECK(cudaGraphLaunch(g, stream_));
+    const float ms = timed_window(g);
+    if (ms >= target_ms || n >= o.max_batch || iter >= 16) {
+      if (ms < target_ms)
+        std::fprintf(stderr, "warning: window %.3f ms < target %.3f ms at N=%lld\n", ms, target_ms, n);
+      break;
+    }
+    // Aim 25% above the target; grow at most 64x per step (the first windows
+    // of tiny batches are dominated by fixed graph-launch cost).
+    const double want = ms > 0 ? std::ceil(n * target_ms * 1.25 / ms) : double(n) * 64;
+    const long long next = std::min<long long>(
+        o.max_batch, std::max<long long>(n + 1, std::min<long long>(n * 64, (long long)want)));
+    AEGIS_CUDA_CHECK(cudaGraphExecDestroy(g));
+    n = next;
+  }
+
+  for (int i = 0; i < o.warmup; ++i) AEGIS_CUDA_CHECK(cudaGraphLaunch(g, stream_));
+
+  const int reps = o.reps;
+  std::vector<cudaEvent_t> starts(reps), stops(reps);
+  for (int i = 0; i < reps; ++i) {
+    AEGIS_CUDA_CHECK(cudaEventCreate(&starts[i]));
+    AEGIS_CUDA_CHECK(cudaEventCreate(&stops[i]));
+  }
+  for (int i = 0; i < reps; ++i) {
+    flush_l2(i);  // outside the window
+    AEGIS_CUDA_CHECK(cudaEventRecord(starts[i], stream_));
+    AEGIS_CUDA_CHECK(cudaGraphLaunch(g, stream_));
+    AEGIS_CUDA_CHECK(cudaEventRecord(stops[i], stream_));
+  }
+  AEGIS_CUDA_CHECK(cudaStreamSynchronize(stream_));
+  std::vector<float> window(reps), per_launch(reps);
+  for (int i = 0; i < reps; ++i) {
+    AEGIS_CUDA_CHECK(cudaEventElapsedTime(&window[i], starts[i], stops[i]));
+    per_launch[i] = window[i] / float(n);
+    cudaEventDestroy(starts[i]);
+    cudaEventDestroy(stops[i]);
+  }
+  AEGIS_CUDA_CHECK(cudaGraphExecDestroy(g));
+
+  Timing t;
+  t.reps = reps;
+  t.median_us = percentile(per_launch, 0.5) * 1e3;
+  t.p10_us = percentile(per_launch, 0.1) * 1e3;
+  t.p90_us = percentile(per_launch, 0.9) * 1e3;
+  t.protocol_version = 2;
+  t.batch_n = n;
+  t.window_ms = percentile(window, 0.5);
   return t;
 }
 
@@ -204,12 +311,12 @@ std::string Harness::json_row(const char* impl, const gemm::KernelEntry* e, cons
         "\"checked\":%s,\"pass\":%s,\"max_abs_err\":%.6g,\"rel_err\":%.6g,"
         "\"regs\":%d,\"smem_bytes\":%zu,\"local_bytes\":%zu,"
         "\"device\":\"%s\",\"sm_arch\":%d%d,\"cuda_runtime\":%d,\"cuda_driver\":%d,"
-        "\"timer_res_ns\":%.1f%s}",
+        "\"timer_res_ns\":%.1f,\"protocol_version\":%d,\"batch_n\":%lld,\"window_ms\":%.4f%s}",
         impl, config, M, N, K, t.median_us, t.p10_us, t.p90_us, tflops, gbps, t.reps,
         c.checked ? "true" : "false", c.pass ? "true" : "false", c.max_abs_err, c.rel_err,
         e ? attrs.numRegs : -1, e ? attrs.sharedSizeBytes : size_t(0),
         e ? attrs.localSizeBytes : size_t(0), prop_.name, prop_.major, prop_.minor, runtime_,
-        driver_, timer_.tick_ns, extra.c_str());
+        driver_, timer_.tick_ns, t.protocol_version, t.batch_n, t.window_ms, extra.c_str());
   };
   std::string s(size_t(print(nullptr, 0)), '\0');
   print(s.data(), s.size() + 1);
