@@ -505,5 +505,5 @@ Same method (6 processes per impl, cold, 20 windows each), guard 0.0%, run
 winner's spread is now two clusters (2441–2445 and 2516–2542 µs) rather than
 one outlier, so its 4% is real run-to-run variation, not one bad run. The
 per-window band (single launch per window at this size) stays 8–22%, which
-keeps 4096³ tied. Medians are 1.5–2% higher than in the previous session for
-all three impls.
+keeps 4096³ tied. Mean of the six medians vs the previous session: cublas
++1.8%, cublaslt_best +0.9%, winner +0.3%.
