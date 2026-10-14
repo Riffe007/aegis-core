@@ -233,3 +233,63 @@ passes (0.0%), but the Benchmark policy asks for SSH with remote desktop off,
 and step 7 regenerates the committed winners header. A functional `aegis-perf
 tune --shapes shapes/quick.txt` against a scratch DB ran end to end in 7.5 s
 (aegis_tune wall); its numbers are not recorded.
+
+## 2026-10-14 (evening) — step 7: sm_121 re-tuned under protocol v2
+
+**Conditions.** Session in the local gnome-terminal (not SSH); remote desktop
+stopped (`systemctl --user stop gnome-remote-desktop`); Xorg, gnome-shell and
+Firefox still on the GPU (graphics only). `RmProfilingAdminOnly: 0`. The idle
+guard refused one attempt (6.8% mean) and passed the next (1.1% mean, max 2%,
+no `--allow-busy`). Repeated 2 s samples with the desktop up read 1.0–1.5% with
+occasional bursts (one read 10% mean / 19% max), so a burst during the run is
+possible and undetected.
+
+**Run** `46372b6f92ba` (aegis_tune seed 3452099652): 14 shapes x 21 candidates
+(19 configs + cuBLAS + cublaslt_best), 350 rows, 0 failed `--check`, aegis_tune
+26.3 s wall. Timer 32 ns. Winners and `winners/sm_121.h` regenerated from v2
+cold rows.
+
+| Shape | Winner | % of cublaslt_best, cold | % of cublaslt_best, warm | Tied |
+|---|---|---|---|---|
+| 1x896x896 | `mma_pipe_64x64x32_2x2_s4` | 84.9 | 45.8 | no |
+| 16x896x896 | `mma_pipe_64x64x32_2x2_s4` | 96.0 | 84.4 | tied |
+| 1x4864x896 | `mma_pipe_64x64x32_2x2_s4` | 89.4 | 158.6 ¹ | no |
+| 1x896x4864 | `mma_pipe_64x64x32_2x2_s4` | 76.7 | 79.9 ¹ | tied |
+| 16x4864x896 | `mma_pipe_64x128x32_2x4_s4` | 87.9 | 63.2 | no |
+| 16x896x4864 | `mma_pipe_64x64x32_2x2_s4` | 76.6 | 19.1 | no |
+| 256x256x256 | `mma_pipe_64x64x32_2x2_s4` | 92.7 | 80.0 | no |
+| 512x512x512 | `mma_pipe_64x64x32_2x2_s4` | 80.6 | 64.0 | no |
+| 512x896x896 | `mma_pipe_64x128x32_2x4_s3` | 74.1 | 66.1 | tied |
+| 512x4864x896 | `mma_pipe_128x128x32_2x4_s2` | 65.4 | 67.6 | no |
+| 512x896x4864 | `mma_pipe_64x128x32_2x4_s3` | 64.0 | 50.5 | tied |
+| 1024x1024x1024 | `mma_pipe_128x128x32_2x4_s2` | 77.6 | 66.8 | tied |
+| 2048x2048x2048 | `mma_pipe_128x128x32_2x4_s2` | 68.1 | 71.4 | tied |
+| 4096x4096x4096 | `mma_pipe_128x128x32_2x4_s2` | 59.0 | 55.9 | tied |
+
+Warm % = cublaslt_best warm median / winner warm median. ¹ Baseline warm rows
+are bimodal there: cuBLAS warm at 1x4864x896 has p10 8.76 µs vs median 19.70;
+cublaslt_best warm at 1x896x4864 has p10 9.71 vs median 37.74. Do not use
+those two warm cells. Also note: cublaslt_best's warm row re-times the
+algorithm picked cold, and at 16x896x896 plain cuBLAS warm (3.99 µs) is 2x
+faster than it (7.95 µs), so the warm column understates cuBLAS on small
+shapes.
+
+**Verdicts on earlier claims (all v1 rows, logged 2026-10-13):**
+- **Decode shapes above 100% of cuBLAS — died.** v1 had 1x896x896 109.1%,
+  16x896x896 109.6%, 16x4864x896 102.4% (tune.py table) and 100.0–104.7% in
+  the v1 winners table (plus 512x896x896 100.1%). Under v2 cold, vs
+  cublaslt_best: 84.9%, 96.0%, 87.9% (512x896x896: 74.1%). The closest call,
+  16x4864x896, is 101.2% of plain cuBLAS but 87.9% of cublaslt_best: cuBLASLt
+  finds a 37.73 µs algorithm where cublasGemmEx's default takes 43.46 µs. No
+  shape beats cublaslt_best cold.
+- **The 16x896x896 "miss" — died as a disagreement.** v2 picks
+  `mma_pipe_64x64x32_2x2_s4`, the tune.py winner, at 10.91 µs. The v1
+  aegis_tune pick, `mma_pipe_64x128x32_2x4_s4`, is 13.39 µs (23% slower) under
+  v2. The v1 "8.9% gap = one tick" was quantization noise around a real gap.
+  The shape is still marked tied, against `_s3` (12.73 µs, just inside the
+  winner's p90 of 12.74).
+- **11/14 tied — partly survived: 7/14 under v2.** All four decode-family
+  shapes with N=896, K=896 and 4864 resolved except 1x896x4864 and
+  16x896x896; the ties that remain are 512x896x{896,4864}, 1024³, 2048³, 4096³
+  and those two, i.e. mostly large shapes where the winner's p90 tail is wide.
+- **Overall level:** v1's 55–110% of cuBLAS becomes 59–96% of cublaslt_best.
