@@ -10,7 +10,10 @@
 #include <random>
 #include <thread>
 
-#include <nvml.h>
+#include <dlfcn.h>
+
+#include <cstring>
+#include <type_traits>
 
 #include "aegis/common.cuh"
 
@@ -435,32 +438,69 @@ std::string Harness::json_row(const char* impl, const Impl& impl_e, const Proble
 
 namespace aegis::bench {
 
-IdleSample sample_gpu_utilization(double seconds, int interval_ms) {
+namespace {
+
+// NVML, loaded at run time: Tegra (Jetson) has no libnvidia-ml, and a link-time
+// dependency would stop every harness binary from loading there. Only the
+// handful of entry points the guard needs, with their documented C types.
+struct Nvml {
+  using Ret = int;  // nvmlReturn_t; 0 = NVML_SUCCESS
+  using Dev = void*;
+  struct Util { unsigned gpu, memory; };  // nvmlUtilization_t
+  void* lib = nullptr;
+  Ret (*init)() = nullptr;
+  Ret (*shutdown)() = nullptr;
+  Ret (*by_bus)(const char*, Dev*) = nullptr;
+  Ret (*by_index)(unsigned, Dev*) = nullptr;
+  Ret (*util)(Dev, Util*) = nullptr;
+  const char* (*err)(Ret) = nullptr;
+
+  bool load(std::string& error) {
+    lib = dlopen("libnvidia-ml.so.1", RTLD_NOW | RTLD_LOCAL);
+    if (!lib) {
+      error = "libnvidia-ml.so.1 not available";
+      return false;
+    }
+    auto sym = [&](auto& f, const char* name) { f = reinterpret_cast<std::remove_reference_t<decltype(f)>>(dlsym(lib, name)); return f != nullptr; };
+    if (!(sym(init, "nvmlInit_v2") && sym(shutdown, "nvmlShutdown") &&
+          sym(by_bus, "nvmlDeviceGetHandleByPciBusId_v2") && sym(by_index, "nvmlDeviceGetHandleByIndex_v2") &&
+          sym(util, "nvmlDeviceGetUtilizationRates") && sym(err, "nvmlErrorString"))) {
+      error = "libnvidia-ml.so.1 lacks a required symbol";
+      return false;
+    }
+    return true;
+  }
+  ~Nvml() { if (lib) dlclose(lib); }
+};
+
+IdleSample sample_nvml(double seconds, int interval_ms) {
   IdleSample s;
-  if (nvmlReturn_t r = nvmlInit_v2(); r != NVML_SUCCESS) {
-    s.error = std::string("nvmlInit: ") + nvmlErrorString(r);
+  s.source = "nvml";
+  Nvml nv;
+  if (!nv.load(s.error)) return s;
+  if (Nvml::Ret r = nv.init(); r != 0) {
+    s.error = std::string("nvmlInit: ") + nv.err(r);
     return s;
   }
-  nvmlDevice_t dev{};
+  Nvml::Dev dev = nullptr;
   int cuda_dev = 0;
   char bus[64] = "";
-  nvmlReturn_t r = NVML_ERROR_UNKNOWN;
-  if (cudaGetDevice(&cuda_dev) == cudaSuccess &&
-      cudaDeviceGetPCIBusId(bus, sizeof bus, cuda_dev) == cudaSuccess)
-    r = nvmlDeviceGetHandleByPciBusId_v2(bus, &dev);
-  if (r != NVML_SUCCESS) r = nvmlDeviceGetHandleByIndex_v2(0, &dev);  // single-GPU fallback
-  if (r != NVML_SUCCESS) {
-    s.error = std::string("nvmlDeviceGetHandle: ") + nvmlErrorString(r);
-    nvmlShutdown();
+  Nvml::Ret r = -1;
+  if (cudaGetDevice(&cuda_dev) == cudaSuccess && cudaDeviceGetPCIBusId(bus, sizeof bus, cuda_dev) == cudaSuccess)
+    r = nv.by_bus(bus, &dev);
+  if (r != 0) r = nv.by_index(0, &dev);  // single-GPU fallback
+  if (r != 0) {
+    s.error = std::string("nvmlDeviceGetHandle: ") + nv.err(r);
+    nv.shutdown();
     return s;
   }
   const int n = std::max(1, int(seconds * 1000 / interval_ms));
   double sum = 0;
   for (int i = 0; i < n; ++i) {
-    nvmlUtilization_t u{};
-    if (r = nvmlDeviceGetUtilizationRates(dev, &u); r != NVML_SUCCESS) {
-      s.error = std::string("nvmlDeviceGetUtilizationRates: ") + nvmlErrorString(r);
-      nvmlShutdown();
+    Nvml::Util u{};
+    if (r = nv.util(dev, &u); r != 0) {
+      s.error = std::string("nvmlDeviceGetUtilizationRates: ") + nv.err(r);
+      nv.shutdown();
       return s;
     }
     sum += u.gpu;
@@ -470,15 +510,105 @@ IdleSample sample_gpu_utilization(double seconds, int interval_ms) {
   }
   s.mean_pct = sum / s.samples;
   s.ok = true;
-  nvmlShutdown();
+  nv.shutdown();
+  return s;
+}
+
+// Tegra: the GPU load file (per mille, 0..1000) of the integrated GPU.
+IdleSample sample_tegra_sysfs(double seconds, int interval_ms) {
+  IdleSample s;
+  static const char* const kPaths[] = {
+      "/sys/devices/platform/gpu.0/load",                 // older L4T naming
+      "/sys/devices/gpu.0/load",
+      "/sys/devices/platform/17000000.gpu/load",          // Orin
+      "/sys/devices/platform/bus@0/17000000.gpu/load",
+  };
+  const char* path = nullptr;
+  for (const char* p : kPaths)
+    if (std::FILE* f = std::fopen(p, "r")) { std::fclose(f); path = p; break; }
+  if (!path) {
+    s.error = "no Tegra GPU load file in sysfs";
+    return s;
+  }
+  s.source = std::string("sysfs:") + path;
+  const int n = std::max(1, int(seconds * 1000 / interval_ms));
+  double sum = 0;
+  for (int i = 0; i < n; ++i) {
+    std::FILE* f = std::fopen(path, "r");
+    int permille = -1;
+    if (!f || std::fscanf(f, "%d", &permille) != 1 || permille < 0) {
+      if (f) std::fclose(f);
+      s.error = std::string("cannot read ") + path;
+      return s;
+    }
+    std::fclose(f);
+    const double pct = permille / 10.0;
+    sum += pct;
+    s.max_pct = std::max(s.max_pct, pct);
+    ++s.samples;
+    std::this_thread::sleep_for(std::chrono::milliseconds(interval_ms));
+  }
+  s.mean_pct = sum / s.samples;
+  s.ok = true;
+  return s;
+}
+
+// Tegra: GR3D_FREQ load from tegrastats ("GR3D_FREQ 12%@[...]" or "GR3D_FREQ 12%@918").
+IdleSample sample_tegrastats(double seconds, int interval_ms) {
+  IdleSample s;
+  s.source = "tegrastats";
+  const int n = std::max(1, int(seconds * 1000 / interval_ms));
+  const std::string cmd = "timeout " + std::to_string(int(std::ceil(seconds)) + 2) + " tegrastats --interval " +
+                          std::to_string(interval_ms) + " 2>/dev/null";
+  std::FILE* p = popen(cmd.c_str(), "r");
+  if (!p) {
+    s.error = "cannot run tegrastats";
+    return s;
+  }
+  char line[4096];
+  double sum = 0;
+  while (s.samples < n && std::fgets(line, sizeof line, p)) {
+    const char* g = std::strstr(line, "GR3D_FREQ ");
+    int pct = -1;
+    if (!g || std::sscanf(g, "GR3D_FREQ %d%%", &pct) != 1) continue;
+    sum += pct;
+    s.max_pct = std::max(s.max_pct, double(pct));
+    ++s.samples;
+  }
+  pclose(p);
+  if (s.samples == 0) {
+    s.error = "tegrastats printed no GR3D_FREQ";
+    return s;
+  }
+  s.mean_pct = sum / s.samples;
+  s.ok = true;
+  return s;
+}
+
+}  // namespace
+
+// NVML where it exists; on Tegra, the sysfs GPU load, then tegrastats GR3D_FREQ.
+IdleSample sample_gpu_utilization(double seconds, int interval_ms) {
+  // AEGIS_IDLE_SKIP_NVML=1 forces the Tegra paths (for testing them off-Tegra).
+  const char* skip = std::getenv("AEGIS_IDLE_SKIP_NVML");
+  IdleSample s;
+  if (skip && std::strcmp(skip, "1") == 0) s.error = "NVML skipped (AEGIS_IDLE_SKIP_NVML=1)";
+  else s = sample_nvml(seconds, interval_ms);
+  if (s.ok) return s;
+  std::string why = s.error;
+  if (IdleSample t = sample_tegra_sysfs(seconds, interval_ms); t.ok) return t;
+  else why += "; " + t.error;
+  if (IdleSample t = sample_tegrastats(seconds, interval_ms); t.ok) return t;
+  else why += "; " + t.error;
+  s.error = why;
   return s;
 }
 
 IdleSample idle_guard(bool allow_busy, double max_pct) {
   const IdleSample s = sample_gpu_utilization();
   if (s.ok)
-    std::fprintf(stderr, "idle guard: GPU utilization mean %.1f%%, max %.0f%% over %d samples (limit %.0f%%)\n",
-                 s.mean_pct, s.max_pct, s.samples, max_pct);
+    std::fprintf(stderr, "idle guard: GPU utilization mean %.1f%%, max %.0f%% over %d samples (limit %.0f%%, %s)\n",
+                 s.mean_pct, s.max_pct, s.samples, max_pct, s.source.c_str());
   else
     std::fprintf(stderr, "idle guard: cannot read GPU utilization (%s)\n", s.error.c_str());
   const bool busy = !s.ok || s.mean_pct > max_pct;

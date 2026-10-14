@@ -158,8 +158,11 @@ only to compare with old rows (`--protocol 1`).
 - **Benchmark over SSH, remote desktop off.** A remote-desktop session
   (gnome-remote-desktop) encodes video on the GPU and shares L2 and DRAM with
   the benchmark; disconnect it before a sweep, tune or microbench run.
-- **Idle guard.** `aegis-perf sweep` and `tune` (and `aegis_tune`) sample NVML
-  GPU utilization for 2 s first and refuse to start above 2% mean.
+- **Idle guard.** `aegis-perf sweep` and `tune` (and `aegis_tune`) sample GPU
+  utilization for 2 s first and refuse to start above 2% mean. Source: NVML
+  (loaded with dlopen) where it exists; on Tegra (no NVML) the sysfs GPU load
+  file (`.../gpu.0/load` or `.../17000000.gpu/load`, per mille), else
+  `tegrastats` GR3D_FREQ. The source is logged.
   `--allow-busy` overrides and marks every row (`allow_busy`, `idle_util_pct`);
   marked rows are not evidence for a performance claim.
 - **Baselines.** `cublas` (cublasGemmEx, default algorithm) and

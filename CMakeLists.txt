@@ -47,7 +47,7 @@ target_link_libraries(aegis PUBLIC aegis_kernels CUDA::cudart CUDA::cublas)
 add_library(aegis_bench_harness STATIC src/bench/harness.cu)
 target_include_directories(aegis_bench_harness PUBLIC src)
 target_link_libraries(aegis_bench_harness PUBLIC aegis_kernels CUDA::cudart CUDA::cublas CUDA::cublasLt
-                                           PRIVATE CUDA::nvml)
+                                           PRIVATE ${CMAKE_DL_LIBS})
 
 add_executable(bench_gemm bench/bench_gemm.cu)
 target_link_libraries(bench_gemm PRIVATE aegis_bench_harness)

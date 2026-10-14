@@ -251,10 +251,12 @@ class Harness {
   TimerResolution timer_{};
 };
 
-// GPU utilization over a sampling period, from NVML (device matched to the
-// current CUDA device by PCI bus id).
+// GPU utilization over a sampling period: NVML (dlopen; device matched to the
+// current CUDA device by PCI bus id) where it exists, else on Tegra the sysfs
+// GPU load file, else tegrastats GR3D_FREQ. Same 2 s / 2% rule for all.
 struct IdleSample {
-  bool ok = false;     // NVML answered; if false, `error` says why
+  bool ok = false;     // a source answered; if false, `error` says why
+  std::string source;  // "nvml", "sysfs:<path>" (Tegra GPU load) or "tegrastats"
   double mean_pct = 0, max_pct = 0;
   int samples = 0;
   std::string error;
