@@ -1,5 +1,4 @@
-//! aegis-perf: the AEGIS perf DB from Rust. Same commands, schema and output
-//! as tools/perfdb.py and tools/sweep.py. Run from the repo root.
+//! aegis-perf: the AEGIS perf DB and tooling CLI. Run from the repo root.
 //!
 //!     aegis-perf init
 //!     aegis-perf ingest RESULTS.jsonl --manifest M

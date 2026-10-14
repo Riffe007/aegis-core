@@ -5,6 +5,14 @@ set -euo pipefail
 ROOT="$(git rev-parse --show-toplevel)"
 cd "$ROOT"
 
+# No Python in AEGIS Core (CLAUDE.md rule 9): refuse any *.py, staged or tracked.
+py="$( { git diff --cached --name-only --diff-filter=ACR; git ls-files; } | grep -E '\.py$' | sort -u || true)"
+if [[ -n "$py" ]]; then
+  echo "pre-commit: Python files are not allowed in AEGIS Core:" >&2
+  echo "$py" | sed 's/^/  /' >&2
+  exit 1
+fi
+
 if [[ ! -d build ]]; then
   echo "pre-commit: no build/ directory; run cmake -S . -B build -DCMAKE_BUILD_TYPE=Release" >&2
   exit 1

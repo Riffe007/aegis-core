@@ -1,8 +1,9 @@
-//! Python `json.dumps(value, sort_keys=True)` formatting, byte for byte.
+//! Canonical config serialization for kernel ids: sorted keys, ", " and ": "
+//! separators, Python-style float repr (the format the former Python perfdb
+//! used for `json.dumps(config, sort_keys=True)`).
 //!
-//! The perf DB derives `kernel_id` from `json.dumps(config, sort_keys=True)`
-//! (tools/perfdb.py), so rows ingested from Rust and Python must serialize
-//! configs identically or the same kernel gets two ids.
+//! `kernel_id = sha1(op|impl|canonical(config))`. Every row already in a perf
+//! DB was keyed this way, so the format must not change.
 use serde_json::Value;
 
 pub fn dumps_sorted(v: &Value) -> String {
@@ -108,7 +109,7 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn matches_python_json_dumps() {
+    fn matches_canonical_format() {
         // Expected strings produced by: json.dumps(v, sort_keys=True)
         assert_eq!(dumps_sorted(&json!({"tile": 32, "block": [32, 32]})), r#"{"block": [32, 32], "tile": 32}"#);
         assert_eq!(
@@ -120,7 +121,7 @@ mod tests {
     }
 
     #[test]
-    fn float_repr_matches_python() {
+    fn float_repr_is_canonical() {
         for (x, want) in [(1.0, "1.0"), (0.1, "0.1"), (1e-5, "1e-05"), (1.5e16, "1.5e+16"),
                           (123456.789, "123456.789"), (0.0001, "0.0001"), (1e16, "1e+16")] {
             assert_eq!(py_float_repr(x), want, "{x}");

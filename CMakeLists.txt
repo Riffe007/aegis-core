@@ -37,7 +37,7 @@ set_target_properties(aegis_kernels PROPERTIES CUDA_SEPARABLE_COMPILATION OFF
 add_library(aegis STATIC src/matmul.cu src/manifest.cpp)
 set_target_properties(aegis PROPERTIES POSITION_INDEPENDENT_CODE ON)
 # matmul.cu pulls winners in with __has_include, which dependency scanning
-# misses when a header first appears; glob them so `tune.py --emit-header`
+# misses when a header first appears; glob them so `aegis-perf emit-header`
 # triggers a rebuild.
 file(GLOB AEGIS_WINNER_HEADERS CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/include/aegis/winners/*.h)
 set_source_files_properties(src/matmul.cu PROPERTIES OBJECT_DEPENDS "${AEGIS_WINNER_HEADERS}")

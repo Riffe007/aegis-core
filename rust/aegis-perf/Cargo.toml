@@ -3,7 +3,7 @@ name = "aegis-perf"
 version = "0.1.0"
 edition.workspace = true
 publish.workspace = true
-description = "AEGIS perf DB CLI: init, ingest, winners, report, sweep (port of tools/perfdb.py + tools/sweep.py)"
+description = "AEGIS perf DB and tooling CLI: init, ingest, winners, report, sweep, tune, emit-header, roofline"
 
 [[bin]]
 name = "aegis-perf"

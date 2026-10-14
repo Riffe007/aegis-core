@@ -1,5 +1,5 @@
-//! `sweep`: port of tools/sweep.py. Shells out to bench_gemm with the same
-//! shapes, impl order and reps, then ingests and recomputes winners.
+//! `sweep`: every registered impl (bench_gemm --list) over the shape set, one
+//! bench_gemm process per (impl, shape), then ingest and recompute winners.
 use std::io::Write as _;
 use std::path::Path;
 use std::process::Command;
@@ -29,7 +29,7 @@ pub fn quick_shapes() -> Vec<(i64, i64, i64)> {
     vec![(512, 512, 512), (1, 896, 896), (1024, 1024, 1024)]
 }
 
-/// sweep.py IMPLS: cuBLAS 50 reps; naive 5 reps and skipped above 2*2048^3
+/// Reps: cuBLAS 50; naive 5 reps and skipped above 2*2048^3
 /// FLOPs; every other registered impl 20 reps.
 pub struct Spec {
     pub reps: u32,
@@ -44,7 +44,7 @@ pub fn spec(impl_: &str) -> Spec {
     }
 }
 
-/// sweep.py's default impl list: cuBLAS, then the registry in order.
+/// Default impl list: cuBLAS, then the registry in order.
 pub fn default_impls(bench: &Path) -> Result<Vec<String>> {
     let out = Command::new(bench).arg("--list").output().context("run bench_gemm --list")?;
     let mut impls = vec!["cublas".to_string()];

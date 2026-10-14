@@ -41,7 +41,7 @@ using LaunchFn = void (*)(const __half* A, const __half* B, __half* C,
 using AttrsFn = cudaFuncAttributes (*)();
 
 struct KernelEntry {
-  const char* name;    // impl name: bench_gemm --impl, sweep.py, perf DB
+  const char* name;    // impl name: bench_gemm --impl, aegis_tune, perf DB
   const char* config;  // JSON; states every template parameter
   LaunchFn launch;
   AttrsFn attrs;       // sharedSizeBytes includes dynamic smem per block

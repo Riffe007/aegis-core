@@ -1,7 +1,7 @@
-//! Perf DB commands, a line-for-line port of tools/perfdb.py.
+//! Perf DB commands: schema, ingest, winners, report.
 //!
-//! Output text, SQL, kernel ids and row selection match the Python tool so
-//! both can write the same DB and print identical reports.
+//! Originally a line-for-line port of the (deleted) Python perfdb tool; kernel
+//! ids, row selection and report text are unchanged so existing DBs stay valid.
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::path::Path;
@@ -15,7 +15,7 @@ use sha1::{Digest, Sha1};
 
 use crate::pyjson::dumps_sorted;
 
-/// Copied verbatim from `SCHEMA` in tools/perfdb.py (a test checks it).
+/// The perf DB schema. Source of truth; v1 columns are frozen (add, never rename).
 pub const SCHEMA: &str = include_str!("schema.sql");
 
 pub fn connect(db: &Path) -> Result<Connection> {
@@ -233,7 +233,7 @@ pub fn cmd_ingest_microbench(db: &Path, results: &Path, manifest: Option<&Path>,
     Ok(())
 }
 
-/// One row of `_latest_per_kernel_shape` in perfdb.py.
+/// Latest passing measurement per (arch, kernel, shape).
 #[derive(Clone, Debug)]
 pub struct Latest {
     pub sm_arch: i64,
@@ -328,7 +328,7 @@ pub fn cmd_winners(db: &Path, arch: Option<i64>) -> Result<()> {
     Ok(())
 }
 
-/// The report text, exactly as `perfdb.py report` prints it.
+/// The report text (format unchanged since the Python perfdb).
 pub fn report_text(con: &Connection, arch: Option<i64>) -> Result<String> {
     let rows = latest_per_kernel_shape(con, arch)?;
     // table[(arch, m, n, k)][impl] = row; later rows overwrite (Python dict).
@@ -381,18 +381,23 @@ pub fn cmd_report(db: &Path, arch: Option<i64>) -> Result<()> {
 mod tests {
     use super::*;
 
-    /// SCHEMA must stay a verbatim copy of tools/perfdb.py's.
+    /// The schema creates every table and is idempotent.
     #[test]
-    fn schema_matches_perfdb_py() {
-        let py = include_str!("../../../tools/perfdb.py");
-        let start = py.find("SCHEMA = \"\"\"").expect("SCHEMA in perfdb.py") + "SCHEMA = \"\"\"".len();
-        let end = start + py[start..].find("\"\"\"").unwrap();
-        assert_eq!(&py[start..end], SCHEMA, "schema.sql drifted from tools/perfdb.py SCHEMA");
+    fn schema_creates_tables() {
+        let con = Connection::open_in_memory().unwrap();
+        con.execute_batch(SCHEMA).unwrap();
+        con.execute_batch(SCHEMA).unwrap();
+        for t in ["runs", "kernels", "measurements", "winners", "microbench"] {
+            let n: i64 = con
+                .query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?", [t], |r| r.get(0))
+                .unwrap();
+            assert_eq!(n, 1, "missing table {t}");
+        }
     }
 
     #[test]
-    fn kernel_id_matches_python() {
-        // python3 -c 'import hashlib,json; print(hashlib.sha1(("gemm|tiled|"+json.dumps({"tile":32,"block":[32,32]},sort_keys=True)).encode()).hexdigest()[:16])'
+    fn kernel_id_is_stable() {
+        // The id every existing DB row uses for tiled (computed by the former Python tool).
         let cfg = serde_json::json!({"tile": 32, "block": [32, 32]});
         assert_eq!(kernel_id("gemm", "tiled", &cfg), PY_TILED_KID);
     }

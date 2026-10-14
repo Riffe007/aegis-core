@@ -4,7 +4,7 @@
 //   C[M,N] = A[M,K] * B[K,N], row-major, FP16 in, FP32 accumulate, FP16 out.
 //
 // Selection, against the winners compiled in for the device's sm_arch
-// (include/aegis/winners/sm_<arch>.h, written by tools/tune.py --emit-header):
+// (include/aegis/winners/sm_<arch>.h, written by aegis-perf emit-header):
 //   1. exact (M, N, K) match;
 //   2. else the winner with the same N and K whose M is nearest in log2
 //      (ties go to the larger M);

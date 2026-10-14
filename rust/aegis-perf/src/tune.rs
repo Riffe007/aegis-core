@@ -69,7 +69,7 @@ pub fn cmd_tune(a: &TuneArgs) -> Result<()> {
 }
 
 /// Winner per shape from one run's rows, with the gap to the runner-up.
-/// Same layout as the former tools/tune.py table.
+/// Same layout as the original Python tuner's table.
 pub fn run_table(jsonl: &str) -> Result<String> {
     let mut order: Vec<(i64, i64, i64)> = Vec::new();
     let mut rows: HashMap<(i64, i64, i64), Vec<Value>> = HashMap::new();
@@ -114,8 +114,8 @@ pub fn run_table(jsonl: &str) -> Result<String> {
     Ok(out)
 }
 
-/// The generated header text, exactly as the former `tools/tune.py --emit-header`
-/// wrote it apart from line 1 (generator name, host, time).
+/// The generated header text (format unchanged from the original Python tuner
+/// apart from line 1: generator name, host, time).
 pub fn header_text(con: &rusqlite::Connection, arch: i64, generated: &str) -> Result<(String, usize)> {
     let mut stmt = con.prepare(
         "SELECT w.shape_bucket, k.impl, w.pct_of_cublas FROM winners w \
