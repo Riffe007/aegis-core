@@ -43,8 +43,13 @@ file(GLOB AEGIS_WINNER_HEADERS CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/include/aeg
 set_source_files_properties(src/matmul.cu PROPERTIES OBJECT_DEPENDS "${AEGIS_WINNER_HEADERS}")
 target_link_libraries(aegis PUBLIC aegis_kernels CUDA::cudart CUDA::cublas)
 
+# The timing protocol (src/bench/harness.h), shared by bench_gemm and aegis_tune.
+add_library(aegis_bench_harness STATIC src/bench/harness.cu)
+target_include_directories(aegis_bench_harness PUBLIC src)
+target_link_libraries(aegis_bench_harness PUBLIC aegis_kernels CUDA::cudart CUDA::cublas)
+
 add_executable(bench_gemm bench/bench_gemm.cu)
-target_link_libraries(bench_gemm PRIVATE aegis_kernels CUDA::cudart CUDA::cublas)
+target_link_libraries(bench_gemm PRIVATE aegis_bench_harness)
 
 add_executable(aegis_manifest tools/aegis_manifest.cu)
 target_link_libraries(aegis_manifest PRIVATE aegis)
