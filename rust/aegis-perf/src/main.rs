@@ -4,7 +4,7 @@
 //!     aegis-perf ingest RESULTS.jsonl --manifest M
 //!     aegis-perf ingest-microbench MB.jsonl --manifest M
 //!     aegis-perf winners [--arch 121]
-//!     aegis-perf report [--arch 121]
+//!     aegis-perf report [--arch 121] [--protocol 2] [--cache cold|warm] [--include-busy]
 //!     aegis-perf sweep [--impls tiled cublas] [--quick] [--allow-busy]
 //!     aegis-perf tune [--shapes shapes/default.txt] [--seed S] [--allow-busy]
 //!     aegis-perf emit-header [--arch 121]
@@ -61,6 +61,15 @@ enum Cmd {
     Report {
         #[arg(long)]
         arch: Option<i64>,
+        /// Timing protocol of the rows to show (1 = rows from before protocol v2).
+        #[arg(long, default_value_t = 2)]
+        protocol: i64,
+        /// v2 cache mode: cold or warm.
+        #[arg(long, default_value = "cold")]
+        cache: String,
+        /// Also show rows measured on a busy GPU (--allow-busy).
+        #[arg(long)]
+        include_busy: bool,
     },
     /// Autotune: build/aegis_tune over a shapes file, ingest, recompute winners, print the table.
     Tune {
@@ -127,7 +136,9 @@ fn main() -> Result<()> {
             db::cmd_ingest_microbench(&cli.db, &results, manifest.as_deref(), run_id)
         }
         Cmd::Winners { arch } => db::cmd_winners(&cli.db, arch),
-        Cmd::Report { arch } => db::cmd_report(&cli.db, arch),
+        Cmd::Report { arch, protocol, cache, include_busy } => {
+            db::cmd_report(&cli.db, arch, &db::Selection { protocol, cache, include_busy })
+        }
         Cmd::Tune { shapes, seed, prefix, allow_busy, build_dir, results_dir } => tune::cmd_tune(&tune::TuneArgs {
             db: &cli.db,
             build: &build_dir,

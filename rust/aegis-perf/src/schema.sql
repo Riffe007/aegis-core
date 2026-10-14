@@ -34,7 +34,16 @@ CREATE TABLE IF NOT EXISTS measurements (
   reps INTEGER,
   checked INTEGER, pass INTEGER,
   max_abs_err REAL, rel_err REAL,
-  power_w REAL
+  power_w REAL,
+  -- Timing protocol v2 (src/bench/harness.h). Rows from before it are v1.
+  protocol_version INTEGER NOT NULL DEFAULT 1,
+  batch_n INTEGER,             -- launches per timed window (v1: 1)
+  timer_res_ns REAL,           -- measured cudaEvent resolution
+  cache_mode TEXT,             -- 'cold' | 'warm' (v2); 'flush_per_launch' or NULL (v1)
+  buffer_sets INTEGER,         -- K buffer sets rotated inside a cold window
+  window_ms REAL,              -- median timed window
+  allow_busy INTEGER NOT NULL DEFAULT 0,  -- idle guard found the GPU busy; --allow-busy ran anyway
+  idle_util_pct REAL           -- idle guard's mean GPU utilization
 );
 CREATE INDEX IF NOT EXISTS idx_meas_shape ON measurements(m, n, k, dtype);
 CREATE TABLE IF NOT EXISTS winners (
@@ -49,6 +58,8 @@ CREATE TABLE IF NOT EXISTS winners (
   tied INTEGER NOT NULL DEFAULT 0,  -- runner-up median inside the winner's p10-p90
   tie_set TEXT,                     -- JSON list of impls in the tie (incl. the pick)
   pick_reason TEXT,                 -- "fastest", or which tie-break decided
+  protocol_version INTEGER NOT NULL DEFAULT 1,  -- of the measurements it was picked from
+  warm_median_us REAL,              -- the pick's cache_mode=warm median (v2), if measured
   PRIMARY KEY (sm_arch, op, dtype, shape_bucket)
 );
 CREATE TABLE IF NOT EXISTS microbench (

@@ -88,13 +88,18 @@ pub fn run_table(jsonl: &str) -> Result<String> {
     }
     let med = |r: &Value| r["median_us"].as_f64().unwrap_or(f64::INFINITY);
     let mut out = String::new();
-    let hdr = format!("{:>5} {:>5} {:>5}  {:<30} {:>9}  {:<30} {:>6}", "M", "N", "K", "winner", "% cuBLAS", "runner-up", "gap");
+    let hdr = format!(
+        "{:>5} {:>5} {:>5}  {:<30} {:>9}  {:<30} {:>6}  {:>9}",
+        "M", "N", "K", "winner", "% cuBLAS", "runner-up", "gap", "warm %"
+    );
     writeln!(out, "{hdr}")?;
     writeln!(out, "{}", "-".repeat(hdr.len()))?;
     for key in order {
-        let rs = &rows[&key];
-        let cb = rs.iter().find(|r| r["impl"] == "cublas");
-        let mut ok: Vec<&Value> = rs.iter().filter(|r| r["impl"] != "cublas" && r["pass"] == true).collect();
+        // Rank on cold rows (v1 rows have no warm pass); warm rows only annotate.
+        let is_warm = |r: &&Value| r["cache_mode"] == "warm";
+        let (warm, rs): (Vec<&Value>, Vec<&Value>) = rows[&key].iter().partition(is_warm);
+        let cb = rs.iter().copied().find(|r| r["impl"] == "cublas");
+        let mut ok: Vec<&Value> = rs.iter().copied().filter(|r| r["impl"] != "cublas" && r["pass"] == true).collect();
         ok.sort_by(|a, b| med(a).total_cmp(&med(b)));
         let (m, n, k) = key;
         let Some(w) = ok.first() else {
@@ -111,12 +116,22 @@ pub fn run_table(jsonl: &str) -> Result<String> {
             Some(r) => (r["impl"].as_str().unwrap_or("?").to_string(), format!("{:5.1}%", (med(r) / med(w) - 1.0) * 100.0)),
             None => ("-".to_string(), format!("{:>6}", "-")),
         };
-        writeln!(out, "{m:>5} {n:>5} {k:>5}  {:<30} {pct}  {ru:<30} {gap}", w["impl"].as_str().unwrap_or("?"))?;
+        let warm_of = |i: &Value| warm.iter().find(|r| r["impl"] == *i).map(|r| med(r));
+        let warm_pct = match (warm_of(&Value::from("cublas")), warm_of(&w["impl"])) {
+            (Some(c), Some(o)) => format!("{:8.1}%", c / o * 100.0),
+            _ => format!("{:>9}", "-"),
+        };
+        writeln!(
+            out,
+            "{m:>5} {n:>5} {k:>5}  {:<30} {pct}  {ru:<30} {gap}  {warm_pct}",
+            w["impl"].as_str().unwrap_or("?")
+        )?;
     }
     writeln!(
         out,
         "\n% cuBLAS: cuBLAS median / winner median (100% = parity). gap: how much slower the runner-up's median is than the winner's;\n\
-         \"tied\": the runner-up's median is inside the winner's p10-p90 (this run only; the DB winner is picked by the tie-break)."
+         \"tied\": the runner-up's median is inside the winner's p10-p90 (this run only; the DB winner is picked by the tie-break).\n\
+         Ranked on cache_mode=cold rows. warm %: cuBLAS warm median / winner warm median (protocol v2)."
     )?;
     Ok(out)
 }

@@ -49,6 +49,8 @@ fn points(con: &Connection, arch: i64) -> Result<Vec<Point>> {
         "SELECT w.shape_bucket, k.impl, w.median_us, \
                 (SELECT m.median_us FROM measurements m JOIN kernels kc USING(kernel_id) JOIN runs r USING(run_id) \
                  WHERE kc.impl = 'cublas' AND r.sm_arch = w.sm_arch AND m.dtype = w.dtype \
+                   AND m.protocol_version = w.protocol_version AND m.allow_busy = 0 \
+                   AND (m.protocol_version = 1 OR m.cache_mode = 'cold') \
                    AND (m.m || 'x' || m.n || 'x' || m.k) = w.shape_bucket \
                  ORDER BY r.started_at DESC LIMIT 1) \
          FROM winners w JOIN kernels k USING(kernel_id) WHERE w.sm_arch = ? AND w.op = 'gemm'",

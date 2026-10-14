@@ -36,7 +36,54 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("winners", "pick_reason", "TEXT"),
     ("microbench", "superseded", "INTEGER NOT NULL DEFAULT 0"),
     ("microbench", "superseded_by", "TEXT"),
+    // Timing protocol v2: rows from before it get protocol_version = 1.
+    ("measurements", "protocol_version", "INTEGER NOT NULL DEFAULT 1"),
+    ("measurements", "batch_n", "INTEGER"),
+    ("measurements", "timer_res_ns", "REAL"),
+    ("measurements", "cache_mode", "TEXT"),
+    ("measurements", "buffer_sets", "INTEGER"),
+    ("measurements", "window_ms", "REAL"),
+    ("measurements", "allow_busy", "INTEGER NOT NULL DEFAULT 0"),
+    ("measurements", "idle_util_pct", "REAL"),
+    ("winners", "protocol_version", "INTEGER NOT NULL DEFAULT 1"),
+    ("winners", "warm_median_us", "REAL"),
 ];
+
+/// Reference implementations: always eligible (they are what --check compares
+/// against), never winners.
+const BASELINES: &str = "'cublas'";
+
+pub fn is_baseline(impl_: &str) -> bool {
+    impl_ == "cublas"
+}
+
+/// Which measurements a winners / report query reads.
+#[derive(Clone, Debug)]
+pub struct Selection {
+    pub protocol: i64,
+    /// v2 cache mode ("cold" / "warm"); ignored for protocol 1.
+    pub cache: String,
+    /// Include rows measured on a busy GPU (--allow-busy).
+    pub include_busy: bool,
+}
+
+impl Selection {
+    /// What winners are picked from: protocol v2, cold, idle GPU.
+    pub fn ranking() -> Self {
+        Selection { protocol: 2, cache: "cold".to_string(), include_busy: false }
+    }
+
+    fn sql(&self) -> String {
+        let mut s = format!(" AND m.protocol_version = {}", self.protocol);
+        if self.protocol >= 2 {
+            s += &format!(" AND m.cache_mode = '{}'", self.cache.replace('\'', "''"));
+        }
+        if !self.include_busy {
+            s += " AND m.allow_busy = 0";
+        }
+        s
+    }
+}
 
 fn migrate(con: &Connection) -> Result<()> {
     for (table, column, decl) in ADDED_COLUMNS {
@@ -192,8 +239,13 @@ pub fn cmd_ingest(
                     sql(r.get("local_bytes"))],
         )?;
         let s = get(r, "shape")?;
+        // Rows written before timing protocol v2 carry no protocol_version: v1.
+        let protocol = r.get("protocol_version").and_then(Value::as_i64).unwrap_or(1);
         tx.execute(
-            "INSERT INTO measurements VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO measurements (run_id, kernel_id, dtype, m, n, k, median_us, p10_us, p90_us, \
+             tflops, gbps, reps, checked, pass, max_abs_err, rel_err, power_w, protocol_version, batch_n, \
+             timer_res_ns, cache_mode, buffer_sets, window_ms, allow_busy, idle_util_pct) \
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             params![
                 run_id, kid, sql(Some(get(r, "dtype")?)),
                 sql(Some(get(s, "M")?)), sql(Some(get(s, "N")?)), sql(Some(get(s, "K")?)),
@@ -203,6 +255,14 @@ pub fn cmd_ingest(
                 get(r, "pass")?.as_bool().unwrap_or(false) as i64,
                 sql(Some(get(r, "max_abs_err")?)), sql(Some(get(r, "rel_err")?)),
                 sql(r.get("power_w")),
+                protocol,
+                sql(r.get("batch_n")),
+                sql(r.get("timer_res_ns")),
+                sql(r.get("cache_mode")),
+                sql(r.get("buffer_sets")),
+                sql(r.get("window_ms")),
+                r.get("allow_busy").and_then(Value::as_bool).unwrap_or(false) as i64,
+                sql(r.get("idle_util_pct")),
             ],
         )?;
     }
@@ -293,14 +353,15 @@ pub struct Latest {
 /// Most recent measurement per (arch, kernel, shape); only checked+passing rows
 /// are eligible, except cuBLAS which is the reference itself. Keeps Python's
 /// dict semantics: first-seen key order, later runs overwrite values.
-fn latest_per_kernel_shape(con: &Connection, arch: Option<i64>) -> Result<Vec<Latest>> {
+fn latest_per_kernel_shape(con: &Connection, arch: Option<i64>, sel: &Selection) -> Result<Vec<Latest>> {
     let arch = arch.filter(|&a| a != 0); // Python: `if arch`
     let q = format!(
         "SELECT r.sm_arch, k.op, m.dtype, m.m, m.n, m.k, k.impl, k.kernel_id, m.run_id, \
                 m.median_us, m.tflops, m.p10_us, m.p90_us, k.regs, k.smem_bytes \
          FROM measurements m JOIN runs r USING(run_id) JOIN kernels k USING(kernel_id) \
-         WHERE (k.impl = 'cublas' OR (m.checked = 1 AND m.pass = 1)) {} ORDER BY r.started_at",
-        if arch.is_some() { "AND r.sm_arch = ?" } else { "" }
+         WHERE (k.impl IN ({BASELINES}) OR (m.checked = 1 AND m.pass = 1)) {}{} ORDER BY r.started_at",
+        sel.sql(),
+        if arch.is_some() { " AND r.sm_arch = ?" } else { "" }
     );
     let mut stmt = con.prepare(&q)?;
     let map = |row: &rusqlite::Row| -> rusqlite::Result<Latest> {
@@ -375,7 +436,9 @@ fn neighbors(a: &ShapeKey, b: &ShapeKey) -> bool {
 /// then less smem, then lower median, then name.
 pub fn cmd_winners(db: &Path, arch: Option<i64>) -> Result<()> {
     let con = connect(db)?;
-    let rows = latest_per_kernel_shape(&con, arch)?;
+    // Ranked on protocol v2, cold, idle-GPU rows only (CLAUDE.md Benchmark policy).
+    let sel = Selection::ranking();
+    let rows = latest_per_kernel_shape(&con, arch, &sel)?;
     let mut groups: Vec<(ShapeKey, Vec<&Latest>)> = Vec::new();
     let mut index = HashMap::new();
     for r in &rows {
@@ -390,16 +453,34 @@ pub fn cmd_winners(db: &Path, arch: Option<i64>) -> Result<()> {
     let sets: Vec<(ShapeKey, Vec<String>)> = groups
         .iter()
         .map(|(key, rs)| {
-            let ours: Vec<&Latest> = rs.iter().copied().filter(|r| r.impl_ != "cublas").collect();
+            let ours: Vec<&Latest> = rs.iter().copied().filter(|r| !is_baseline(&r.impl_)).collect();
             (key.clone(), tie_set(&ours).iter().map(|r| r.impl_.clone()).collect())
         })
         .collect();
+
+    // Winners are derived data: drop the old ones of every arch recomputed here,
+    // so shapes measured only under protocol v1 do not keep a stale winner.
+    let mut archs: Vec<i64> = groups.iter().map(|(k, _)| k.0).collect();
+    archs.dedup();
+    for a in &archs {
+        con.execute("DELETE FROM winners WHERE sm_arch = ?", [a])?;
+    }
+    let warm_of = |kernel_id: &str, (arch, dtype, m, n, k): (i64, &str, i64, i64, i64)| -> Result<Option<f64>> {
+        let warm = Selection { cache: "warm".to_string(), ..sel.clone() };
+        let q = format!(
+            "SELECT m.median_us FROM measurements m JOIN runs r USING(run_id) \
+             WHERE m.kernel_id = ? AND r.sm_arch = ? AND m.dtype = ? AND m.m = ? AND m.n = ? AND m.k = ? {} \
+             ORDER BY r.started_at DESC LIMIT 1",
+            warm.sql()
+        );
+        Ok(con.query_row(&q, params![kernel_id, arch, dtype, m, n, k], |r| r.get(0)).ok())
+    };
 
     let (mut n, mut tied_n) = (0, 0);
     for (key, rs) in &groups {
         let (arch, op, dtype, m, nn, k) = key;
         let cublas = rs.iter().find(|r| r.impl_ == "cublas");
-        let ours: Vec<&Latest> = rs.iter().copied().filter(|r| r.impl_ != "cublas").collect();
+        let ours: Vec<&Latest> = rs.iter().copied().filter(|r| !is_baseline(&r.impl_)).collect();
         let tie = tie_set(&ours);
         let Some(&fastest) = tie.first() else { continue };
         let (pick, reason) = if tie.len() == 1 {
@@ -434,19 +515,24 @@ pub fn cmd_winners(db: &Path, arch: Option<i64>) -> Result<()> {
         let set_json = serde_json::to_string(&tie.iter().map(|r| r.impl_.as_str()).collect::<Vec<_>>())?;
         con.execute(
             "INSERT OR REPLACE INTO winners (sm_arch, op, dtype, shape_bucket, kernel_id, run_id, median_us, \
-             pct_of_cublas, tied, tie_set, pick_reason) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+             pct_of_cublas, tied, tie_set, pick_reason, protocol_version, warm_median_us) \
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
             params![arch, op, dtype, shape_bucket(*m, *nn, *k), pick.kernel_id, pick.run_id, pick.median_us, pct,
-                    (tie.len() > 1) as i64, set_json, reason],
+                    (tie.len() > 1) as i64, set_json, reason, sel.protocol,
+                    warm_of(&pick.kernel_id, (*arch, dtype.as_str(), *m, *nn, *k))?],
         )?;
         n += 1;
     }
-    println!("wrote {n} winners ({tied_n} tied, resolved by the tie-break)");
+    println!(
+        "wrote {n} winners ({tied_n} tied, resolved by the tie-break) from protocol v{} {} rows",
+        sel.protocol, sel.cache
+    );
     Ok(())
 }
 
 /// The report text (format unchanged since the Python perfdb).
-pub fn report_text(con: &Connection, arch: Option<i64>) -> Result<String> {
-    let rows = latest_per_kernel_shape(con, arch)?;
+pub fn report_text(con: &Connection, arch: Option<i64>, sel: &Selection) -> Result<String> {
+    let rows = latest_per_kernel_shape(con, arch, sel)?;
     // table[(arch, m, n, k)][impl] = row; later rows overwrite (Python dict).
     let mut table: HashMap<(i64, i64, i64, i64), HashMap<String, &Latest>> = HashMap::new();
     for r in &rows {
@@ -484,12 +570,15 @@ pub fn report_text(con: &Connection, arch: Option<i64>) -> Result<String> {
         writeln!(out, "{a:>5} {m:>6} {n:>6} {k:>6} {cbs} {}", cells.join(" "))?;
     }
     writeln!(out, "\nCells are % of cuBLAS speed (100% = parity, >100% = faster than cuBLAS).")?;
+    let cache = if sel.protocol >= 2 { format!(", cache_mode={}", sel.cache) } else { String::new() };
+    let busy = if sel.include_busy { "including" } else { "excluding" };
+    writeln!(out, "Rows: timing protocol v{}{cache}, {busy} --allow-busy rows.", sel.protocol)?;
     Ok(out)
 }
 
-pub fn cmd_report(db: &Path, arch: Option<i64>) -> Result<()> {
+pub fn cmd_report(db: &Path, arch: Option<i64>, sel: &Selection) -> Result<()> {
     let con = connect(db)?;
-    print!("{}", report_text(&con, arch)?);
+    print!("{}", report_text(&con, arch, sel)?);
     Ok(())
 }
 
@@ -509,6 +598,28 @@ mod tests {
                 .unwrap();
             assert_eq!(n, 1, "missing table {t}");
         }
+    }
+
+    /// A pre-v2 measurements table gains the protocol columns; its rows read as
+    /// protocol v1, from an idle GPU.
+    #[test]
+    fn migrate_marks_old_rows_v1() {
+        let con = Connection::open_in_memory().unwrap();
+        con.execute_batch(
+            "CREATE TABLE measurements (run_id TEXT NOT NULL, kernel_id TEXT NOT NULL, dtype TEXT NOT NULL, \
+             m INTEGER, n INTEGER, k INTEGER, median_us REAL, p10_us REAL, p90_us REAL, tflops REAL, gbps REAL, \
+             reps INTEGER, checked INTEGER, pass INTEGER, max_abs_err REAL, rel_err REAL, power_w REAL);
+             INSERT INTO measurements (run_id, kernel_id, dtype) VALUES ('r', 'k', 'f16f32f16');",
+        )
+        .unwrap();
+        con.execute_batch(SCHEMA).unwrap();
+        migrate(&con).unwrap();
+        let (p, busy, cache): (i64, i64, Option<String>) = con
+            .query_row("SELECT protocol_version, allow_busy, cache_mode FROM measurements", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .unwrap();
+        assert_eq!((p, busy, cache), (1, 0, None));
     }
 
     #[test]
