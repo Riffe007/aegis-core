@@ -1062,6 +1062,9 @@ before issuing step s's MMAs (tier 4 only; on tier 3 it spilled
 - **Paired vs. the Phase A build** (alternating processes, 30 pairs, cold;
   idle guard read 2.9% before the run): 4096³ B/A 0.999 [0.983, 1.016] (tie);
   2048³ (`mma_pipe_128x128x32_2x4_s2`) B/A 1.007 [1.002, 1.014] (0.7% slower).
+  ~~SUSPECT~~ (marked 2026-10-15, cleared the same day): the idle reading,
+  2.9%, was above the 2% threshold. The re-run on an idle GPU (below,
+  `paired_results` ids 1 and 2) reproduces both results.
 - **Verdict:** no NOP reduction, more registers, no speedup -> reverted (kernel
   SASS identical to Phase A again). The NOPs between back-to-back HMMAs need
   either more independent work per k-step (larger k-steps, or moving global
@@ -1210,3 +1213,100 @@ runs any tuned winner and falls back to plain cuBLAS only for untuned shapes.
   73–75%.
 - e. **Power-controls probe** (deferred). Needs a passwordless sudoers entry
   for `nvidia-smi` and `cpupower`, which is not in place.
+
+## 2026-10-15 — Phase B a re-run (prepared, then run by hand)
+
+The Phase B a paired-ab result (commit 4220a8c) is marked **suspect**: the
+idle guard read 2.9% before it (limit 2%), and paired-ab had no blocking
+guard then. paired-ab now has one and stores every result in the perf DB
+(`paired_results`). The re-run is prepared but not run: the guard read 3.0%
+(max 6%, GPU in P0) with Xorg, gnome-shell and Firefox on the GPU and the
+remote-desktop daemon up.
+
+Builds, in the worktree `~/Documents/projects/aegis-phaseBa-rerun` (detached
+at b0bedd5, the Phase A kernel code the original A/B used):
+- A, `bin-A/bench_gemm`: unmodified. Its `mma_pipe_128x256x32_2x4_s3`
+  instruction stream is identical to the saved Phase A binary
+  (`aegis-phaseA-bin/bench_gemm`): 192 HMMA, 171 NOP, 188 registers.
+- B, `build/bench_gemm`: the fragment double-buffering patch, recovered
+  verbatim from the session that ran it (`phaseBa-dbuf.patch` in the worktree):
+  192 HMMA, 171 NOP, 206 registers, the same as the original B.
+
+Command (from the Core repo root, idle GPU, remote desktop off):
+
+    W=~/Documents/projects/aegis-phaseBa-rerun
+    rust/target/release/aegis-perf paired-ab --a $W/bin-A/bench_gemm --b $W/build/bench_gemm \
+      --impl mma_pipe_128x256x32_2x4_s3 --shape 4096 4096 4096 --pairs 30 --reps 10 \
+      --sha-a b0bedd58fbf9 --sha-b b0bedd58fbf9-dirty
+    rust/target/release/aegis-perf paired-ab --a $W/bin-A/bench_gemm --b $W/build/bench_gemm \
+      --impl mma_pipe_128x128x32_2x4_s2 --shape 2048 2048 2048 --pairs 30 --reps 20 \
+      --sha-a b0bedd58fbf9 --sha-b b0bedd58fbf9-dirty
+
+(`-dirty` = b0bedd5 plus `phaseBa-dbuf.patch`.) The double-buffering verdict
+(no NOP reduction, +18 registers) rests on SASS and stands; only the timing
+ratios await the re-run.
+
+**Re-run done (2026-10-15, by hand, the commands above).** The guard passed
+both times; results are stored in the perf DB `paired_results`:
+
+| id | Shape | impl | idle | B/A | 95% CI | Call |
+|---|---|---|---|---|---|---|
+| 1 | 4096³ | mma_pipe_128x256x32_2x4_s3 | 0.0% | 0.9971 | [0.9929, 1.0117] | tie |
+| 2 | 2048³ | mma_pipe_128x128x32_2x4_s2 | 1.5% | 1.0074 | [1.0049, 1.0118] | B 0.7% slower |
+
+Same as the suspect run (4096³ 0.999 tie; 2048³ 1.007 [1.002, 1.014]). The
+SUSPECT mark on 4220a8c is cleared, and the rejection of fragment double
+buffering stands: a tie at 4096³, 0.7% slower at 2048³, and 18 more
+registers (188 -> 206).
+
+## 2026-10-15 — Clock locking works on GB10; locked-clock pointer chase
+
+`sudo nvidia-smi -lgc 2418,2418` succeeds on GB10, although `nvidia-smi -q`
+lists "Supported Clocks: N/A". Without root, NVML's SetGpuLockedClocks
+answers "Insufficient Permissions", so the probes record the lock as not
+held. Policy from now on: latency probes run with clocks locked at 2418 MHz
+(the default applications clock), via `microbench/run_latency_locked.sh 2418`.
+
+Locked run `e3d94274b31d` (`run_latency_locked.sh 2418`, idle 0.0% NVML,
+109 rows; the 145 rows of `a825f4e557a3` became `replaced`). SM clock
+measured 2416 / 2381 MHz before / after, mean 2398.16, within the 2%
+tolerance, so `clocks_locked = 1`. Values as `emit-arch` derives them (cycles,
+median across points):
+
+| | Locked `e3d94274b31d` | Unlocked `a825f4e557a3` (committed sm_121.json) |
+|---|---|---|
+| L2 latency, 256 KiB – 8 MiB, 12 points | 490.0 cycles (range 336.0 – 1067.8) | 335.4 cycles (335.4 – 335.4) |
+| DRAM latency, >= 32 MiB, 10 points | 1088.7 cycles (range 932.5 – 1401.5) | 956.6 cycles (952.1 – 964.8) |
+| SM clock | 2398.16 MHz, locked | 2406.78 MHz, unlocked |
+| L1 hit (<= 64 KiB) | 37.0 cycles | 37.0 cycles |
+
+**The locked run is not adopted: it was disturbed.** Clock locking cannot
+spread an L2 hit from 336 to 1068 cycles. The L2 plateau was flat at 335.4
+in the unlocked run and in the earlier runs (see "Pointer chase rerun"). In
+the locked run, p10 and median also disagree within single points (1 MiB
+cross_page: p10 367, median 428), which points to interference during the
+run. The journal shows the cause: Firefox restarted at 18:37:39 and opened
+the GPU (`pci id for fd 17: 10de:2e12`). That was after `nvidia-smi -lgc`
+(18:37:33) and the idle check, and about 10 s before the run row's
+`started_at`, 18:37:50. The idle guard samples only before the run, so it
+could not see this. L1 points (37.0 cycles) are identical in both runs.
+
+The `sm_121.json` that `emit-arch` wrote from this run is left uncommitted.
+The committed one, from `a825f4e557a3`, stays. Next: re-run with
+Firefox and the desktop session idle (over SSH), then emit-arch and commit
+the file. To fall back meanwhile, invalidate the run:
+`aegis-perf invalidate --run e3d94274b31d --probe ptr_chase_latency --reason "..."`
+(emit-arch then uses the newest replaced run, `a825f4e557a3`).
+
+## 2026-10-15 — Perf DB schema_version; aegis-perf 0.2.0
+
+The perf DB gets a `schema_version` table (one row). The current schema is
+v2: microbench status and clock columns, the runs idle reading, and
+`paired_results`. A DB without the table is v1. Every aegis-perf reader
+checks it before any query: `connect_ro` refuses any other version, and
+`connect` migrates older DBs and refuses newer ones without touching them.
+Both fail with "DB schema vN, binary expects vM" instead of an SQL error.
+The live DB is stamped v2 (backup:
+`results/aegis_perf.db.bak-2026-10-14-pre-schema-version`). Binaries built
+before this change do not check the version; on a v2 DB they fail on the
+missing `superseded` column.

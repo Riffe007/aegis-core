@@ -605,14 +605,25 @@ IdleSample sample_gpu_utilization(double seconds, int interval_ms) {
   return s;
 }
 
-IdleSample idle_guard(bool allow_busy, double max_pct) {
+double idle_max_pct() {
+  double limit = kIdleMaxPct;
+  if (const char* e = std::getenv("AEGIS_IDLE_MAX_PCT")) {
+    char* end = nullptr;
+    const double v = std::strtod(e, &end);
+    if (end != e) limit = std::min(limit, v);  // lower only
+  }
+  return limit;
+}
+
+IdleSample idle_guard(bool allow_busy) {
+  const double max_pct = idle_max_pct();
   const IdleSample s = sample_gpu_utilization();
   if (s.ok)
     std::fprintf(stderr, "idle guard: GPU utilization mean %.1f%%, max %.0f%% over %d samples (limit %.0f%%, %s)\n",
                  s.mean_pct, s.max_pct, s.samples, max_pct, s.source.c_str());
   else
     std::fprintf(stderr, "idle guard: cannot read GPU utilization (%s)\n", s.error.c_str());
-  const bool busy = !s.ok || s.mean_pct > max_pct;
+  const bool busy = idle_busy(s, max_pct);
   if (busy && !allow_busy) {
     std::fprintf(stderr,
                  "idle guard: refusing to benchmark a busy GPU. Stop other GPU work (remote desktop "

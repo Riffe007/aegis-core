@@ -191,3 +191,20 @@ add_test(NAME gpu_budget_budget COMMAND test_gpu_budget budget)
 set_tests_properties(gpu_budget_budget PROPERTIES ENVIRONMENT "AEGIS_GPU_BUDGET=64M")
 add_test(NAME gpu_budget_minfree COMMAND test_gpu_budget minfree)
 set_tests_properties(gpu_budget_minfree PROPERTIES ENVIRONMENT "AEGIS_GPU_MIN_FREE=1000000G")
+
+# The blocking idle guard: busy aborts (exit 3) unless --allow-busy; rows carry the reading.
+add_test(NAME idle_guard_paths
+         COMMAND ${CMAKE_SOURCE_DIR}/tests/test_idle_guard.sh $<TARGET_FILE:bench_gemm> $<TARGET_FILE:aegis_tune>)
+
+# GPU lock (CLAUDE.md rule 15): every test except the compile-only sm87_gate
+# touches the GPU, is labelled "gpu" and requires the gpu_lock_guard fixture,
+# which fails unless this ctest run holds the GPU lock (tools/gpu_lock.sh
+# ctest ...). ctest -LE gpu runs the rest without the lock.
+add_test(NAME gpu_lock_guard COMMAND ${CMAKE_SOURCE_DIR}/tools/gpu_lock_guard.sh)
+set_tests_properties(gpu_lock_guard PROPERTIES FIXTURES_SETUP gpu_lock LABELS gpu)
+get_property(AEGIS_ALL_TESTS DIRECTORY PROPERTY TESTS)
+foreach(t ${AEGIS_ALL_TESTS})
+  if(NOT t STREQUAL "sm87_gate" AND NOT t STREQUAL "gpu_lock_guard")
+    set_tests_properties(${t} PROPERTIES LABELS gpu FIXTURES_REQUIRED gpu_lock)
+  endif()
+endforeach()

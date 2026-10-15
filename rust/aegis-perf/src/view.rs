@@ -27,10 +27,17 @@ pub struct Run {
     pub temp_start_c: Option<f64>,
     pub measured_bw_gbps: Option<f64>,
     pub started_at: String,
+    /// The idle guard's mean GPU utilization (%) before the run; None if not
+    /// recorded (older runs without it on their rows).
+    pub idle_util_pct: Option<f64>,
+    pub idle_source: Option<String>,
+    /// The guard found the GPU busy and the run went ahead (--allow-busy).
+    pub allow_busy: bool,
 }
 
 const RUN_COLS: &str = "run_id, device_id, sm_arch, gpu_name, cuda_ver, driver_ver, git_sha, power_mode, \
-                        clocks_locked, temp_start_c, measured_bw_gbps, started_at";
+                        clocks_locked, temp_start_c, measured_bw_gbps, started_at, idle_util_pct, idle_source, \
+                        allow_busy";
 
 fn run_row(r: &Row) -> rusqlite::Result<Run> {
     Ok(Run {
@@ -46,6 +53,9 @@ fn run_row(r: &Row) -> rusqlite::Result<Run> {
         temp_start_c: r.get(9)?,
         measured_bw_gbps: r.get(10)?,
         started_at: r.get(11)?,
+        idle_util_pct: r.get(12)?,
+        idle_source: r.get(13)?,
+        allow_busy: r.get::<_, i64>(14)? != 0,
     })
 }
 
@@ -378,28 +388,146 @@ pub struct Microbench {
     pub param_json: String,
     pub value: Option<f64>,
     pub unit: String,
-    pub superseded: bool,
-    pub superseded_by: Option<String>,
+    pub status: MicrobenchStatus,
+    /// Replaced: the run_id of the newer run of the same probe.
+    pub replaced_by: Option<String>,
+    /// Latency rows: SM clock at measurement, whether clocks were locked, and
+    /// what the probe requested; None on older rows and non-latency probes.
+    pub sm_clock_mhz: Option<f64>,
+    pub clocks_locked: Option<bool>,
+    pub clock_lock: Option<String>,
 }
 
-/// Microbench rows of an arch, oldest run first. Superseded rows (a later run
-/// re-measured the probe) are history: left out unless asked for.
-pub fn microbench(con: &Connection, arch: i64, include_superseded: bool) -> Result<Vec<Microbench>> {
+impl Microbench {
+    /// A cycles row in ns at the clock it was measured at (derived, never stored).
+    pub fn ns(&self) -> Option<f64> {
+        match (self.unit.as_str(), self.value, self.sm_clock_mhz) {
+            ("cycles", Some(c), Some(mhz)) if mhz > 0.0 => Some(c / mhz * 1e3),
+            _ => None,
+        }
+    }
+}
+
+/// A microbench row's status. Invalidated rows (known bad) are never returned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MicrobenchStatus {
+    /// The probe's current measurement.
+    Valid,
+    /// A newer run of the same probe exists; still valid history.
+    Replaced,
+}
+
+/// Microbench rows of an arch, oldest run first: valid and replaced rows, each
+/// labelled. Invalidated rows (known bad, with a reason) are hidden everywhere.
+/// The hardware model uses the newest valid run per probe (db::current_run).
+pub fn microbench(con: &Connection, arch: i64) -> Result<Vec<Microbench>> {
     let mut stmt = con.prepare(
-        "SELECT m.run_id, m.probe, m.param_json, m.value, m.unit, m.superseded, m.superseded_by \
+        "SELECT m.run_id, m.probe, m.param_json, m.value, m.unit, m.status, m.replaced_by, \
+                m.sm_clock_mhz, m.clocks_locked, m.clock_lock \
          FROM microbench m JOIN runs r USING(run_id) \
-         WHERE r.sm_arch = ?1 AND (?2 OR m.superseded = 0) ORDER BY r.started_at, m.rowid",
+         WHERE r.sm_arch = ?1 AND m.status <> 'invalidated' ORDER BY r.started_at, m.rowid",
     )?;
     let rows = stmt
-        .query_map(params![arch, include_superseded], |r| {
+        .query_map(params![arch], |r| {
+            let status: String = r.get(5)?;
             Ok(Microbench {
                 run_id: r.get(0)?,
                 probe: r.get(1)?,
                 param_json: r.get(2)?,
                 value: r.get(3)?,
                 unit: r.get(4)?,
-                superseded: r.get::<_, i64>(5)? != 0,
-                superseded_by: r.get(6)?,
+                status: if status == "replaced" { MicrobenchStatus::Replaced } else { MicrobenchStatus::Valid },
+                replaced_by: r.get(6)?,
+                sm_clock_mhz: r.get(7)?,
+                clocks_locked: r.get::<_, Option<i64>>(8)?.map(|l| l != 0),
+                clock_lock: r.get(9)?,
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(rows)
+}
+
+/// One stored paired-ab result (`paired_results` table): build B vs build A on
+/// one shape. ratio = median per-pair B/A time; tied when the CI contains 1.0.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PairedResult {
+    pub id: i64,
+    /// Each build's commit (`-dirty`: uncommitted tracked changes); None: unknown.
+    pub sha_a: Option<String>,
+    pub sha_b: Option<String>,
+    pub m: i64,
+    pub n: i64,
+    pub k: i64,
+    pub impl_a: String,
+    pub impl_b: String,
+    pub ratio: f64,
+    pub ci_lo: f64,
+    pub ci_hi: f64,
+    /// Pairs (alternating process pairs).
+    pub pairs: i64,
+    pub protocol_version: i64,
+    pub cache_mode: String,
+    /// The idle guard's mean GPU utilization (%) before the run; None: unreadable.
+    pub idle_reading: Option<f64>,
+    pub clocks_locked: bool,
+    pub started_at: String,
+    pub finished_at: String,
+}
+
+impl PairedResult {
+    pub fn tied(&self) -> bool {
+        self.ci_lo <= 1.0 && self.ci_hi >= 1.0
+    }
+    /// Above the idle guard's limit (or unreadable): not evidence for a performance claim.
+    pub fn busy(&self) -> bool {
+        self.idle_reading.is_none_or(|u| u > crate::sweep::IDLE_MAX_PCT)
+    }
+}
+
+/// Which paired-ab results to read; every field narrows.
+#[derive(Clone, Debug, Default)]
+pub struct PairedResultFilter {
+    /// impl_a or impl_b.
+    pub impl_: Option<String>,
+    pub shape: Option<(i64, i64, i64)>,
+    /// sha_a or sha_b starts with this.
+    pub sha: Option<String>,
+}
+
+/// Stored paired-ab results, oldest first.
+pub fn paired_results(con: &Connection, f: &PairedResultFilter) -> Result<Vec<PairedResult>> {
+    let shape = f.shape.map(|(m, n, k)| format!("{m}x{n}x{k}"));
+    let sha = f.sha.as_ref().map(|s| format!("{}%", s.replace('%', "")));
+    let mut stmt = con.prepare(
+        "SELECT id, sha_a, sha_b, shape, impl_a, impl_b, ratio, ci_lo, ci_hi, n, protocol_version, cache_mode, \
+                idle_reading, clocks_locked, started_at, finished_at FROM paired_results \
+         WHERE (?1 IS NULL OR impl_a = ?1 OR impl_b = ?1) AND (?2 IS NULL OR shape = ?2) \
+           AND (?3 IS NULL OR sha_a LIKE ?3 OR sha_b LIKE ?3) ORDER BY started_at, id",
+    )?;
+    let rows = stmt
+        .query_map(params![f.impl_, shape, sha], |r| {
+            let shape: String = r.get(3)?;
+            let dims: Vec<i64> = shape.split('x').filter_map(|d| d.parse().ok()).collect();
+            let dim = |i: usize| dims.get(i).copied().unwrap_or(0);
+            Ok(PairedResult {
+                id: r.get(0)?,
+                sha_a: r.get(1)?,
+                sha_b: r.get(2)?,
+                m: dim(0),
+                n: dim(1),
+                k: dim(2),
+                impl_a: r.get(4)?,
+                impl_b: r.get(5)?,
+                ratio: r.get(6)?,
+                ci_lo: r.get(7)?,
+                ci_hi: r.get(8)?,
+                pairs: r.get(9)?,
+                protocol_version: r.get(10)?,
+                cache_mode: r.get(11)?,
+                idle_reading: r.get(12)?,
+                clocks_locked: r.get::<_, i64>(13)? != 0,
+                started_at: r.get(14)?,
+                finished_at: r.get(15)?,
             })
         })?
         .collect::<rusqlite::Result<_>>()?;
@@ -439,8 +567,9 @@ mod tests {
              INSERT INTO paired (run_id, op, dtype, m, n, k, a_impl, b_impl, role, ratio_median, ratio_ci_lo,
                                  ratio_ci_hi, tied, protocol_version, cache_mode) VALUES
                ('r1', 'gemm', 'f16f32f16', 64, 64, 64, 'mma_x', 'mma_y', 'runner_up', 1.0, 0.99, 1.01, 1, 2, 'cold');
-             INSERT INTO microbench (run_id, probe, param_json, value, unit, superseded) VALUES
-               ('r1', 'dram_bandwidth', '{}', 200.0, 'GB/s', 1), ('r2', 'dram_bandwidth', '{}', 230.0, 'GB/s', 0);",
+             INSERT INTO microbench (run_id, probe, param_json, value, unit, status, status_reason, replaced_by) VALUES
+               ('r1', 'dram_bandwidth', '{}', 200.0, 'GB/s', 'replaced', NULL, 'r2'), ('r2', 'dram_bandwidth', '{}', 230.0, 'GB/s', 'valid', NULL, NULL),
+               ('r2', 'ptr_chase_latency', '{}', 1.0, 'ns', 'invalidated', 'clock not recorded', NULL);",
         )
         .unwrap();
         p
@@ -492,11 +621,63 @@ mod tests {
     }
 
     #[test]
-    fn microbench_hides_superseded() {
+    fn microbench_hides_only_invalidated() {
         let p = seeded("mb");
         let con = db::connect_ro(&p).unwrap();
-        assert_eq!(microbench(&con, 121, false).unwrap().len(), 1);
-        assert_eq!(microbench(&con, 121, true).unwrap().len(), 2);
+        let rows = microbench(&con, 121).unwrap();
+        let got: Vec<(&str, &str, MicrobenchStatus)> =
+            rows.iter().map(|r| (r.run_id.as_str(), r.probe.as_str(), r.status)).collect();
+        assert_eq!(
+            got,
+            vec![
+                ("r1", "dram_bandwidth", MicrobenchStatus::Replaced),
+                ("r2", "dram_bandwidth", MicrobenchStatus::Valid),
+            ]
+        );
+        assert_eq!(rows[0].replaced_by.as_deref(), Some("r2"));
+        std::fs::remove_file(&p).unwrap();
+    }
+
+    #[test]
+    fn paired_results_round_trip_and_filters() {
+        let p = std::env::temp_dir().join(format!("aegis-view-pr-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        {
+            let con = db::connect(&p).unwrap();
+            let r = |sha_b: &str, impl_: &str, shape: (i64, i64, i64), idle: Option<f64>, lo: f64, hi: f64| {
+                crate::ab::NewPairedResult {
+                    sha_a: Some("2c6aabb9dd18".into()),
+                    sha_b: Some(sha_b.into()),
+                    shape,
+                    impl_a: impl_.into(),
+                    impl_b: impl_.into(),
+                    ratio: (lo + hi) / 2.0,
+                    ci_lo: lo,
+                    ci_hi: hi,
+                    n: 30,
+                    protocol_version: 2,
+                    cache_mode: "cold".into(),
+                    idle_reading: idle,
+                    clocks_locked: false,
+                    started_at: "2026-10-15T00:00:00+00:00".into(),
+                    finished_at: "2026-10-15T00:05:00+00:00".into(),
+                }
+            };
+            crate::ab::store(&con, &r("abc123-dirty", "mma_a", (4096, 4096, 4096), Some(2.9), 0.983, 1.016)).unwrap();
+            crate::ab::store(&con, &r("def456", "mma_b", (2048, 2048, 2048), Some(0.4), 1.002, 1.014)).unwrap();
+        }
+        let con = db::connect_ro(&p).unwrap();
+        let all = paired_results(&con, &PairedResultFilter::default()).unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!((all[0].m, all[0].n, all[0].k, all[0].pairs), (4096, 4096, 4096, 30));
+        assert!(all[0].tied() && all[0].busy(), "2.9% > 2%: busy");
+        assert!(!all[1].tied() && !all[1].busy());
+        let by_impl = PairedResultFilter { impl_: Some("mma_b".into()), ..Default::default() };
+        assert_eq!(paired_results(&con, &by_impl).unwrap().len(), 1);
+        let by_shape = PairedResultFilter { shape: Some((4096, 4096, 4096)), ..Default::default() };
+        assert_eq!(paired_results(&con, &by_shape).unwrap()[0].sha_b.as_deref(), Some("abc123-dirty"));
+        let by_sha = PairedResultFilter { sha: Some("2c6aabb".into()), ..Default::default() };
+        assert_eq!(paired_results(&con, &by_sha).unwrap().len(), 2);
         std::fs::remove_file(&p).unwrap();
     }
 }

@@ -2,7 +2,9 @@
 //
 // One warp; every MMA accumulates into the previous one's result, so each
 // waits for the last to finish. cycles / MMAs = issue-to-result latency.
-// Timed loop: 8 dependent HMMAs per iteration.
+// Timed loop: 8 dependent HMMAs per iteration. Rows: cycles, with the SM clock
+// and whether clocks were locked (clock_lock.cuh).
+#include "clock_lock.cuh"
 #include "common.cuh"
 #include "mma_common.cuh"
 
@@ -34,6 +36,8 @@ int main() {
   MB_CHECK(aegis::budget::gpu_malloc(&sink, 32 * sizeof(float)));
   MB_CHECK(aegis::budget::gpu_malloc(&dcycles, sizeof(long long)));
   const int iters = 1 << 16;
+  mb::ClockLock clk;  // request locked clocks; recorded on every row
+  std::vector<double> per_mma;
   mb_mma_latency<<<1, 32>>>(0x3c003c00u, iters, sink, dcycles);  // warm-up
   MB_CHECK(cudaDeviceSynchronize());
   for (int rep = 0; rep < 3; ++rep) {
@@ -41,9 +45,12 @@ int main() {
     MB_CHECK(cudaGetLastError());
     long long cycles = 0;
     MB_CHECK(cudaMemcpy(&cycles, dcycles, sizeof cycles, cudaMemcpyDeviceToHost));
-    mb::emit(dev, "mma_latency",
-             "{\"shape\":\"m16n8k16\",\"types\":\"f32.f16.f16.f32\",\"rep\":" + std::to_string(rep) + "}",
-             double(cycles) / iters, "cycles");
+    per_mma.push_back(double(cycles) / iters);
   }
+  clk.finish();
+  for (size_t rep = 0; rep < per_mma.size(); ++rep)
+    mb::emit_clocked(dev, "mma_latency",
+                     "{\"shape\":\"m16n8k16\",\"types\":\"f32.f16.f16.f32\",\"rep\":" + std::to_string(rep) + "}",
+                     per_mma[rep], "cycles", clk);
   return 0;
 }

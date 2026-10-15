@@ -48,6 +48,25 @@ enum Cmd {
         manifest: Option<PathBuf>,
         #[arg(long)]
         run_id: Option<String>,
+        /// The idle guard's reading for this run (run_all.sh passes it).
+        #[arg(long)]
+        idle_util_pct: Option<f64>,
+        #[arg(long)]
+        idle_source: Option<String>,
+        /// The guard found the GPU busy and the run went ahead anyway.
+        #[arg(long)]
+        allow_busy: bool,
+    },
+    /// Mark a microbench run's rows invalidated (known bad; hidden everywhere).
+    Invalidate {
+        #[arg(long)]
+        run: String,
+        /// Only this probe's rows (default: every probe of the run).
+        #[arg(long)]
+        probe: Option<String>,
+        /// Why the measurement is bad (required).
+        #[arg(long)]
+        reason: String,
     },
     /// Recompute the best kernel per (arch, shape).
     Winners {
@@ -127,6 +146,15 @@ enum Cmd {
         reps: u32,
         #[arg(long, default_value = "cold")]
         cache: String,
+        /// Run even if the idle guard finds the GPU busy (> 2% utilization); the result is marked.
+        #[arg(long)]
+        allow_busy: bool,
+        /// Commit of build A (default: HEAD of the git tree containing it, -dirty if modified).
+        #[arg(long)]
+        sha_a: Option<String>,
+        /// Commit of build B (same default).
+        #[arg(long)]
+        sha_b: Option<String>,
     },
     /// Measured machine parameters (L2/DRAM latency, DRAM bandwidth, mma peak)
     /// -> include/aegis/arch/sm_<arch>.json, for the cost model.
@@ -134,7 +162,8 @@ enum Cmd {
         #[arg(long)]
         arch: i64,
         /// Pointer-chase runs to use, RUN or RUN:LAYOUT (cross_page / page_local_64k);
-        /// repeatable. Default: every current (non-superseded) run.
+        /// repeatable (replaced runs allowed, invalidated refused). Default: the newest
+        /// valid run (else the newest replaced one).
         #[arg(long = "ptr-chase")]
         ptr_chase: Vec<String>,
         #[arg(long)]
@@ -177,9 +206,11 @@ fn main() -> Result<()> {
         Cmd::Ingest { results, manifest, run_id, temp_start } => {
             db::cmd_ingest(&cli.db, &results, manifest.as_deref(), run_id, temp_start)
         }
-        Cmd::IngestMicrobench { results, manifest, run_id } => {
-            db::cmd_ingest_microbench(&cli.db, &results, manifest.as_deref(), run_id)
+        Cmd::IngestMicrobench { results, manifest, run_id, idle_util_pct, idle_source, allow_busy } => {
+            let idle = db::RunIdle { pct: idle_util_pct, source: idle_source, allow_busy };
+            db::cmd_ingest_microbench(&cli.db, &results, manifest.as_deref(), run_id, &idle)
         }
+        Cmd::Invalidate { run, probe, reason } => db::cmd_invalidate(&cli.db, &run, probe.as_deref(), &reason),
         Cmd::Winners { arch } => db::cmd_winners(&cli.db, arch),
         Cmd::Report { arch, protocol, cache, include_busy, baseline } => {
             db::cmd_report(&cli.db, arch, &db::Selection { protocol, cache, include_busy }, baseline.as_deref())
@@ -197,7 +228,9 @@ fn main() -> Result<()> {
         Cmd::EmitHeader { arch, out, results_dir } => {
             tune::cmd_emit_header(&cli.db, arch, &results_dir, out.as_deref())
         }
-        Cmd::PairedAb { a, b, impl_, impl_b, shape, pairs, reps, cache } => ab::cmd_paired_ab(&ab::AbArgs {
+        Cmd::PairedAb { a, b, impl_, impl_b, shape, pairs, reps, cache, allow_busy, sha_a, sha_b } => {
+            ab::cmd_paired_ab(&ab::AbArgs {
+            db: &cli.db,
             a: &a,
             b: &b,
             impl_a: &impl_,
@@ -206,7 +239,11 @@ fn main() -> Result<()> {
             pairs,
             reps,
             cache: &cache,
-        }),
+            allow_busy,
+            sha_a: sha_a.as_deref(),
+            sha_b: sha_b.as_deref(),
+            })
+        }
         Cmd::EmitArch { arch, ptr_chase, out, results_dir } => {
             arch::cmd_emit_arch(&cli.db, arch, &ptr_chase, &results_dir, out.as_deref())
         }

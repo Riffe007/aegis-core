@@ -32,12 +32,12 @@ exports only `aegis_*`; changing a signature there means bumping
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DAEGIS_SM87_GATE=ON  # arch: local GPU ("native"); + sm_87 compile gate
 cmake --build build -j                            # kernels, bench, C ABI (.a/.so), microbench
-ctest --test-dir build --output-on-failure        # every impl on odd shapes, matmul dispatch, C ABI, sm87_gate
+tools/gpu_lock.sh ctest --test-dir build --output-on-failure   # GPU lock (rule 15); every impl on odd shapes, matmul dispatch, C ABI, sm87_gate
 ./build/aegis_manifest > results/manifest-$(hostname).json
 
 # Rust (needs the CMake build first: aegis-sys links build/libaegis_capi.so)
 cargo build --release --manifest-path rust/Cargo.toml
-cargo test --release --manifest-path rust/Cargo.toml   # bindings vs CPU reference, schema parity
+tools/gpu_lock.sh cargo test --release --manifest-path rust/Cargo.toml   # bindings vs CPU reference (GPU), schema parity
 cargo clippy --release --all-targets --manifest-path rust/Cargo.toml
 # AEGIS_LIB_DIR=/path/to/build overrides where aegis-sys finds the library.
 
@@ -48,7 +48,7 @@ rust/target/release/aegis-perf emit-header        # winners -> include/aegis/win
 rust/target/release/aegis-perf roofline --arch 121  # results/roofline-sm121.svg from measured roofs
 rust/target/release/aegis-perf emit-arch --arch 121  # include/aegis/arch/sm_121.json: measured L2/DRAM latency, DRAM bw, mma peak
 tools/sass_dump.sh                                # SASS + register usage per kernel
-microbench/run_all.sh                             # hardware probes -> perf DB microbench table
+microbench/run_all.sh                             # hardware probes -> perf DB microbench table (takes the GPU lock)
 ./build/aegis_fuzz --cases 2000 --seed 1          # randomized correctness vs FP64 / cuBLASLt (ctest fuzz_2000)
 cmake --build build --target fuzz_nightly         # 50,000 fuzz cases
 tools/sanitize.sh                                 # ctest suite under compute-sanitizer memcheck/racecheck/initcheck/synccheck
@@ -121,7 +121,12 @@ docs/               LOG.md (dated run log), analysis/ (consolidated analyses, e.
    model comes from the perf DB (`microbench` table or `aegis_manifest`), on
    the same device. Datasheet figures may appear only as labeled context. A
    probe's number counts only if its SASS proof passed (run_all.sh exits 0);
-   if a probe changes, rerun it before reusing its numbers.
+   if a probe changes, rerun it before reusing its numbers. Latencies are
+   stored in cycles with the SM clock they were measured at and whether
+   clocks were locked (latency probes request locked clocks,
+   `microbench/clock_lock.cuh`); `arch/*.json` stores cycles and clocks, and
+   aegis-perf derives ns at read time. Locked-clock pointer-chase run:
+   `sudo nvidia-smi -lgc F,F; microbench/run_latency_locked.sh F; sudo nvidia-smi -rgc`.
 9. **No Python in AEGIS Core.** Kernels and runtime: C++20/CUDA/PTX. ABI: C11.
    CPU kernels: AArch64 asm/intrinsics. Tooling: Rust. The pre-commit hook
    refuses any `*.py` file. Kernel ids keep their canonical config
@@ -158,6 +163,19 @@ docs/               LOG.md (dated run log), analysis/ (consolidated analyses, e.
    free when `free` said 112). This, not the cgroup cap, is the real protection
    on unified memory: the driver does not charge device allocations to the
    job's cgroup. Tests: ctest `gpu_budget_*` (deliberate oversize requests).
+14. **One session owns main at a time. Nobody force-pushes main.** Every
+   other session works on its own branch (in a separate `git worktree add`
+   when the main working tree is in use) and stops for review; the owner of
+   main merges. No session pushes or rewrites another's branch.
+15. **All GPU work holds the exclusive GPU lock**: an flock on
+   `results/gpu.lock` (`tools/gpu_lock.sh CMD`, or in-process in aegis-perf).
+   Tunes, sweeps, paired-ab, microbench (`run_all.sh`), sanitizers, the
+   nightly fuzz (`tools/gpu_job.sh` locks too) and GPU ctests. Every ctest
+   but the compile-only `sm87_gate` is labelled `gpu` and fails its
+   `gpu_lock_guard` fixture unless the run holds the lock. The holder is
+   written into the lock file. A busy lock is refused (exit 75), never waited
+   for silently; the pre-commit hook then runs `ctest -LE gpu` only and says
+   that it skipped the GPU tests.
 
 ## Production bar (minimum for "done")
 
@@ -223,11 +241,21 @@ only to compare with old rows (`--protocol 1`).
 - **Timer.** The event timer's resolution is measured at startup (32 ns on
   GB10). v1 rows are quantized to 2.048 us steps by the memset in front of each
   start event; do not rank shapes under ~50 us on v1 rows.
+- **Latency probes run with clocks locked at 2418 MHz** (GB10's default
+  applications clock; `nvidia-smi -lgc` works on GB10 as root):
+  `sudo nvidia-smi -lgc 2418,2418; microbench/run_latency_locked.sh 2418;
+  sudo nvidia-smi -rgc`. Keep the desktop idle for the whole run, not just
+  the idle check: an app that starts on the GPU mid-run spreads the L2 plateau
+  (LOG 2026-10-15, run `e3d94274b31d`).
 - **Benchmark over SSH, remote desktop off.** A remote-desktop session
   (gnome-remote-desktop) encodes video on the GPU and shares L2 and DRAM with
   the benchmark; disconnect it before a sweep, tune or microbench run.
-- **Idle guard.** `aegis-perf sweep` and `tune` (and `aegis_tune`) sample GPU
-  utilization for 2 s first and refuse to start above 2% mean. Source: NVML
+- **Idle guard (blocking).** `aegis-perf sweep`, `tune` and `paired-ab` (and
+  `aegis_tune`, `microbench/run_all.sh`) sample GPU utilization for 2 s first
+  and abort above 2% mean (or when no source can tell) unless `--allow-busy`
+  (`ALLOW_BUSY=1` for run_all.sh). `AEGIS_IDLE_MAX_PCT` can only lower the
+  limit (tests use -1 to force the busy path). The reading is stored on every
+  run row (`runs.idle_util_pct`, `idle_source`, `allow_busy`). Source: NVML
   (loaded with dlopen) where it exists; on Tegra (no NVML) the sysfs GPU load
   file (`.../gpu.0/load` or `.../17000000.gpu/load`, per mille), else
   `tegrastats` GR3D_FREQ. The source is logged.

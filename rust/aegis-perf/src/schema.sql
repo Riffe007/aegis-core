@@ -74,8 +74,17 @@ CREATE TABLE IF NOT EXISTS microbench (
   param_json TEXT NOT NULL,
   value REAL,
   unit TEXT NOT NULL,
-  superseded INTEGER NOT NULL DEFAULT 0,  -- 1 once a later run re-measured this probe
-  superseded_by TEXT                      -- run_id of that later run
+  -- valid: current. replaced: a newer run of the same probe exists (still valid
+  -- history). invalidated: known bad; status_reason says why (required).
+  status TEXT NOT NULL DEFAULT 'valid' CHECK (status IN ('valid', 'replaced', 'invalidated')),
+  status_reason TEXT CHECK (status <> 'invalidated' OR length(trim(coalesce(status_reason, ''))) > 0),
+  replaced_by TEXT,                       -- replaced: run_id of the newer run
+  -- Latency probes (clock_lock.cuh): the SM clock the value was measured at,
+  -- whether clocks were locked, and what was requested / happened. NULL on
+  -- rows from before the clock-locking probes and on non-latency rows.
+  sm_clock_mhz REAL,
+  clocks_locked INTEGER,
+  clock_lock TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_micro_probe ON microbench(probe);
 -- Paired tie tests (aegis_tune, protocol v2): `pairs` alternating windows of
@@ -101,3 +110,34 @@ CREATE TABLE IF NOT EXISTS paired (
   allow_busy INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_paired_shape ON paired(run_id, m, n, k);
+-- paired-ab results (aegis-perf paired-ab): the same impl (or two impls) from
+-- two builds, alternating processes; ratio = median of per-pair B/A medians,
+-- 95% percentile-bootstrap CI. sha_a / sha_b: the git commit of each build's
+-- tree (suffix -dirty: uncommitted tracked changes; NULL: unknown). shape:
+-- "MxNxK". idle_reading: the idle guard's mean GPU utilization (%) before the
+-- run, NULL if unreadable. clocks_locked: paired-ab does not lock clocks (0).
+CREATE TABLE IF NOT EXISTS paired_results (
+  id INTEGER PRIMARY KEY,
+  sha_a TEXT,
+  sha_b TEXT,
+  shape TEXT NOT NULL,
+  impl_a TEXT NOT NULL,
+  impl_b TEXT NOT NULL,
+  ratio REAL NOT NULL,
+  ci_lo REAL NOT NULL,
+  ci_hi REAL NOT NULL,
+  n INTEGER NOT NULL,
+  protocol_version INTEGER NOT NULL,
+  cache_mode TEXT NOT NULL,
+  idle_reading REAL,
+  clocks_locked INTEGER NOT NULL DEFAULT 0,
+  started_at TEXT NOT NULL,
+  finished_at TEXT NOT NULL
+);
+-- Schema version (one row, id 1): what aegis-perf migrated this DB to
+-- (db::SCHEMA_VERSION). Every reader refuses a DB at another version with
+-- "DB schema vN, binary expects vM". A DB without this table is v1.
+CREATE TABLE IF NOT EXISTS schema_version (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  version INTEGER NOT NULL
+);
