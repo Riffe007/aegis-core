@@ -62,6 +62,10 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("microbench", "status", "TEXT NOT NULL DEFAULT 'valid' CHECK (status IN ('valid', 'replaced', 'invalidated'))"),
     ("microbench", "status_reason", "TEXT CHECK (status <> 'invalidated' OR length(trim(coalesce(status_reason, ''))) > 0)"),
     ("microbench", "replaced_by", "TEXT"),
+    // Latency rows: the SM clock at measurement and whether it was locked.
+    ("microbench", "sm_clock_mhz", "REAL"),
+    ("microbench", "clocks_locked", "INTEGER"),
+    ("microbench", "clock_lock", "TEXT"),
     // Timing protocol v2: rows from before it get protocol_version = 1.
     ("measurements", "protocol_version", "INTEGER NOT NULL DEFAULT 1"),
     ("measurements", "batch_n", "INTEGER"),
@@ -399,6 +403,10 @@ pub fn cmd_ingest_microbench(
         None => Value::Object(Default::default()),
     };
     let first = &rows[0];
+    // runs.clocks_locked: 1 if every row that records a lock state was locked,
+    // 0 if any was not, NULL if no row records one (non-latency probes).
+    let lock_states: Vec<bool> = rows.iter().filter_map(|r| r.get("clocks_locked").and_then(Value::as_bool)).collect();
+    let clocks_locked: Option<i64> = (!lock_states.is_empty()).then(|| i64::from(lock_states.iter().all(|&l| l)));
     let mut con = connect(db)?;
     let tx = con.transaction()?;
     let run_id = run_id.unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string()[..12].to_string());
@@ -409,7 +417,7 @@ pub fn cmd_ingest_microbench(
         params![
             run_id, sql(Some(&device_id)), sql(Some(get(first, "sm_arch")?)), sql(first.get("device")),
             sql(first.get("cuda_runtime")), sql(first.get("cuda_driver")), git_sha(), power_mode(),
-            SqlValue::Null, gpu_temp_c(), sql(manifest.get("measured_d2d_bw_gbps")), started_at,
+            clocks_locked, gpu_temp_c(), sql(manifest.get("measured_d2d_bw_gbps")), started_at,
             idle.pct, idle.source, idle.allow_busy as i64,
         ],
     )?;
@@ -417,8 +425,18 @@ pub fn cmd_ingest_microbench(
     for r in &rows {
         let probe = get(r, "probe")?.as_str().unwrap_or_default().to_string();
         tx.execute(
-            "INSERT INTO microbench (run_id, probe, param_json, value, unit) VALUES (?,?,?,?,?)",
-            params![run_id, probe, dumps_sorted(get(r, "param")?), sql(Some(get(r, "value")?)), sql(Some(get(r, "unit")?))],
+            "INSERT INTO microbench (run_id, probe, param_json, value, unit, sm_clock_mhz, clocks_locked, clock_lock) \
+             VALUES (?,?,?,?,?,?,?,?)",
+            params![
+                run_id,
+                probe,
+                dumps_sorted(get(r, "param")?),
+                sql(Some(get(r, "value")?)),
+                sql(Some(get(r, "unit")?)),
+                r.get("sm_clock_mhz").and_then(Value::as_f64),
+                r.get("clocks_locked").and_then(Value::as_bool).map(i64::from),
+                r.get("clock_lock").and_then(Value::as_str),
+            ],
         )?;
         if !probes.contains(&probe) {
             probes.push(probe);
@@ -1087,6 +1105,41 @@ mod tests {
         // Only replaced rows left: the newest replaced run is the fallback.
         con.execute("UPDATE microbench SET status = 'replaced', replaced_by = 'b' WHERE run_id = 'a'", []).unwrap();
         assert_eq!(current_run(&con, 121, "p").unwrap().as_deref(), Some("a"));
+        drop(con);
+        std::fs::remove_file(&db).ok();
+    }
+
+    /// Latency rows keep cycles plus the clock they were measured at and the
+    /// lock state; the run records whether every latency row was locked; the
+    /// viewer derives ns at read time.
+    #[test]
+    fn ingest_microbench_stores_clock_and_lock() {
+        let db = tmp("clk.db");
+        let _ = std::fs::remove_file(&db);
+        let f = tmp("clk.jsonl");
+        std::fs::write(
+            &f,
+            concat!(
+                r#"{"probe":"ptr_chase_latency","param":{"stat":"median"},"value":335.0,"unit":"cycles","sm_arch":121,"sm_clock_mhz":2407.0,"clocks_locked":false,"clock_lock":"lock requested at 2418 MHz via NVML: Insufficient Permissions"}"#,
+                "\n",
+                r#"{"probe":"dram_bandwidth","param":{},"value":236.0,"unit":"GB/s","sm_arch":121}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        cmd_ingest_microbench(&db, &f, None, Some("c".into()), &RunIdle::default()).unwrap();
+        std::fs::remove_file(&f).ok();
+        let con = connect_ro(&db).unwrap();
+        let rows = crate::view::microbench(&con, 121).unwrap();
+        let lat = rows.iter().find(|r| r.probe == "ptr_chase_latency").unwrap();
+        assert_eq!((lat.sm_clock_mhz, lat.clocks_locked), (Some(2407.0), Some(false)));
+        assert!(lat.clock_lock.as_deref().unwrap().contains("Insufficient Permissions"));
+        assert!((lat.ns().unwrap() - 335.0 / 2407.0 * 1e3).abs() < 1e-9);
+        let bw = rows.iter().find(|r| r.probe == "dram_bandwidth").unwrap();
+        assert_eq!((bw.sm_clock_mhz, bw.clocks_locked, bw.ns()), (None, None, None));
+        let run_locked: Option<i64> =
+            con.query_row("SELECT clocks_locked FROM runs WHERE run_id = 'c'", [], |r| r.get(0)).unwrap();
+        assert_eq!(run_locked, Some(0));
         drop(con);
         std::fs::remove_file(&db).ok();
     }

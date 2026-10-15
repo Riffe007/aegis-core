@@ -78,7 +78,13 @@ CREATE TABLE IF NOT EXISTS microbench (
   -- history). invalidated: known bad; status_reason says why (required).
   status TEXT NOT NULL DEFAULT 'valid' CHECK (status IN ('valid', 'replaced', 'invalidated')),
   status_reason TEXT CHECK (status <> 'invalidated' OR length(trim(coalesce(status_reason, ''))) > 0),
-  replaced_by TEXT                        -- replaced: run_id of the newer run
+  replaced_by TEXT,                       -- replaced: run_id of the newer run
+  -- Latency probes (clock_lock.cuh): the SM clock the value was measured at,
+  -- whether clocks were locked, and what was requested / happened. NULL on
+  -- rows from before the clock-locking probes and on non-latency rows.
+  sm_clock_mhz REAL,
+  clocks_locked INTEGER,
+  clock_lock TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_micro_probe ON microbench(probe);
 -- Paired tie tests (aegis_tune, protocol v2): `pairs` alternating windows of

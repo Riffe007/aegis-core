@@ -18,25 +18,22 @@
   "device": "NVIDIA GB10",
   "dram_latency": {
     "clock_spread_pct": 0.0,
-    "combine": "clocks within 2%: cycles and measured ns both combined",
+    "clocks_locked": false,
+    "combine": "source-run clocks within 2%",
     "cycles": 956.6305,
     "cycles_max": 964.767,
     "cycles_min": 952.092,
-    "method": "dependent-load pointer chase, one thread, 128 B node stride, median of 5 repeats per point; cycles = median across points and runs; ns_at_ref = cycles / ref_clock_mhz, ref = the highest source-run SM clock",
-    "ns_at_ref": 397.4731799333549,
-    "ns_measured": {
-      "max": 400.853,
-      "median": 397.47249999999997,
-      "min": 395.587
-    },
+    "method": "dependent-load pointer chase, one thread, 128 B node stride, median of 5 repeats per point; cycles = median across points and runs; ns are derived by readers (cycles / clock)",
     "points": 10,
     "probe": "ptr_chase_latency",
     "ref_clock_mhz": 2406.78,
+    "ref_clock_rule": "the highest source-run SM clock (clocks not locked in every source run)",
     "runs": [
       {
+        "clock_lock": null,
+        "clocks_locked": null,
         "cycles": 956.6305,
         "layout": "both",
-        "ns": 397.47249999999997,
         "points": 10,
         "run_id": "a825f4e557a3",
         "sm_clock_mhz": 2406.78
@@ -44,29 +41,26 @@
     ],
     "working_sets": ">= 32 MiB"
   },
-  "generated_by": "aegis-perf emit-arch on spark-5822, 2026-10-15 00:30 UTC",
+  "generated_by": "aegis-perf emit-arch on spark-5822, 2026-10-15 00:54 UTC",
   "l2_bytes": 25165824,
   "l2_latency": {
     "clock_spread_pct": 0.0,
-    "combine": "clocks within 2%: cycles and measured ns both combined",
+    "clocks_locked": false,
+    "combine": "source-run clocks within 2%",
     "cycles": 335.437,
     "cycles_max": 335.448,
     "cycles_min": 335.379,
-    "method": "dependent-load pointer chase, one thread, 128 B node stride, median of 5 repeats per point; cycles = median across points and runs; ns_at_ref = cycles / ref_clock_mhz, ref = the highest source-run SM clock",
-    "ns_at_ref": 139.3716916377899,
-    "ns_measured": {
-      "max": 139.376,
-      "median": 139.37150000000003,
-      "min": 139.347
-    },
+    "method": "dependent-load pointer chase, one thread, 128 B node stride, median of 5 repeats per point; cycles = median across points and runs; ns are derived by readers (cycles / clock)",
     "points": 12,
     "probe": "ptr_chase_latency",
     "ref_clock_mhz": 2406.78,
+    "ref_clock_rule": "the highest source-run SM clock (clocks not locked in every source run)",
     "runs": [
       {
+        "clock_lock": null,
+        "clocks_locked": null,
         "cycles": 335.437,
         "layout": "both",
-        "ns": 139.37150000000003,
         "points": 12,
         "run_id": "a825f4e557a3",
         "sm_clock_mhz": 2406.78
@@ -106,7 +100,7 @@
     "value": 257.841
   },
   "roof_rule": "memory roof: read_bw_gbps for GEMV and decode shapes (M <= 16), copy_bw_gbps elsewhere",
-  "schema": "aegis-arch-params/2",
+  "schema": "aegis-arch-params/3",
   "sm_arch": 121,
   "sm_count": 48
 }

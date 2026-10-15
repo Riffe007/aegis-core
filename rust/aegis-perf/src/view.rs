@@ -391,6 +391,21 @@ pub struct Microbench {
     pub status: MicrobenchStatus,
     /// Replaced: the run_id of the newer run of the same probe.
     pub replaced_by: Option<String>,
+    /// Latency rows: SM clock at measurement, whether clocks were locked, and
+    /// what the probe requested; None on older rows and non-latency probes.
+    pub sm_clock_mhz: Option<f64>,
+    pub clocks_locked: Option<bool>,
+    pub clock_lock: Option<String>,
+}
+
+impl Microbench {
+    /// A cycles row in ns at the clock it was measured at (derived, never stored).
+    pub fn ns(&self) -> Option<f64> {
+        match (self.unit.as_str(), self.value, self.sm_clock_mhz) {
+            ("cycles", Some(c), Some(mhz)) if mhz > 0.0 => Some(c / mhz * 1e3),
+            _ => None,
+        }
+    }
 }
 
 /// A microbench row's status. Invalidated rows (known bad) are never returned.
@@ -407,7 +422,8 @@ pub enum MicrobenchStatus {
 /// The hardware model uses the newest valid run per probe (db::current_run).
 pub fn microbench(con: &Connection, arch: i64) -> Result<Vec<Microbench>> {
     let mut stmt = con.prepare(
-        "SELECT m.run_id, m.probe, m.param_json, m.value, m.unit, m.status, m.replaced_by \
+        "SELECT m.run_id, m.probe, m.param_json, m.value, m.unit, m.status, m.replaced_by, \
+                m.sm_clock_mhz, m.clocks_locked, m.clock_lock \
          FROM microbench m JOIN runs r USING(run_id) \
          WHERE r.sm_arch = ?1 AND m.status <> 'invalidated' ORDER BY r.started_at, m.rowid",
     )?;
@@ -422,6 +438,9 @@ pub fn microbench(con: &Connection, arch: i64) -> Result<Vec<Microbench>> {
                 unit: r.get(4)?,
                 status: if status == "replaced" { MicrobenchStatus::Replaced } else { MicrobenchStatus::Valid },
                 replaced_by: r.get(6)?,
+                sm_clock_mhz: r.get(7)?,
+                clocks_locked: r.get::<_, Option<i64>>(8)?.map(|l| l != 0),
+                clock_lock: r.get(9)?,
             })
         })?
         .collect::<rusqlite::Result<_>>()?;

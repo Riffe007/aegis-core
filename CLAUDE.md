@@ -121,7 +121,12 @@ docs/               LOG.md (dated run log), analysis/ (consolidated analyses, e.
    model comes from the perf DB (`microbench` table or `aegis_manifest`), on
    the same device. Datasheet figures may appear only as labeled context. A
    probe's number counts only if its SASS proof passed (run_all.sh exits 0);
-   if a probe changes, rerun it before reusing its numbers.
+   if a probe changes, rerun it before reusing its numbers. Latencies are
+   stored in cycles with the SM clock they were measured at and whether
+   clocks were locked (latency probes request locked clocks,
+   `microbench/clock_lock.cuh`); `arch/*.json` stores cycles and clocks, and
+   aegis-perf derives ns at read time. Locked-clock pointer-chase run:
+   `sudo nvidia-smi -lgc F,F; microbench/run_latency_locked.sh F; sudo nvidia-smi -rgc`.
 9. **No Python in AEGIS Core.** Kernels and runtime: C++20/CUDA/PTX. ABI: C11.
    CPU kernels: AArch64 asm/intrinsics. Tooling: Rust. The pre-commit hook
    refuses any `*.py` file. Kernel ids keep their canonical config

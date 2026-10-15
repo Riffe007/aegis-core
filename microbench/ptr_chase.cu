@@ -16,10 +16,13 @@
 //
 // Timed loop: 16 dependent LDGs per iteration.
 // Output: probe "ptr_chase_latency", param {working_set_bytes, variant, stat,
-// repeats}: ns for median/p10/p90, cycles for the median.
+// repeats}: cycles for median / p10 / p90, each row with the SM clock it was
+// measured at and whether clocks were locked (clock_lock.cuh). ns are derived
+// at read time (aegis-perf), never stored.
 #include <numeric>
 #include <random>
 
+#include "clock_lock.cuh"
 #include "common.cuh"
 
 namespace {
@@ -89,7 +92,9 @@ double percentile(std::vector<double> v, double p) {
 int main() {
   const mb::Device dev = mb::device();
   mb::prove("mb_ptr_chase", {{"LDG", kUnroll}});
-  const double mhz = mb::sm_clock_mhz();
+  mb::ClockLock clk;  // request locked clocks; recorded on every row
+  struct Row { std::string head; double med, p10, p90; };
+  std::vector<Row> out;
 
   unsigned long long* sink;
   long long* dcycles;
@@ -126,13 +131,15 @@ int main() {
       MB_CHECK(aegis::budget::gpu_free(buf));
       const std::string head = "{\"working_set_bytes\":" + std::to_string(ws) + ",\"variant\":\"" +
                                variant + "\",\"repeats\":" + std::to_string(kRepeats) + ",\"stat\":";
-      const double med = percentile(cyc, 0.5);
-      mb::emit(dev, "ptr_chase_latency", head + "\"median\"}", med, "cycles");
-      mb::emit(dev, "ptr_chase_latency", head + "\"median\"}", med / mhz * 1e3, "ns");
-      mb::emit(dev, "ptr_chase_latency", head + "\"p10\"}", percentile(cyc, 0.1) / mhz * 1e3, "ns");
-      mb::emit(dev, "ptr_chase_latency", head + "\"p90\"}", percentile(cyc, 0.9) / mhz * 1e3, "ns");
+      out.push_back({head, percentile(cyc, 0.5), percentile(cyc, 0.1), percentile(cyc, 0.9)});
     }
   }
-  mb::emit(dev, "sm_clock", "{}", mhz, "MHz");
+  clk.finish();
+  for (const Row& r : out) {
+    mb::emit_clocked(dev, "ptr_chase_latency", r.head + "\"median\"}", r.med, "cycles", clk);
+    mb::emit_clocked(dev, "ptr_chase_latency", r.head + "\"p10\"}", r.p10, "cycles", clk);
+    mb::emit_clocked(dev, "ptr_chase_latency", r.head + "\"p90\"}", r.p90, "cycles", clk);
+  }
+  mb::emit_clocked(dev, "sm_clock", "{}", clk.mhz(), "MHz", clk);
   return 0;
 }

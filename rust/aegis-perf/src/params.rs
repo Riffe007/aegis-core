@@ -22,18 +22,21 @@ pub struct ArchParams {
     pub copy_bw_gbps: f64,
     pub read_bw_gbps: f64,
     pub peak_tflops: f64,
-    /// Pointer-chase latencies (schema aegis-arch-params/2); None in older files.
+    /// Pointer-chase latencies (schema aegis-arch-params/2 and later); None in older files.
     pub l2_latency: Option<Latency>,
     pub dram_latency: Option<Latency>,
 }
 
-/// A latency in SM cycles (clock-invariant, the primary value), with the
-/// reference clock its derived ns were stated at.
+/// A latency in SM cycles (clock-invariant; the arch file stores only cycles)
+/// and the clock to state it at. ns are derived here, at read time.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Latency {
     pub cycles: f64,
+    /// The arch file's reference clock: the locked clock if every source run
+    /// was locked, else the highest source-run clock.
     pub ref_clock_mhz: f64,
-    pub ns_at_ref: f64,
+    /// Every source run measured at locked clocks.
+    pub clocks_locked: bool,
 }
 
 impl Latency {
@@ -42,11 +45,16 @@ impl Latency {
         self.cycles / mhz * 1e3
     }
 
+    /// The latency in ns at the reference clock.
+    pub fn ns(&self) -> f64 {
+        self.ns_at(self.ref_clock_mhz)
+    }
+
     fn parse(v: &Value) -> Option<Latency> {
         Some(Latency {
             cycles: v["cycles"].as_f64()?,
             ref_clock_mhz: v["ref_clock_mhz"].as_f64()?,
-            ns_at_ref: v["ns_at_ref"].as_f64()?,
+            clocks_locked: v["clocks_locked"].as_bool().unwrap_or(false),
         })
     }
 }
@@ -147,13 +155,14 @@ mod tests {
             run_id: "r".into(),
             layout: None,
             sm_clock_mhz: 2407.0,
+            clocks_locked: Some(true),
+            clock_lock: Some("locked at 2407 MHz".into()),
             cycles: vec![335.0],
-            ns: vec![139.2],
         }];
         let mut l2 = latency_value(&runs, "x");
         l2["probe"] = serde_json::json!("ptr_chase_latency");
         let doc = serde_json::json!({
-            "schema": "aegis-arch-params/2",
+            "schema": "aegis-arch-params/3",
             "copy_bw_gbps": {"value": 236.7}, "read_bw_gbps": {"value": 257.8},
             "mma_peak": {"tflops": 125.6}, "l2_latency": l2,
         });
@@ -166,7 +175,8 @@ mod tests {
         let l = p.l2_latency.expect("l2 latency");
         assert_eq!(l.cycles, 335.0);
         assert_eq!(l.ref_clock_mhz, 2407.0);
-        assert!((l.ns_at_ref - 335.0 / 2407.0 * 1e3).abs() < 1e-9);
+        assert!(l.clocks_locked);
+        assert!((l.ns() - 335.0 / 2407.0 * 1e3).abs() < 1e-9, "ns derived at read time");
         assert!((l.ns_at(2557.0) - 131.01).abs() < 0.01);
         assert!(p.dram_latency.is_none(), "missing entry -> None");
     }
