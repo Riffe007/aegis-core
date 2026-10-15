@@ -2,9 +2,13 @@
 //! (include/aegis/arch/sm_<arch>.json) for the cost model. Every number comes
 //! from the perf DB (CLAUDE.md rule 8); each carries its source runs.
 //!
-//! - L2 / DRAM latency: ptr_chase_latency medians (ns and cycles) over the
-//!   L2-resident working sets (256 KiB..8 MiB) and the DRAM ones (>= 32 MiB),
-//!   from the selected (run, layout) pairs; the median across them.
+//! - L2 / DRAM latency: ptr_chase_latency medians over the L2-resident working
+//!   sets (256 KiB..8 MiB) and the DRAM ones (>= 32 MiB), from non-superseded
+//!   rows of the selected (run, layout) pairs. **Cycles are the primary value**
+//!   (clock-invariant); each source run's SM clock (sm_clock probe) is recorded,
+//!   and ns appears only derived, at a stated reference clock. When the runs'
+//!   clocks agree within CLOCK_TOLERANCE the measured ns are summarized too;
+//!   when they differ by more, measured ns are not averaged across runs.
 //! - DRAM bandwidth: the latest dram_bandwidth medians, copy (memcpy D2D) and
 //!   read (read-only 128-bit stream).
 //! - MMA peak: the highest current mma_throughput row (TFLOPS, HMMA/clk/SM).
@@ -19,6 +23,9 @@ use crate::db;
 const KIB: i64 = 1024;
 const L2_SETS: (i64, i64) = (256 * KIB, 8 * 1024 * KIB);
 const DRAM_MIN_SET: i64 = 32 * 1024 * KIB;
+/// Source runs whose SM clocks differ by more than this (max / min - 1) are
+/// combined in cycles only.
+pub const CLOCK_TOLERANCE: f64 = 0.02;
 
 fn median(mut v: Vec<f64>) -> Option<f64> {
     if v.is_empty() {
@@ -39,43 +46,105 @@ fn parse_selection(sel: &[String]) -> Vec<(String, Option<String>)> {
         .collect()
 }
 
-/// Pointer-chase medians for the selected runs, in `unit`, with the working
-/// set inside [lo, hi].
-fn chase(con: &Connection, arch: i64, sel: &[(String, Option<String>)], unit: &str, lo: i64, hi: i64) -> Result<Vec<f64>> {
-    let mut out = Vec::new();
-    for (run, variant) in sel {
-        let mut stmt = con.prepare(
-            "SELECT m.value FROM microbench m JOIN runs r USING(run_id) \
-             WHERE m.run_id = ?1 AND r.sm_arch = ?2 AND m.probe = 'ptr_chase_latency' AND m.unit = ?3 \
-               AND json_extract(m.param_json, '$.stat') = 'median' \
-               AND (?4 IS NULL OR json_extract(m.param_json, '$.variant') = ?4) \
-               AND json_extract(m.param_json, '$.working_set_bytes') BETWEEN ?5 AND ?6",
-        )?;
-        let vals: Vec<f64> = stmt
-            .query_map(params![run, arch, unit, variant, lo, hi], |r| r.get(0))?
-            .collect::<rusqlite::Result<_>>()?;
-        if vals.is_empty() {
-            bail!("no ptr_chase_latency rows for run {run} ({}) on sm_{arch}", variant.as_deref().unwrap_or("both layouts"));
-        }
-        out.extend(vals);
-    }
-    Ok(out)
+/// One source run's pointer-chase points inside one working-set range.
+#[derive(Clone, Debug)]
+pub struct RunPoints {
+    pub run_id: String,
+    pub layout: Option<String>,
+    pub sm_clock_mhz: f64,
+    pub cycles: Vec<f64>,
+    pub ns: Vec<f64>,
 }
 
-fn latency(con: &Connection, arch: i64, sel: &[(String, Option<String>)], lo: i64, hi: i64, sets: &str) -> Result<Value> {
-    let ns = chase(con, arch, sel, "ns", lo, hi)?;
-    let cycles = chase(con, arch, sel, "cycles", lo, hi)?;
-    let (min, max) = ns.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), &x| (a.min(x), b.max(x)));
-    Ok(json!({
-        "ns": median(ns.clone()),
-        "cycles": median(cycles),
-        "ns_min": min,
-        "ns_max": max,
-        "points": ns.len(),
+/// Non-superseded pointer-chase medians of one (run, layout) in `unit`, with
+/// the working set inside [lo, hi].
+fn chase(con: &Connection, arch: i64, run: &str, variant: Option<&str>, unit: &str, lo: i64, hi: i64) -> Result<Vec<f64>> {
+    let mut stmt = con.prepare(
+        "SELECT m.value FROM microbench m JOIN runs r USING(run_id) \
+         WHERE m.run_id = ?1 AND r.sm_arch = ?2 AND m.probe = 'ptr_chase_latency' AND m.unit = ?3 \
+           AND m.superseded = 0 \
+           AND json_extract(m.param_json, '$.stat') = 'median' \
+           AND (?4 IS NULL OR json_extract(m.param_json, '$.variant') = ?4) \
+           AND json_extract(m.param_json, '$.working_set_bytes') BETWEEN ?5 AND ?6",
+    )?;
+    let vals: Vec<f64> = stmt
+        .query_map(params![run, arch, unit, variant, lo, hi], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    if vals.is_empty() {
+        bail!(
+            "no current (non-superseded) ptr_chase_latency rows for run {run} ({}) on sm_{arch}",
+            variant.unwrap_or("both layouts")
+        );
+    }
+    Ok(vals)
+}
+
+fn run_points(con: &Connection, arch: i64, sel: &[(String, Option<String>)], lo: i64, hi: i64) -> Result<Vec<RunPoints>> {
+    sel.iter()
+        .map(|(run, variant)| {
+            let mhz: f64 = con
+                .query_row("SELECT value FROM microbench WHERE run_id = ? AND probe = 'sm_clock'", [run], |x| x.get(0))
+                .with_context(|| format!("run {run} has no sm_clock row: latencies cannot be tied to a clock"))?;
+            Ok(RunPoints {
+                run_id: run.clone(),
+                layout: variant.clone(),
+                sm_clock_mhz: mhz,
+                cycles: chase(con, arch, run, variant.as_deref(), "cycles", lo, hi)?,
+                ns: chase(con, arch, run, variant.as_deref(), "ns", lo, hi)?,
+            })
+        })
+        .collect()
+}
+
+/// The latency entry from per-run points. Primary value: the median of the
+/// cycle points across runs. Reference clock: the highest source-run clock
+/// (the least-throttled run); ns_at_ref = cycles / ref MHz. Clocks within
+/// CLOCK_TOLERANCE: measured ns are summarized as well ("ns_measured");
+/// otherwise they are not combined (each run keeps its own median ns).
+pub fn latency_value(runs: &[RunPoints], sets: &str) -> Value {
+    let cycles: Vec<f64> = runs.iter().flat_map(|r| r.cycles.iter().copied()).collect();
+    let (cmin, cmax) = cycles.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), &x| (a.min(x), b.max(x)));
+    let cyc = median(cycles.clone());
+    let (fmin, fmax) = runs.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), r| {
+        (a.min(r.sm_clock_mhz), b.max(r.sm_clock_mhz))
+    });
+    let spread = if fmin > 0.0 { fmax / fmin - 1.0 } else { f64::INFINITY };
+    let consistent = spread <= CLOCK_TOLERANCE;
+    let ns_measured = if consistent {
+        let ns: Vec<f64> = runs.iter().flat_map(|r| r.ns.iter().copied()).collect();
+        let (lo, hi) = ns.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), &x| (a.min(x), b.max(x)));
+        json!({"median": median(ns), "min": lo, "max": hi})
+    } else {
+        Value::Null
+    };
+    json!({
+        "cycles": cyc,
+        "cycles_min": cmin,
+        "cycles_max": cmax,
+        "ref_clock_mhz": fmax,
+        "ns_at_ref": cyc.map(|c| c / fmax * 1e3),
+        "ns_measured": ns_measured,
+        "clock_spread_pct": spread * 100.0,
+        "combine": if consistent {
+            format!("clocks within {:.0}%: cycles and measured ns both combined", CLOCK_TOLERANCE * 100.0)
+        } else {
+            format!("clocks differ by {:.1}% (> {:.0}%): combined in cycles only; measured ns per run",
+                    spread * 100.0, CLOCK_TOLERANCE * 100.0)
+        },
+        "points": cycles.len(),
         "working_sets": sets,
         "method": "dependent-load pointer chase, one thread, 128 B node stride, median of 5 repeats per point; \
-                   the value is the median across points and runs",
-    }))
+                   cycles = median across points and runs; ns_at_ref = cycles / ref_clock_mhz, ref = the highest \
+                   source-run SM clock",
+        "runs": runs.iter().map(|r| json!({
+            "run_id": r.run_id,
+            "layout": r.layout.as_deref().unwrap_or("both"),
+            "sm_clock_mhz": r.sm_clock_mhz,
+            "cycles": median(r.cycles.clone()),
+            "ns": median(r.ns.clone()),
+            "points": r.cycles.len(),
+        })).collect::<Vec<_>>(),
+    })
 }
 
 pub fn cmd_emit_arch(db_path: &Path, arch: i64, ptr_chase: &[String], results: &Path, out: Option<&Path>) -> Result<()> {
@@ -95,17 +164,8 @@ pub fn cmd_emit_arch(db_path: &Path, arch: i64, ptr_chase: &[String], results: &
     if sel.is_empty() {
         bail!("no ptr_chase_latency runs for sm_{arch}");
     }
-    let l2 = latency(&con, arch, &sel, L2_SETS.0, L2_SETS.1, "256 KiB - 8 MiB")?;
-    let dram = latency(&con, arch, &sel, DRAM_MIN_SET, i64::MAX, ">= 32 MiB")?;
-    let clocks: Vec<Value> = sel
-        .iter()
-        .map(|(r, _)| {
-            let mhz: Option<f64> = con
-                .query_row("SELECT value FROM microbench WHERE run_id = ? AND probe = 'sm_clock'", [r], |x| x.get(0))
-                .ok();
-            json!({"run_id": r, "sm_clock_mhz": mhz})
-        })
-        .collect();
+    let l2 = latency_value(&run_points(&con, arch, &sel, L2_SETS.0, L2_SETS.1)?, "256 KiB - 8 MiB");
+    let dram = latency_value(&run_points(&con, arch, &sel, DRAM_MIN_SET, i64::MAX)?, ">= 32 MiB");
 
     // DRAM bandwidth, per stream: the latest current median and its reps.
     let bandwidth = |method: &str, desc: &str| -> Result<Value> {
@@ -166,7 +226,7 @@ pub fn cmd_emit_arch(db_path: &Path, arch: i64, ptr_chase: &[String], results: &
         .unwrap_or(Value::Null);
 
     let doc = json!({
-        "schema": "aegis-arch-params/1",
+        "schema": "aegis-arch-params/2",
         "sm_arch": arch,
         "device": manifest.get("gpu_name"),
         "sm_count": manifest.get("sm_count"),
@@ -175,8 +235,8 @@ pub fn cmd_emit_arch(db_path: &Path, arch: i64, ptr_chase: &[String], results: &
                                 chrono::Utc::now().format("%Y-%m-%d %H:%M UTC")),
         "note": "Measured on this device (CLAUDE.md rule 8). Regenerate with aegis-perf emit-arch after re-running \
                  the probes; do not edit by hand.",
-        "l2_latency": { "value": l2, "source": {"probe": "ptr_chase_latency", "runs": sel_json(&sel), "clocks": clocks} },
-        "dram_latency": { "value": dram, "source": {"probe": "ptr_chase_latency", "runs": sel_json(&sel)} },
+        "l2_latency": with_probe(l2),
+        "dram_latency": with_probe(dram),
         "copy_bw_gbps": copy_bw,
         "read_bw_gbps": read_bw,
         "roof_rule": "memory roof: read_bw_gbps for GEMV and decode shapes (M <= 16), copy_bw_gbps elsewhere",
@@ -197,10 +257,45 @@ pub fn cmd_emit_arch(db_path: &Path, arch: i64, ptr_chase: &[String], results: &
     Ok(())
 }
 
-fn sel_json(sel: &[(String, Option<String>)]) -> Value {
-    Value::Array(
-        sel.iter()
-            .map(|(r, v)| json!({"run_id": r, "layout": v.as_deref().unwrap_or("both")}))
-            .collect(),
-    )
+fn with_probe(mut v: Value) -> Value {
+    v["probe"] = json!("ptr_chase_latency");
+    v
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run(id: &str, mhz: f64, cycles: &[f64]) -> RunPoints {
+        RunPoints {
+            run_id: id.into(),
+            layout: None,
+            sm_clock_mhz: mhz,
+            cycles: cycles.to_vec(),
+            ns: cycles.iter().map(|c| c / mhz * 1e3).collect(),
+        }
+    }
+
+    #[test]
+    fn clocks_within_tolerance_combine_ns_too() {
+        let v = latency_value(&[run("a", 2557.0, &[338.0, 340.0]), run("b", 2540.0, &[336.0])], "x");
+        assert_eq!(v["cycles"].as_f64(), Some(338.0));
+        assert_eq!(v["ref_clock_mhz"].as_f64(), Some(2557.0));
+        assert!((v["ns_at_ref"].as_f64().unwrap() - 338.0 / 2557.0 * 1e3).abs() < 1e-9);
+        assert!(v["ns_measured"]["median"].as_f64().is_some());
+        assert_eq!(v["runs"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn clocks_beyond_tolerance_use_cycles_only() {
+        // 2557 vs 2407 MHz: 6.2% apart. Same cycles, different ns.
+        let v = latency_value(&[run("fast", 2557.0, &[338.0, 338.0]), run("slow", 2407.0, &[335.0])], "x");
+        assert!(v["ns_measured"].is_null(), "ns must not be averaged across clocks");
+        assert_eq!(v["cycles"].as_f64(), Some(338.0));
+        assert_eq!(v["ref_clock_mhz"].as_f64(), Some(2557.0));
+        assert!(v["clock_spread_pct"].as_f64().unwrap() > 6.0);
+        let runs = v["runs"].as_array().unwrap();
+        assert_eq!(runs[1]["sm_clock_mhz"].as_f64(), Some(2407.0));
+        assert!(runs[1]["ns"].as_f64().unwrap() > runs[0]["ns"].as_f64().unwrap());
+    }
 }
