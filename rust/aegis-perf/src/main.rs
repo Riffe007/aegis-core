@@ -149,6 +149,12 @@ enum Cmd {
         /// Run even if the idle guard finds the GPU busy (> 2% utilization); the result is marked.
         #[arg(long)]
         allow_busy: bool,
+        /// Commit of build A (default: HEAD of the git tree containing it, -dirty if modified).
+        #[arg(long)]
+        sha_a: Option<String>,
+        /// Commit of build B (same default).
+        #[arg(long)]
+        sha_b: Option<String>,
     },
     /// Measured machine parameters (L2/DRAM latency, DRAM bandwidth, mma peak)
     /// -> include/aegis/arch/sm_<arch>.json, for the cost model.
@@ -222,7 +228,9 @@ fn main() -> Result<()> {
         Cmd::EmitHeader { arch, out, results_dir } => {
             tune::cmd_emit_header(&cli.db, arch, &results_dir, out.as_deref())
         }
-        Cmd::PairedAb { a, b, impl_, impl_b, shape, pairs, reps, cache, allow_busy } => ab::cmd_paired_ab(&ab::AbArgs {
+        Cmd::PairedAb { a, b, impl_, impl_b, shape, pairs, reps, cache, allow_busy, sha_a, sha_b } => {
+            ab::cmd_paired_ab(&ab::AbArgs {
+            db: &cli.db,
             a: &a,
             b: &b,
             impl_a: &impl_,
@@ -232,7 +240,10 @@ fn main() -> Result<()> {
             reps,
             cache: &cache,
             allow_busy,
-        }),
+            sha_a: sha_a.as_deref(),
+            sha_b: sha_b.as_deref(),
+            })
+        }
         Cmd::EmitArch { arch, ptr_chase, out, results_dir } => {
             arch::cmd_emit_arch(&cli.db, arch, &ptr_chase, &results_dir, out.as_deref())
         }

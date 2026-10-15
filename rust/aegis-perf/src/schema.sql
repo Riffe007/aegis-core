@@ -110,3 +110,27 @@ CREATE TABLE IF NOT EXISTS paired (
   allow_busy INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_paired_shape ON paired(run_id, m, n, k);
+-- paired-ab results (aegis-perf paired-ab): the same impl (or two impls) from
+-- two builds, alternating processes; ratio = median of per-pair B/A medians,
+-- 95% percentile-bootstrap CI. sha_a / sha_b: the git commit of each build's
+-- tree (suffix -dirty: uncommitted tracked changes; NULL: unknown). shape:
+-- "MxNxK". idle_reading: the idle guard's mean GPU utilization (%) before the
+-- run, NULL if unreadable. clocks_locked: paired-ab does not lock clocks (0).
+CREATE TABLE IF NOT EXISTS paired_results (
+  id INTEGER PRIMARY KEY,
+  sha_a TEXT,
+  sha_b TEXT,
+  shape TEXT NOT NULL,
+  impl_a TEXT NOT NULL,
+  impl_b TEXT NOT NULL,
+  ratio REAL NOT NULL,
+  ci_lo REAL NOT NULL,
+  ci_hi REAL NOT NULL,
+  n INTEGER NOT NULL,
+  protocol_version INTEGER NOT NULL,
+  cache_mode TEXT NOT NULL,
+  idle_reading REAL,
+  clocks_locked INTEGER NOT NULL DEFAULT 0,
+  started_at TEXT NOT NULL,
+  finished_at TEXT NOT NULL
+);

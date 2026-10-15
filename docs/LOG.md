@@ -1062,6 +1062,9 @@ before issuing step s's MMAs (tier 4 only; on tier 3 it spilled
 - **Paired vs. the Phase A build** (alternating processes, 30 pairs, cold;
   idle guard read 2.9% before the run): 4096³ B/A 0.999 [0.983, 1.016] (tie);
   2048³ (`mma_pipe_128x128x32_2x4_s2`) B/A 1.007 [1.002, 1.014] (0.7% slower).
+  **SUSPECT** (marked 2026-10-15): the idle reading, 2.9%, was above the 2%
+  threshold, and paired-ab had no blocking guard then, so the run went ahead
+  on a busy GPU. These ratios are not evidence; see "Phase B a re-run" below.
 - **Verdict:** no NOP reduction, more registers, no speedup -> reverted (kernel
   SASS identical to Phase A again). The NOPs between back-to-back HMMAs need
   either more independent work per k-step (larger k-steps, or moving global
@@ -1210,3 +1213,35 @@ runs any tuned winner and falls back to plain cuBLAS only for untuned shapes.
   73–75%.
 - e. **Power-controls probe** (deferred). Needs a passwordless sudoers entry
   for `nvidia-smi` and `cpupower`, which is not in place.
+
+## 2026-10-15 — Phase B a re-run (prepared; not run: GPU busy)
+
+The Phase B a paired-ab result (commit 4220a8c) is marked **suspect**: the
+idle guard read 2.9% before it (limit 2%), and paired-ab had no blocking
+guard then. paired-ab now has one and stores every result in the perf DB
+(`paired_results`). The re-run is prepared but not run: the guard read 3.0%
+(max 6%, GPU in P0) with Xorg, gnome-shell and Firefox on the GPU and the
+remote-desktop daemon up.
+
+Builds, in the worktree `~/Documents/projects/aegis-phaseBa-rerun` (detached
+at b0bedd5, the Phase A kernel code the original A/B used):
+- A, `bin-A/bench_gemm`: unmodified. Its `mma_pipe_128x256x32_2x4_s3`
+  instruction stream is identical to the saved Phase A binary
+  (`aegis-phaseA-bin/bench_gemm`): 192 HMMA, 171 NOP, 188 registers.
+- B, `build/bench_gemm`: the fragment double-buffering patch, recovered
+  verbatim from the session that ran it (`phaseBa-dbuf.patch` in the worktree):
+  192 HMMA, 171 NOP, 206 registers, the same as the original B.
+
+Command (from the Core repo root, idle GPU, remote desktop off):
+
+    W=~/Documents/projects/aegis-phaseBa-rerun
+    rust/target/release/aegis-perf paired-ab --a $W/bin-A/bench_gemm --b $W/build/bench_gemm \
+      --impl mma_pipe_128x256x32_2x4_s3 --shape 4096 4096 4096 --pairs 30 --reps 10 \
+      --sha-a b0bedd58fbf9 --sha-b b0bedd58fbf9-dirty
+    rust/target/release/aegis-perf paired-ab --a $W/bin-A/bench_gemm --b $W/build/bench_gemm \
+      --impl mma_pipe_128x128x32_2x4_s2 --shape 2048 2048 2048 --pairs 30 --reps 20 \
+      --sha-a b0bedd58fbf9 --sha-b b0bedd58fbf9-dirty
+
+(`-dirty` = b0bedd5 plus `phaseBa-dbuf.patch`.) The double-buffering verdict
+(no NOP reduction, +18 registers) rests on SASS and stands; only the timing
+ratios await the re-run.

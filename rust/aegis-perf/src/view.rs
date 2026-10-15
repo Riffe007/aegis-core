@@ -447,6 +447,93 @@ pub fn microbench(con: &Connection, arch: i64) -> Result<Vec<Microbench>> {
     Ok(rows)
 }
 
+/// One stored paired-ab result (`paired_results` table): build B vs build A on
+/// one shape. ratio = median per-pair B/A time; tied when the CI contains 1.0.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PairedResult {
+    pub id: i64,
+    /// Each build's commit (`-dirty`: uncommitted tracked changes); None: unknown.
+    pub sha_a: Option<String>,
+    pub sha_b: Option<String>,
+    pub m: i64,
+    pub n: i64,
+    pub k: i64,
+    pub impl_a: String,
+    pub impl_b: String,
+    pub ratio: f64,
+    pub ci_lo: f64,
+    pub ci_hi: f64,
+    /// Pairs (alternating process pairs).
+    pub pairs: i64,
+    pub protocol_version: i64,
+    pub cache_mode: String,
+    /// The idle guard's mean GPU utilization (%) before the run; None: unreadable.
+    pub idle_reading: Option<f64>,
+    pub clocks_locked: bool,
+    pub started_at: String,
+    pub finished_at: String,
+}
+
+impl PairedResult {
+    pub fn tied(&self) -> bool {
+        self.ci_lo <= 1.0 && self.ci_hi >= 1.0
+    }
+    /// Above the idle guard's limit (or unreadable): not evidence for a performance claim.
+    pub fn busy(&self) -> bool {
+        self.idle_reading.is_none_or(|u| u > crate::sweep::IDLE_MAX_PCT)
+    }
+}
+
+/// Which paired-ab results to read; every field narrows.
+#[derive(Clone, Debug, Default)]
+pub struct PairedResultFilter {
+    /// impl_a or impl_b.
+    pub impl_: Option<String>,
+    pub shape: Option<(i64, i64, i64)>,
+    /// sha_a or sha_b starts with this.
+    pub sha: Option<String>,
+}
+
+/// Stored paired-ab results, oldest first.
+pub fn paired_results(con: &Connection, f: &PairedResultFilter) -> Result<Vec<PairedResult>> {
+    let shape = f.shape.map(|(m, n, k)| format!("{m}x{n}x{k}"));
+    let sha = f.sha.as_ref().map(|s| format!("{}%", s.replace('%', "")));
+    let mut stmt = con.prepare(
+        "SELECT id, sha_a, sha_b, shape, impl_a, impl_b, ratio, ci_lo, ci_hi, n, protocol_version, cache_mode, \
+                idle_reading, clocks_locked, started_at, finished_at FROM paired_results \
+         WHERE (?1 IS NULL OR impl_a = ?1 OR impl_b = ?1) AND (?2 IS NULL OR shape = ?2) \
+           AND (?3 IS NULL OR sha_a LIKE ?3 OR sha_b LIKE ?3) ORDER BY started_at, id",
+    )?;
+    let rows = stmt
+        .query_map(params![f.impl_, shape, sha], |r| {
+            let shape: String = r.get(3)?;
+            let dims: Vec<i64> = shape.split('x').filter_map(|d| d.parse().ok()).collect();
+            let dim = |i: usize| dims.get(i).copied().unwrap_or(0);
+            Ok(PairedResult {
+                id: r.get(0)?,
+                sha_a: r.get(1)?,
+                sha_b: r.get(2)?,
+                m: dim(0),
+                n: dim(1),
+                k: dim(2),
+                impl_a: r.get(4)?,
+                impl_b: r.get(5)?,
+                ratio: r.get(6)?,
+                ci_lo: r.get(7)?,
+                ci_hi: r.get(8)?,
+                pairs: r.get(9)?,
+                protocol_version: r.get(10)?,
+                cache_mode: r.get(11)?,
+                idle_reading: r.get(12)?,
+                clocks_locked: r.get::<_, i64>(13)? != 0,
+                started_at: r.get(14)?,
+                finished_at: r.get(15)?,
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(rows)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -548,6 +635,49 @@ mod tests {
             ]
         );
         assert_eq!(rows[0].replaced_by.as_deref(), Some("r2"));
+        std::fs::remove_file(&p).unwrap();
+    }
+
+    #[test]
+    fn paired_results_round_trip_and_filters() {
+        let p = std::env::temp_dir().join(format!("aegis-view-pr-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        {
+            let con = db::connect(&p).unwrap();
+            let r = |sha_b: &str, impl_: &str, shape: (i64, i64, i64), idle: Option<f64>, lo: f64, hi: f64| {
+                crate::ab::NewPairedResult {
+                    sha_a: Some("2c6aabb9dd18".into()),
+                    sha_b: Some(sha_b.into()),
+                    shape,
+                    impl_a: impl_.into(),
+                    impl_b: impl_.into(),
+                    ratio: (lo + hi) / 2.0,
+                    ci_lo: lo,
+                    ci_hi: hi,
+                    n: 30,
+                    protocol_version: 2,
+                    cache_mode: "cold".into(),
+                    idle_reading: idle,
+                    clocks_locked: false,
+                    started_at: "2026-10-15T00:00:00+00:00".into(),
+                    finished_at: "2026-10-15T00:05:00+00:00".into(),
+                }
+            };
+            crate::ab::store(&con, &r("abc123-dirty", "mma_a", (4096, 4096, 4096), Some(2.9), 0.983, 1.016)).unwrap();
+            crate::ab::store(&con, &r("def456", "mma_b", (2048, 2048, 2048), Some(0.4), 1.002, 1.014)).unwrap();
+        }
+        let con = db::connect_ro(&p).unwrap();
+        let all = paired_results(&con, &PairedResultFilter::default()).unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!((all[0].m, all[0].n, all[0].k, all[0].pairs), (4096, 4096, 4096, 30));
+        assert!(all[0].tied() && all[0].busy(), "2.9% > 2%: busy");
+        assert!(!all[1].tied() && !all[1].busy());
+        let by_impl = PairedResultFilter { impl_: Some("mma_b".into()), ..Default::default() };
+        assert_eq!(paired_results(&con, &by_impl).unwrap().len(), 1);
+        let by_shape = PairedResultFilter { shape: Some((4096, 4096, 4096)), ..Default::default() };
+        assert_eq!(paired_results(&con, &by_shape).unwrap()[0].sha_b.as_deref(), Some("abc123-dirty"));
+        let by_sha = PairedResultFilter { sha: Some("2c6aabb".into()), ..Default::default() };
+        assert_eq!(paired_results(&con, &by_sha).unwrap().len(), 2);
         std::fs::remove_file(&p).unwrap();
     }
 }

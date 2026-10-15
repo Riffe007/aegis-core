@@ -66,6 +66,9 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("microbench", "sm_clock_mhz", "REAL"),
     ("microbench", "clocks_locked", "INTEGER"),
     ("microbench", "clock_lock", "TEXT"),
+    // paired_results is created by the schema; listed so connect_ro refuses a
+    // DB that predates it.
+    ("paired_results", "finished_at", "TEXT NOT NULL DEFAULT ''"),
     // Timing protocol v2: rows from before it get protocol_version = 1.
     ("measurements", "protocol_version", "INTEGER NOT NULL DEFAULT 1"),
     ("measurements", "batch_n", "INTEGER"),
