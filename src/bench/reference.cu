@@ -24,6 +24,8 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <algorithm>
+#include <thread>
 
 #include "aegis/common.cuh"
 
@@ -68,23 +70,38 @@ void cpu_reference(const HostGemm& g, std::vector<double>& out) {
   const GemmParams& p = g.p;
   out.assign(size_t(p.batch) * p.M * p.N, 0.0);
   const bool ra = p.layout_a == Layout::RowMajor, rb = p.layout_b == Layout::RowMajor;
-  std::vector<double> arow(size_t(p.K)), bcol(size_t(p.K));
-  for (int b = 0; b < p.batch; ++b)
-    for (int i = 0; i < p.M; ++i) {
+  // B transposed once per batch (bt[j * K + k], as double) so the inner loop is
+  // contiguous; rows of C are split across threads. Same arithmetic as before:
+  // one FP64 sum per element in k order, then alpha * acc + beta * C0.
+  std::vector<double> bt(size_t(p.N) * p.K);
+  const unsigned nthreads = std::max(1u, std::min(16u, std::thread::hardware_concurrency()));
+  for (int b = 0; b < p.batch; ++b) {
+    if (p.alpha != 0.f)
       for (int k = 0; k < p.K; ++k)
-        arow[k] = __half2float(g.A[size_t(b * p.stride_a + (ra ? i * p.lda + k : i + k * p.lda))]);
-      for (int j = 0; j < p.N; ++j) {
-        double acc = 0;
-        for (int k = 0; p.alpha != 0.f && k < p.K; ++k) {  // alpha == 0: A*B is not needed
-          const double x = __half2float(g.B[size_t(b * p.stride_b + (rb ? k * p.ldb + j : k + j * p.ldb))]);
-          acc += arow[k] * x;
+        for (int j = 0; j < p.N; ++j)
+          bt[size_t(j) * p.K + k] = __half2float(g.B[size_t(b * p.stride_b + (rb ? k * p.ldb + j : k + j * p.ldb))]);
+    auto rows = [&](int i0, int i1) {
+      std::vector<double> arow(size_t(p.K));
+      for (int i = i0; i < i1; ++i) {
+        for (int k = 0; k < p.K; ++k)
+          arow[k] = __half2float(g.A[size_t(b * p.stride_a + (ra ? i * p.lda + k : i + k * p.lda))]);
+        for (int j = 0; j < p.N; ++j) {
+          double acc = 0;
+          const double* bj = bt.data() + size_t(j) * p.K;
+          for (int k = 0; p.alpha != 0.f && k < p.K; ++k) acc += arow[k] * bj[k];  // alpha == 0: A*B not needed
+          double v = p.alpha == 0.f ? 0.0 : double(p.alpha) * acc;  // BLAS: alpha == 0 ignores A*B
+          if (p.beta != 0.f) v += double(p.beta) * __half2float(g.C0[size_t(b * p.stride_c + i * p.ldc + j)]);
+          out[(size_t(b) * p.M + i) * p.N + j] = v;
         }
-        double v = p.alpha == 0.f ? 0.0 : double(p.alpha) * acc;  // BLAS: alpha == 0 ignores A*B
-        if (p.beta != 0.f) v += double(p.beta) * __half2float(g.C0[size_t(b * p.stride_c + i * p.ldc + j)]);
-        out[(size_t(b) * p.M + i) * p.N + j] = v;
       }
-    }
-  (void)bcol;
+    };
+    const double work = double(p.M) * p.N * p.K;
+    const int parts = work < 1e7 ? 1 : int(std::min<unsigned>(nthreads, unsigned(p.M)));
+    std::vector<std::thread> pool;
+    for (int t = 0; t < parts; ++t)
+      pool.emplace_back(rows, int((long long)p.M * t / parts), int((long long)p.M * (t + 1) / parts));
+    for (auto& th : pool) th.join();
+  }
 }
 
 LtReference::LtReference() {

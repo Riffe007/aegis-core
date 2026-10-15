@@ -1389,3 +1389,54 @@ aegis-nightly.service`):** the guard read 0.9%.
   71.0%; it flags 1x896x4864 77.8 -> 74.9% against an older tune run).
 - The backup and the summary line work: `~/backups/aegis_perf-2026-10-14.db`,
   integrity ok.
+
+## 2026-10-15 — Fuzz case 24632: a cuBLASLt reference error, not ours
+
+The first nightly fuzz failed case 24632 (seed 20261014) against the cuBLASLt
+reference. The case:
+- Kernel: `mma_pipe_128x128x32_2x4_s3`, the dispatched winner at 2048³.
+- Shape 1951x624x3159; A column-major, B row-major (CR); lda 1956, ldb 625,
+  ldc 635; B pointer offset by 2 elements (misaligned); batch 1.
+- alpha = -0.0126576, beta = -1. Data: A in ±0.25, B in ±1, C0 in ±1.
+- K-scaled tolerance (c = 2): 0.001324 = 0.000347 (the alpha*A*B term) +
+  0.000977 (eps * |beta| * max|C0|). Against cuBLASLt it is doubled, 0.002648.
+
+**`--cpu-ref-only` now generates the identical case.** The generator no longer
+depends on the reference mode: it dropped the 2^24 MAC cap, and aegis::matmul
+stays in the target list; that mode skips its cases instead of removing it,
+which had shifted every target index. `--cpu-ref-only` now checks every case
+against FP64, whatever its size. The FP64 CPU reference transposes B once and
+splits rows across up to 16 threads, with the same per-element summation
+order, so results are unchanged: 3.85e9 MACs in 0.4 s. ctest
+`fuzz_modes_same_cases` diffs the case lists of both modes.
+
+**FP64 evidence** (`aegis_fuzz --seed 20261014 --case 24632 --poison
+--explain`; ulp = FP16 ulp at the reference, 2^-10 near 1.0):
+
+| Element | FP64 | Ours (err) | cuBLASLt (err) |
+|---|---|---|---|
+| row 871 col 532 (the failure) | 1.00725778 | 1.00683594 (0.43 ulp, 0.32x tol) | 1.00976562 (**2.57 ulp, 1.89x tol**) |
+| ours, worst element (row 360 col 122) | 1.04345747 | 0.50 ulp (0.37x tol) | 0.50 ulp |
+| mean abs error, 1,217,424 elements | | 8.4e-5 | 1.9e-4 |
+
+**Verdict: a reference bug.** Our result is correctly rounded everywhere: the
+worst element is 0.50 ulp, the rounding limit. cuBLASLt's result is 2.57 ulp
+off FP64 at the failing element, beyond the 1x tolerance on its own. The
+"failure" was the difference between the two. At that element, alpha*A*B is
+small (0.011) and beta*C0 is near 1 (0.996). The tolerance is right for this
+case class (ours used 0.37 of it) and is unchanged.
+
+**Fix.** A case that fails against cuBLASLt is now re-checked against the FP64
+CPU reference at **1x** tolerance, which is stricter than the 2x that
+cuBLASLt gets, and FP64 decides. Each overrule is printed ("note case ...
+cuBLASLt reference error") and counted in the summary. ctest
+`fuzz_lt_reference_error` pins case 24632. The `--corrupt` self-test is
+unaffected (it skips the re-check): 200/200 still caught.
+
+**50,000-case rerun** (seed 20261014, `--poison`, under `tools/gpu_job.sh`):
+**0 failures**. 37,333 cases used the FP64 reference and 12,667 cuBLASLt;
+exactly one cuBLASLt failure was overruled by FP64 (case 24632). 995 s.
+
+Note for `tools/sanitize.sh` (synccheck with `--cpu-ref-only --max-dim 512`):
+cases are no longer capped at 2^24 MACs, so they reach up to 512³ x 4
+batches; expect a longer synccheck run.

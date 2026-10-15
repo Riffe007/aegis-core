@@ -133,6 +133,10 @@ add_test(NAME capi_shared COMMAND capi_test_shared)
 add_test(NAME fuzz_2000 COMMAND aegis_fuzz --cases 2000 --seed 1)
 add_test(NAME fuzz_selftest COMMAND aegis_fuzz --cases 200 --seed 3 --corrupt)
 add_test(NAME fuzz_poison COMMAND aegis_fuzz --cases 2000 --seed 21 --poison)
+# Seed 20261014 case 24632: cuBLASLt is 2.57 ulp off FP64 there (ours 0.43); the
+# cuBLASLt-reference failure must be overruled by the FP64 reference.
+add_test(NAME fuzz_lt_reference_error COMMAND aegis_fuzz --seed 20261014 --case 24632 --poison)
+add_test(NAME fuzz_modes_same_cases COMMAND ${CMAKE_SOURCE_DIR}/tests/test_fuzz_modes.sh $<TARGET_FILE:aegis_fuzz>)
 
 # sm_87 compile gate (Jetson Orin; CLAUDE.md Decisions: compile only, nothing
 # runs for sm_87 until the Jetson port). Every source with kernels is compiled

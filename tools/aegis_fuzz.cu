@@ -2,6 +2,7 @@
 //
 //   aegis_fuzz [--cases 2000] [--seed 1] [--case I] [--impls naive,regblock_,mma_,mma_pipe_,matmul]
 //              [--max-dim 4096] [--calibrate] [--verbose] [--corrupt] [--poison] [--cpu-ref-only]
+//              [--explain]
 //
 // Case i draws everything from mt19937_64(seed * 1000003 + i), so a failure
 // is reproduced alone with --seed S --case I. Per case:
@@ -18,7 +19,8 @@
 //   batch    2..4 with padded strides (15%)
 //   data     uniform(-s, s), s in {1, 0.25, 4}; 5% of cases inject 1-3 of
 //            NaN / +Inf / -Inf into A or B
-// Reference: FP64 CPU when M*N*K*batch <= 2^24, else cuBLASLt (2x tolerance);
+// Reference: FP64 CPU when M*N*K*batch <= 2^24, else cuBLASLt (2x tolerance),
+// and a case that fails against cuBLASLt is decided by FP64 (1x tolerance);
 // see src/bench/reference.h. Exit 1 on any failure.
 //
 // --poison: every element outside the logical matrices (ld padding, batch
@@ -26,9 +28,16 @@
 // beta == 0 all of C is NaN anyway. Must pass with 0 failures: no kernel may
 // read past K, M or N into a product, and beta == 0 must not read C.
 //
-// --cpu-ref-only: no cuBLAS / cuBLASLt kernel ever runs: cases capped at 2^24
-// MACs (FP64 CPU reference only), no aegis::matmul target (its fallback is
-// cuBLAS). For compute-sanitizer synccheck (tools/sanitize.sh).
+// --cpu-ref-only: no cuBLAS / cuBLASLt kernel ever runs: every case is checked
+// against the FP64 CPU reference whatever its size, and aegis::matmul cases
+// (whose fallback is cuBLAS) are skipped. The case stream is the same as in
+// the default mode: case I with seed S is the identical problem in both. For
+// compute-sanitizer synccheck (tools/sanitize.sh) and for checking a
+// cuBLASLt-reference failure against FP64.
+//
+// --explain (with --case I): FP64 CPU reference, our result and cuBLASLt's,
+// each element's error in FP16 ulps; prints the worst elements of each and the
+// tolerance terms.
 //
 // --corrupt: self-test of the checker. Each result gets one element pushed
 // 4x past the allowed error (or a NaN expectation replaced by 0); the run
@@ -66,7 +75,7 @@ struct Args {
   long long only_case = -1;
   std::vector<std::string> impls = {"naive", "regblock_", "mma_", "mma_pipe_", "matmul"};
   int max_dim = 4096;
-  bool calibrate = false, verbose = false, corrupt = false, poison = false, cpu_ref_only = false;
+  bool calibrate = false, verbose = false, corrupt = false, poison = false, cpu_ref_only = false, explain = false;
 };
 
 std::vector<std::string> split(const std::string& s) {
@@ -100,7 +109,12 @@ Args parse(int argc, char** argv) {
     else if (k == "--corrupt") a.corrupt = true;
     else if (k == "--poison") a.poison = true;
     else if (k == "--cpu-ref-only") a.cpu_ref_only = true;
+    else if (k == "--explain") a.explain = true;
     else { std::fprintf(stderr, "unknown arg %s\n", k.c_str()); std::exit(2); }
+  }
+  if (a.explain && (a.cpu_ref_only || a.only_case < 0)) {
+    std::fprintf(stderr, "--explain needs --case I and runs cuBLASLt (not with --cpu-ref-only)\n");
+    std::exit(2);
   }
   return a;
 }
@@ -153,15 +167,16 @@ struct Case {
   }
 };
 
+// The case depends only on (seed, case, targets, max_dim, calibrate): never on
+// the reference mode, so --cpu-ref-only and --explain reproduce a case exactly.
 Case make_case(std::mt19937_64& rng, const std::vector<Target>& targets, int max_dim,
-               const std::vector<int>& primes, bool calibrate, bool cpu_ref_only) {
+               const std::vector<int>& primes, bool calibrate) {
   std::uniform_real_distribution<double> u(0, 1);
   Case c;
   c.target = targets[std::uniform_int_distribution<size_t>(0, targets.size() - 1)(rng)];
   GemmParams& p = c.g.p;
   p.batch = u(rng) < 0.15 ? std::uniform_int_distribution<int>(2, 4)(rng) : 1;
-  double cap = c.target.name == "naive" ? std::ldexp(1.0, 27) : std::ldexp(1.0, 32);
-  if (cpu_ref_only) cap = std::ldexp(1.0, 24);  // every case on the FP64 CPU reference
+  const double cap = c.target.name == "naive" ? std::ldexp(1.0, 27) : std::ldexp(1.0, 32);
   for (;;) {
     p.M = draw_dim(rng, max_dim, primes);
     p.N = draw_dim(rng, max_dim, primes);
@@ -258,6 +273,65 @@ T* device_copy(const std::vector<T>& h, int offset, T** base, bool poison) {
   return p;
 }
 
+// FP16 ulp at |x|: 2^(e-10) for |x| in [2^e, 2^(e+1)), 2^-24 for subnormals.
+double ulp_fp16(double x) {
+  const double ax = std::fabs(x);
+  if (ax < std::ldexp(1.0, -14)) return std::ldexp(1.0, -24);
+  return std::ldexp(1.0, std::ilogb(ax) - 10);
+}
+
+// --explain: our result and cuBLASLt's, both against the FP64 CPU reference, at
+// the worst elements, in FP16 ulps of the reference, plus the tolerance terms.
+void explain(const Case& c, const GemmParams& dp, const std::vector<__half>& out, const std::vector<double>& ref,
+             const aegis::bench::Tolerance& tol, aegis::bench::LtReference& lt, cudaStream_t stream) {
+  const GemmParams& p = c.g.p;
+  AEGIS_CUDA_CHECK(cudaMemcpy(dp.C, c.g.C0.data(), c.g.C0.size() * sizeof(__half), cudaMemcpyHostToDevice));
+  lt.run(dp, stream);
+  AEGIS_CUDA_CHECK(cudaStreamSynchronize(stream));
+  std::vector<__half> lo(c.g.C0.size());
+  AEGIS_CUDA_CHECK(cudaMemcpy(lo.data(), dp.C, lo.size() * sizeof(__half), cudaMemcpyDeviceToHost));
+  struct At { double score = -1; int b = 0, i = 0, j = 0; };
+  At ours_worst, lt_worst, apart;
+  double sum_ours = 0, sum_lt = 0;
+  long long n = 0;
+  for (int b = 0; b < p.batch; ++b)
+    for (int i = 0; i < p.M; ++i)
+      for (int j = 0; j < p.N; ++j) {
+        const double r = ref[(size_t(b) * p.M + i) * p.N + j];
+        if (!std::isfinite(r)) continue;
+        const size_t oi = size_t(b * p.stride_c + i * p.ldc + j);
+        const double o = __half2float(out[oi]), l = __half2float(lo[oi]);
+        const double eo = std::fabs(o - r), el = std::fabs(l - r), d = std::fabs(o - l);
+        sum_ours += eo, sum_lt += el, ++n;
+        if (eo > ours_worst.score) ours_worst = {eo, b, i, j};
+        if (el > lt_worst.score) lt_worst = {el, b, i, j};
+        if (d > apart.score) apart = {d, b, i, j};
+      }
+  const double t1 = aegis::bench::kToleranceC * std::sqrt(double(p.K)) * aegis::bench::kEpsFp16 * tol.max_a *
+                    tol.max_b * std::fabs(double(p.alpha));
+  const double t2 = aegis::bench::kEpsFp16 * std::fabs(double(p.beta)) * tol.max_c0;
+  std::printf("explain: %s\n", c.describe().c_str());
+  std::printf("  tolerance (c = %.2f): %.6g = %.6g (c*sqrt(K)*eps*max|A|*max|B|*|alpha|; max|A| %g, max|B| %g)"
+              " + %.6g (eps*|beta|*max|C0|; max|C0| %g); vs cuBLASLt 2x = %.6g\n",
+              aegis::bench::kToleranceC, tol.tol, t1, tol.max_a, tol.max_b, t2, tol.max_c0, 2 * tol.tol);
+  auto show = [&](const char* what, const At& at) {
+    const size_t oi = size_t(at.b * p.stride_c + at.i * p.ldc + at.j);
+    const double r = ref[(size_t(at.b) * p.M + at.i) * p.N + at.j];
+    const double o = __half2float(out[oi]), l = __half2float(lo[oi]), u = ulp_fp16(r);
+    const double c0 = p.beta != 0.f ? __half2float(c.g.C0[oi]) : 0.0;
+    std::printf("  %-22s batch %d row %d col %d: FP64 %.9g (alpha*AB %.9g, beta*C0 %.9g; ulp %.3g)\n"
+                "  %-22s   ours %.9g: err %.6g = %.2f ulp (%.2f x tol);  cuBLASLt %.9g: err %.6g = %.2f ulp (%.2f x tol)\n",
+                what, at.b, at.i, at.j, r, r - double(p.beta) * c0, double(p.beta) * c0, u, "", o, std::fabs(o - r),
+                std::fabs(o - r) / u, std::fabs(o - r) / tol.tol, l, std::fabs(l - r), std::fabs(l - r) / u,
+                std::fabs(l - r) / tol.tol);
+  };
+  show("worst ours vs FP64:", ours_worst);
+  show("worst cuBLASLt vs FP64:", lt_worst);
+  show("largest ours-cuBLASLt:", apart);
+  std::printf("  mean |err| vs FP64 over %lld elements: ours %.3g, cuBLASLt %.3g\n", n, sum_ours / std::max(1LL, n),
+              sum_lt / std::max(1LL, n));
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -268,8 +342,9 @@ int main(int argc, char** argv) {
     for (const std::string& pre : a.impls)
       if (pre != "matmul" && std::string(e.name).rfind(pre, 0) == 0) { targets.push_back({e.name, &e}); break; }
   }
-  // --cpu-ref-only drops aegis::matmul: it falls back to cuBLAS on untuned shapes.
-  if (!a.cpu_ref_only && std::find(a.impls.begin(), a.impls.end(), "matmul") != a.impls.end())
+  // aegis::matmul stays a target in every mode (the case stream must not depend
+  // on the mode); --cpu-ref-only skips its cases (its fallback is cuBLAS).
+  if (std::find(a.impls.begin(), a.impls.end(), "matmul") != a.impls.end())
     targets.push_back({"matmul", nullptr});
   if (targets.empty()) { std::fprintf(stderr, "no targets\n"); return 2; }
   const std::vector<int> primes = primes_upto(a.max_dim);
@@ -281,13 +356,17 @@ int main(int argc, char** argv) {
                a.only_case >= 0 ? 1LL : a.cases,
                targets.size(), aegis::bench::kToleranceC, a.calibrate ? ", calibrating" : "");
   const auto t0 = std::chrono::steady_clock::now();
-  long long failures = 0, cpu_ref = 0, lt_ref = 0, injected = 0, misaligned = 0;
+  long long failures = 0, cpu_ref = 0, lt_ref = 0, injected = 0, misaligned = 0, skipped = 0, lt_overruled = 0;
   std::map<std::string, double> worst_c;  // calibrate: max err / (c=1 tolerance) per impl
   const long long first = a.only_case >= 0 ? a.only_case : 0;
   const long long last = a.only_case >= 0 ? a.only_case + 1 : a.cases;
   for (long long ci = first; ci < last; ++ci) {
     std::mt19937_64 rng(a.seed * 1000003ull + (unsigned long long)ci);
-    Case c = make_case(rng, targets, a.max_dim, primes, a.calibrate, a.cpu_ref_only);
+    Case c = make_case(rng, targets, a.max_dim, primes, a.calibrate);
+    if (a.cpu_ref_only && !c.target.entry) {
+      ++skipped;
+      continue;
+    }
     GemmParams& hp = c.g.p;
     injected += c.injected;
     misaligned += (c.off_a || c.off_b || c.off_c) ? 1 : 0;
@@ -311,13 +390,10 @@ int main(int argc, char** argv) {
     const double macs = double(hp.M) * hp.N * hp.K * hp.batch;
     // alpha == 0 (C = beta*C) is always checked on the CPU: cuBLASLt applies the
     // BLAS convention inconsistently there (some algorithms propagate NaN from A*B).
-    const bool use_cpu = macs <= std::ldexp(1.0, 24) || hp.alpha == 0.f;
+    // --cpu-ref-only and --explain: the FP64 CPU reference for every case, any size.
+    const bool use_cpu = a.cpu_ref_only || a.explain || macs <= std::ldexp(1.0, 24) || hp.alpha == 0.f;
     std::vector<double> ref;
     std::vector<__half> lt_out;
-    if (a.cpu_ref_only && !use_cpu) {
-      std::fprintf(stderr, "aegis_fuzz: --cpu-ref-only case %lld needs cuBLASLt\n", ci);
-      return 2;
-    }
     if (use_cpu) {
       ++cpu_ref;
       aegis::bench::cpu_reference(c.g, ref);
@@ -349,6 +425,25 @@ int main(int argc, char** argv) {
       cmp = aegis::bench::compare(c.g, out, ref, allowed);
       ok = cmp.pass;
     }
+    // cuBLASLt is a proxy for the exact result, and it can itself be off by more
+    // than the tolerance (seed 20261014 case 24632: 2.57 FP16 ulp from FP64
+    // where ours was 0.43). A cuBLASLt-reference failure is therefore decided by
+    // the FP64 CPU reference at 1x tolerance; the tolerance is never widened.
+    if (!ok && !use_cpu && s == cudaSuccess && !a.corrupt) {
+      std::vector<double> exact;
+      aegis::bench::cpu_reference(c.g, exact);
+      const aegis::bench::Comparison fp64 = aegis::bench::compare(c.g, out, exact, tol.tol);
+      if (fp64.pass) {
+        ++lt_overruled;
+        std::printf("note case %lld (--seed %llu --case %lld): %s\n  vs cuBLASLt: %s; vs FP64: pass (max %.2f x tol): "
+                    "cuBLASLt reference error\n",
+                    ci, a.seed, ci, c.describe().c_str(), cmp.first_failure.c_str(), fp64.max_ratio);
+        ok = true;
+      } else {
+        cmp = fp64;  // report the FP64 verdict
+      }
+    }
+    if (a.explain && s == cudaSuccess) explain(c, dp, out, ref, tol, lt, stream);
     if (a.corrupt) ok = !ok;  // the corrupted result must be caught
     if (a.calibrate && s == cudaSuccess && use_cpu) {
       const double unit = aegis::bench::tolerance(c.g, 1.0).tol;  // c = 1
@@ -372,7 +467,7 @@ int main(int argc, char** argv) {
       ++failures;
       std::printf("FAIL case %lld (--seed %llu --case %lld): %s\n  %s%s\n", ci, a.seed, ci, c.describe().c_str(),
                   s != cudaSuccess ? cudaGetErrorString(s) : cmp.first_failure.c_str(),
-                  use_cpu ? "" : " [cuBLASLt reference]");
+                  use_cpu ? "" : (!a.corrupt && s == cudaSuccess ? " [FP64 reference, after cuBLASLt]" : " [cuBLASLt reference]"));
     } else if (a.verbose) {
       std::printf("ok   case %lld: %s  max_ratio %.3f%s\n", ci, c.describe().c_str(), cmp.max_ratio,
                   use_cpu ? "" : " [lt]");
@@ -383,9 +478,13 @@ int main(int argc, char** argv) {
   }
   const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
   std::printf("aegis_fuzz: %lld cases, %lld %s (%lld CPU-FP64 reference, %lld cuBLASLt; %lld with NaN/Inf, "
-              "%lld misaligned), %.1f s, seed %llu\n",
+              "%lld misaligned%s), %.1f s, seed %llu\n",
               last - first, failures, a.corrupt ? "corruptions NOT caught" : "failures", cpu_ref, lt_ref, injected,
-              misaligned, secs, a.seed);
+              misaligned,
+              (std::string(skipped ? ", " + std::to_string(skipped) + " aegis::matmul cases skipped" : "") +
+               (lt_overruled ? ", " + std::to_string(lt_overruled) + " cuBLASLt-reference failures overruled by FP64" : ""))
+                  .c_str(),
+              secs, a.seed);
   if (a.calibrate) {
     std::printf("observed c (max err / (sqrt(K)*eps*max|A|*max|B|*|alpha| + eps*|beta|*max|C0|)), CPU-reference cases:\n");
     for (const auto& [who, w] : worst_c) std::printf("  %-12s %.4f\n", who.c_str(), w);
