@@ -22,6 +22,8 @@ pub struct AbArgs<'a> {
     pub pairs: usize,
     pub reps: u32,
     pub cache: &'a str,
+    /// Run even if the idle guard finds the GPU busy (the result is marked).
+    pub allow_busy: bool,
 }
 
 fn run_once(bench: &Path, impl_: &str, (m, n, k): (i64, i64, i64), reps: u32, cache: &str) -> Result<f64> {
@@ -76,6 +78,8 @@ pub fn bootstrap(ratios: &[f64], resamples: usize, seed: u64) -> (f64, f64, f64)
 
 pub fn cmd_paired_ab(a: &AbArgs) -> Result<()> {
     let _gpu = crate::gpujob::lock(&format!("aegis-perf paired-ab {} vs {}", a.impl_a, a.impl_b))?;
+    // Blocking idle guard (Benchmark policy), with build B's bench_gemm.
+    let idle = crate::sweep::idle_guard(a.b, a.allow_busy)?;
     let (mut ta, mut tb, mut ratios) = (Vec::new(), Vec::new(), Vec::new());
     for i in 0..a.pairs {
         // Alternate which side runs first so neither always follows the other.
@@ -105,6 +109,13 @@ pub fn cmd_paired_ab(a: &AbArgs) -> Result<()> {
         hi,
         a.pairs,
         if lo <= 1.0 && hi >= 1.0 { " (tie)" } else { "" }
+    );
+    println!(
+        "  idle guard: {} ({}, limit {}%){}",
+        idle.mean_pct.map_or("unreadable".to_string(), |u| format!("{u:.1}%")),
+        idle.source,
+        idle.limit_pct,
+        if idle.busy { "; GPU BUSY, --allow-busy: not evidence for a performance claim" } else { "" }
     );
     Ok(())
 }

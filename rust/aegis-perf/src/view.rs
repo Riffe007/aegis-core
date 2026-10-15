@@ -27,10 +27,17 @@ pub struct Run {
     pub temp_start_c: Option<f64>,
     pub measured_bw_gbps: Option<f64>,
     pub started_at: String,
+    /// The idle guard's mean GPU utilization (%) before the run; None if not
+    /// recorded (older runs without it on their rows).
+    pub idle_util_pct: Option<f64>,
+    pub idle_source: Option<String>,
+    /// The guard found the GPU busy and the run went ahead (--allow-busy).
+    pub allow_busy: bool,
 }
 
 const RUN_COLS: &str = "run_id, device_id, sm_arch, gpu_name, cuda_ver, driver_ver, git_sha, power_mode, \
-                        clocks_locked, temp_start_c, measured_bw_gbps, started_at";
+                        clocks_locked, temp_start_c, measured_bw_gbps, started_at, idle_util_pct, idle_source, \
+                        allow_busy";
 
 fn run_row(r: &Row) -> rusqlite::Result<Run> {
     Ok(Run {
@@ -46,6 +53,9 @@ fn run_row(r: &Row) -> rusqlite::Result<Run> {
         temp_start_c: r.get(9)?,
         measured_bw_gbps: r.get(10)?,
         started_at: r.get(11)?,
+        idle_util_pct: r.get(12)?,
+        idle_source: r.get(13)?,
+        allow_busy: r.get::<_, i64>(14)? != 0,
     })
 }
 

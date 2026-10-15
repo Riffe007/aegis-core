@@ -123,11 +123,11 @@ int main(int argc, char** argv) {
   const Args a = parse(argc, argv);
   const std::vector<Shape> shapes = read_shapes(a.shapes);
   const aegis::bench::IdleSample idle = aegis::bench::idle_guard(a.allow_busy);
-  const bool busy = !idle.ok || idle.mean_pct > aegis::bench::kIdleMaxPct;
+  const bool busy = aegis::bench::idle_busy(idle, aegis::bench::idle_max_pct());
   char util[32] = "null";
   if (idle.ok) std::snprintf(util, sizeof util, "%.1f", idle.mean_pct);
-  const std::string idle_json =
-      std::string(",\"idle_util_pct\":") + util + ",\"allow_busy\":" + (busy ? "true" : "false");
+  const std::string idle_json = std::string(",\"idle_util_pct\":") + util + ",\"idle_source\":\"" +
+                                (idle.ok ? idle.source : "none") + "\",\"allow_busy\":" + (busy ? "true" : "false");
 
   // Candidates: the two baselines (cuBLAS, cublaslt_best), then matching configs.
   struct Cand { const aegis::gemm::KernelEntry* e; bool lt; };

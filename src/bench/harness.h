@@ -265,11 +265,16 @@ struct IdleSample {
 };
 IdleSample sample_gpu_utilization(double seconds = 2.0, int interval_ms = 100);
 
-// Idle guard, run before any sweep or tune: samples utilization for 2 s and
-// exits the process (status 3) if the mean is above `max_pct` (or NVML cannot
-// tell) unless allow_busy. Returns the sample; logs it on stderr.
+// Idle guard, run before any sweep, tune, paired A/B or microbench run: samples
+// utilization for 2 s and exits the process (status 3) if the mean is above the
+// limit (or no source can tell) unless allow_busy. Returns the sample; logs it
+// on stderr. The limit is kIdleMaxPct; AEGIS_IDLE_MAX_PCT can only lower it
+// (tests force the busy path with -1), never raise it.
 inline constexpr double kIdleMaxPct = 2.0;
-IdleSample idle_guard(bool allow_busy, double max_pct = kIdleMaxPct);
+double idle_max_pct();
+// The guard's decision: busy when no source answered or the mean exceeds limit.
+inline bool idle_busy(const IdleSample& s, double limit) { return !s.ok || s.mean_pct > limit; }
+IdleSample idle_guard(bool allow_busy);
 
 // Event pairs around `samples` spin kernels of increasing length. Aborts on error.
 TimerResolution measure_timer_resolution(cudaStream_t stream, int samples = 1000);

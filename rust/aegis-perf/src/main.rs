@@ -48,6 +48,14 @@ enum Cmd {
         manifest: Option<PathBuf>,
         #[arg(long)]
         run_id: Option<String>,
+        /// The idle guard's reading for this run (run_all.sh passes it).
+        #[arg(long)]
+        idle_util_pct: Option<f64>,
+        #[arg(long)]
+        idle_source: Option<String>,
+        /// The guard found the GPU busy and the run went ahead anyway.
+        #[arg(long)]
+        allow_busy: bool,
     },
     /// Recompute the best kernel per (arch, shape).
     Winners {
@@ -127,6 +135,9 @@ enum Cmd {
         reps: u32,
         #[arg(long, default_value = "cold")]
         cache: String,
+        /// Run even if the idle guard finds the GPU busy (> 2% utilization); the result is marked.
+        #[arg(long)]
+        allow_busy: bool,
     },
     /// Measured machine parameters (L2/DRAM latency, DRAM bandwidth, mma peak)
     /// -> include/aegis/arch/sm_<arch>.json, for the cost model.
@@ -177,8 +188,9 @@ fn main() -> Result<()> {
         Cmd::Ingest { results, manifest, run_id, temp_start } => {
             db::cmd_ingest(&cli.db, &results, manifest.as_deref(), run_id, temp_start)
         }
-        Cmd::IngestMicrobench { results, manifest, run_id } => {
-            db::cmd_ingest_microbench(&cli.db, &results, manifest.as_deref(), run_id)
+        Cmd::IngestMicrobench { results, manifest, run_id, idle_util_pct, idle_source, allow_busy } => {
+            let idle = db::RunIdle { pct: idle_util_pct, source: idle_source, allow_busy };
+            db::cmd_ingest_microbench(&cli.db, &results, manifest.as_deref(), run_id, &idle)
         }
         Cmd::Winners { arch } => db::cmd_winners(&cli.db, arch),
         Cmd::Report { arch, protocol, cache, include_busy, baseline } => {
@@ -197,7 +209,7 @@ fn main() -> Result<()> {
         Cmd::EmitHeader { arch, out, results_dir } => {
             tune::cmd_emit_header(&cli.db, arch, &results_dir, out.as_deref())
         }
-        Cmd::PairedAb { a, b, impl_, impl_b, shape, pairs, reps, cache } => ab::cmd_paired_ab(&ab::AbArgs {
+        Cmd::PairedAb { a, b, impl_, impl_b, shape, pairs, reps, cache, allow_busy } => ab::cmd_paired_ab(&ab::AbArgs {
             a: &a,
             b: &b,
             impl_a: &impl_,
@@ -206,6 +218,7 @@ fn main() -> Result<()> {
             pairs,
             reps,
             cache: &cache,
+            allow_busy,
         }),
         Cmd::EmitArch { arch, ptr_chase, out, results_dir } => {
             arch::cmd_emit_arch(&cli.db, arch, &ptr_chase, &results_dir, out.as_deref())

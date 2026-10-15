@@ -77,6 +77,11 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("winners", "ratio_ci_hi", "REAL"),
     ("winners", "lt_ratio_ci_lo", "REAL"),
     ("winners", "lt_ratio_ci_hi", "REAL"),
+    // The idle guard's reading, per run (every run since the blocking guard;
+    // older runs backfilled from their measurement rows where those carry it).
+    ("runs", "idle_util_pct", "REAL"),
+    ("runs", "idle_source", "TEXT"),
+    ("runs", "allow_busy", "INTEGER NOT NULL DEFAULT 0"),
 ];
 
 /// Reference implementations: always eligible (they are what --check compares
@@ -122,6 +127,14 @@ fn migrate(con: &Connection) -> Result<()> {
             .exists([column])?;
         if !exists {
             con.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"))?;
+            if (*table, *column) == ("runs", "allow_busy") {
+                // Backfill once: a run's reading is what its measurement rows recorded.
+                con.execute_batch(
+                    "UPDATE runs SET \
+                       idle_util_pct = (SELECT max(m.idle_util_pct) FROM measurements m WHERE m.run_id = runs.run_id), \
+                       allow_busy = coalesce((SELECT max(m.allow_busy) FROM measurements m WHERE m.run_id = runs.run_id), 0)",
+                )?;
+            }
         }
     }
     Ok(())
@@ -204,6 +217,18 @@ fn get<'a>(r: &'a Value, key: &str) -> Result<&'a Value> {
     r.get(key).with_context(|| format!("results row missing \"{key}\""))
 }
 
+const INSERT_RUN: &str = "INSERT INTO runs (run_id, device_id, sm_arch, gpu_name, cuda_ver, driver_ver, git_sha, \
+     power_mode, clocks_locked, temp_start_c, measured_bw_gbps, started_at, idle_util_pct, idle_source, allow_busy) \
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)";
+
+/// A run's idle-guard reading (Benchmark policy: stored on every run row).
+#[derive(Clone, Debug, Default)]
+pub struct RunIdle {
+    pub pct: Option<f64>,
+    pub source: Option<String>,
+    pub allow_busy: bool,
+}
+
 pub fn cmd_init(db: &Path) -> Result<()> {
     connect(db)?;
     println!("initialized {}", db.display());
@@ -242,8 +267,15 @@ pub fn cmd_ingest(
         .unwrap_or_else(|| Value::String(hostname()));
     // Python: datetime.now(timezone.utc).isoformat()
     let started_at = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.6f+00:00").to_string();
+    // The run's idle-guard reading: aegis_tune puts it on every row, sweep
+    // (bench_gemm --idle-util-pct) too; allow_busy if any row ran busy.
+    let idle = RunIdle {
+        pct: rows.iter().find_map(|r| r.get("idle_util_pct").and_then(Value::as_f64)),
+        source: rows.iter().find_map(|r| r.get("idle_source").and_then(Value::as_str).map(str::to_string)),
+        allow_busy: rows.iter().any(|r| r.get("allow_busy").and_then(Value::as_bool) == Some(true)),
+    };
     tx.execute(
-        "INSERT INTO runs VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        INSERT_RUN,
         params![
             run_id,
             sql(Some(&device_id)),
@@ -257,6 +289,9 @@ pub fn cmd_ingest(
             temp_start.or_else(gpu_temp_c),
             sql(manifest.get("measured_d2d_bw_gbps")),
             started_at,
+            idle.pct,
+            idle.source,
+            idle.allow_busy as i64,
         ],
     )?;
     for r in &rows {
@@ -328,7 +363,13 @@ type ShapeKey = (i64, String, String, i64, i64, i64); // arch, op, dtype, m, n, 
 
 /// Microbench probe lines (microbench/*): one run row with the device metadata
 /// of the first line, then (run_id, probe, param_json, value, unit) per line.
-pub fn cmd_ingest_microbench(db: &Path, results: &Path, manifest: Option<&Path>, run_id: Option<String>) -> Result<()> {
+pub fn cmd_ingest_microbench(
+    db: &Path,
+    results: &Path,
+    manifest: Option<&Path>,
+    run_id: Option<String>,
+    idle: &RunIdle,
+) -> Result<()> {
     let text = std::fs::read_to_string(results).with_context(|| format!("read {}", results.display()))?;
     let rows: Vec<Value> = text
         .lines()
@@ -349,11 +390,12 @@ pub fn cmd_ingest_microbench(db: &Path, results: &Path, manifest: Option<&Path>,
     let device_id = manifest.get("device_id").cloned().unwrap_or_else(|| Value::String(hostname()));
     let started_at = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.6f+00:00").to_string();
     tx.execute(
-        "INSERT INTO runs VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        INSERT_RUN,
         params![
             run_id, sql(Some(&device_id)), sql(Some(get(first, "sm_arch")?)), sql(first.get("device")),
             sql(first.get("cuda_runtime")), sql(first.get("cuda_driver")), git_sha(), power_mode(),
             SqlValue::Null, gpu_temp_c(), sql(manifest.get("measured_d2d_bw_gbps")), started_at,
+            idle.pct, idle.source, idle.allow_busy as i64,
         ],
     )?;
     let mut probes: Vec<String> = Vec::new();
@@ -827,6 +869,72 @@ mod tests {
             })
             .unwrap();
         assert_eq!((p, busy, cache), (1, 0, None));
+    }
+
+    fn tmp(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("aegis-perf-{name}-{}", std::process::id()))
+    }
+
+    fn row(idle: f64, busy: bool) -> String {
+        format!(
+            r#"{{"op":"gemm","impl":"x","config":{{}},"shape":{{"M":8,"N":8,"K":8}},"dtype":"f16f32f16","median_us":1.0,"p10_us":1.0,"p90_us":1.0,"tflops":1.0,"gbps":1.0,"reps":1,"checked":true,"pass":true,"max_abs_err":0.0,"rel_err":0.0,"sm_arch":121,"protocol_version":2,"cache_mode":"cold","idle_util_pct":{idle},"idle_source":"nvml","allow_busy":{busy}}}"#
+        )
+    }
+
+    /// Every run row stores the idle guard's reading: an idle run, and a busy
+    /// run that went ahead with --allow-busy (marked).
+    #[test]
+    fn ingest_stores_the_idle_reading_on_the_run() {
+        let db = tmp("idle.db");
+        let _ = std::fs::remove_file(&db);
+        for (id, idle, busy) in [("idle_run", 0.4, false), ("busy_run", 2.9, true)] {
+            let f = tmp(&format!("{id}.jsonl"));
+            std::fs::write(&f, row(idle, busy) + "\n").unwrap();
+            cmd_ingest(&db, &f, None, Some(id.into()), Some(40.0)).unwrap();
+            std::fs::remove_file(&f).ok();
+        }
+        let mb = tmp("mb.jsonl");
+        std::fs::write(&mb, r#"{"probe":"p","param":{},"value":1.0,"unit":"ns","sm_arch":121}"#.to_string() + "\n").unwrap();
+        let idle = RunIdle { pct: Some(0.7), source: Some("nvml".into()), allow_busy: false };
+        cmd_ingest_microbench(&db, &mb, None, Some("mb_run".into()), &idle).unwrap();
+        std::fs::remove_file(&mb).ok();
+        let con = connect(&db).unwrap();
+        let get = |id: &str| -> (Option<f64>, Option<String>, i64) {
+            con.query_row("SELECT idle_util_pct, idle_source, allow_busy FROM runs WHERE run_id = ?", [id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .unwrap()
+        };
+        assert_eq!(get("idle_run"), (Some(0.4), Some("nvml".into()), 0));
+        assert_eq!(get("busy_run"), (Some(2.9), Some("nvml".into()), 1));
+        assert_eq!(get("mb_run"), (Some(0.7), Some("nvml".into()), 0));
+        drop(con);
+        std::fs::remove_file(&db).ok();
+    }
+
+    /// Runs from before the run-level columns get them from their rows.
+    #[test]
+    fn migrate_backfills_run_idle_from_measurements() {
+        let con = Connection::open_in_memory().unwrap();
+        con.execute_batch(SCHEMA).unwrap();
+        // An old DB: runs without the idle columns.
+        con.execute_batch(
+            "DROP TABLE runs; CREATE TABLE runs (run_id TEXT PRIMARY KEY, device_id TEXT NOT NULL, sm_arch INTEGER NOT NULL,
+               gpu_name TEXT, cuda_ver INTEGER, driver_ver INTEGER, git_sha TEXT, power_mode TEXT, clocks_locked INTEGER,
+               temp_start_c REAL, measured_bw_gbps REAL, started_at TEXT NOT NULL);
+             INSERT INTO runs (run_id, device_id, sm_arch, started_at) VALUES ('a', 'd', 121, 't'), ('b', 'd', 121, 't');",
+        )
+        .unwrap();
+        con.execute_batch(
+            "INSERT INTO kernels (kernel_id, op, impl, config_json) VALUES ('k', 'gemm', 'x', '{}');
+             INSERT INTO measurements (run_id, kernel_id, dtype, idle_util_pct, allow_busy) VALUES ('a', 'k', 'f', 3.5, 1);",
+        )
+        .unwrap();
+        migrate(&con).unwrap();
+        let a: (Option<f64>, i64) = con.query_row("SELECT idle_util_pct, allow_busy FROM runs WHERE run_id = 'a'", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        let b: (Option<f64>, i64) = con.query_row("SELECT idle_util_pct, allow_busy FROM runs WHERE run_id = 'b'", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        assert_eq!(a, (Some(3.5), 1));
+        assert_eq!(b, (None, 0), "no reading recorded: NULL, not an invented idle");
     }
 
     /// A tie where the tie-break dispatches the runner-up (fewer registers):

@@ -55,9 +55,37 @@ pub fn default_impls(bench: &Path) -> Result<Vec<String>> {
     Ok(impls)
 }
 
-/// The idle guard (bench_gemm --idle-check): Ok(None) when idle, Ok(Some(mean %))
-/// when busy and allowed, Err when busy and not allowed.
-pub fn idle_guard(bench: &Path, allow_busy: bool) -> Result<Option<f64>> {
+/// One idle-guard reading (bench_gemm --idle-check), recorded on every run.
+#[derive(Clone, Debug, PartialEq)]
+pub struct IdleReading {
+    /// Mean GPU utilization over the 2 s sample; None if no source answered.
+    pub mean_pct: Option<f64>,
+    /// "nvml", "sysfs:<path>", "tegrastats", or "none".
+    pub source: String,
+    /// The guard's limit (kIdleMaxPct, or lower via AEGIS_IDLE_MAX_PCT).
+    pub limit_pct: f64,
+    /// Above the limit (or unreadable): the run went ahead only with --allow-busy.
+    pub busy: bool,
+}
+
+/// Parse bench_gemm --idle-check output.
+pub fn parse_idle(stdout: &str) -> Result<IdleReading> {
+    let v: Value = serde_json::from_str(stdout.trim()).context("parse bench_gemm --idle-check output")?;
+    let ok = v["ok"].as_bool() == Some(true);
+    let mean = v["mean_pct"].as_f64().filter(|_| ok);
+    let limit = v["limit_pct"].as_f64().unwrap_or(IDLE_MAX_PCT);
+    Ok(IdleReading {
+        mean_pct: mean,
+        source: v["source"].as_str().unwrap_or("none").to_string(),
+        limit_pct: limit,
+        busy: v["busy"].as_bool().unwrap_or_else(|| !ok || mean.is_none_or(|m| m > limit)),
+    })
+}
+
+/// The idle guard (bench_gemm --idle-check), blocking: Err when the GPU is busy
+/// (above the limit, or unreadable) and allow_busy is not set; otherwise the
+/// reading, which the caller stores on every run row.
+pub fn idle_guard(bench: &Path, allow_busy: bool) -> Result<IdleReading> {
     let mut cmd = Command::new(bench);
     cmd.arg("--idle-check");
     if allow_busy {
@@ -67,10 +95,17 @@ pub fn idle_guard(bench: &Path, allow_busy: bool) -> Result<Option<f64>> {
     if !out.status.success() {
         bail!("idle guard refused to start (GPU busy); stop other GPU work or pass --allow-busy");
     }
-    let v: Value = serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim())?;
-    let mean = v["mean_pct"].as_f64().unwrap_or(f64::NAN);
-    let busy = v["ok"].as_bool() != Some(true) || mean > IDLE_MAX_PCT;
-    Ok(busy.then_some(mean))
+    let r = parse_idle(&String::from_utf8_lossy(&out.stdout))?;
+    check_idle(&r, allow_busy)?;
+    Ok(r)
+}
+
+/// The blocking rule: a busy reading aborts the run unless allow_busy.
+pub fn check_idle(r: &IdleReading, allow_busy: bool) -> Result<()> {
+    if r.busy && !allow_busy {
+        bail!("idle guard: GPU busy ({:?}% > {}%); stop other GPU work or pass --allow-busy", r.mean_pct, r.limit_pct);
+    }
+    Ok(())
 }
 
 /// Mean GPU utilization (%) above which the idle guard refuses (src/bench/harness.h kIdleMaxPct).
@@ -81,13 +116,17 @@ fn run_one(
     impl_: &str,
     (m, n, k): (i64, i64, i64),
     reps: u32,
-    busy: Option<f64>,
+    idle: &IdleReading,
 ) -> Result<Option<(Value, String)>> {
     let mut cmd = crate::gpujob::command(bench)?;
     cmd.args(["--impl", impl_, "--m", &m.to_string(), "--n", &n.to_string(), "--k", &k.to_string(),
               "--reps", &reps.to_string(), "--warmup", "3", "--check"]);
-    if let Some(u) = busy {
-        cmd.args(["--allow-busy", "--idle-util-pct", &format!("{u:.1}")]);
+    if let Some(u) = idle.mean_pct {
+        cmd.args(["--idle-util-pct", &format!("{u:.1}")]);
+    }
+    cmd.args(["--idle-source", &idle.source]);
+    if idle.busy {
+        cmd.arg("--allow-busy");
     }
     let p = cmd.output().context("run bench_gemm")?;
     let stdout = String::from_utf8_lossy(&p.stdout);
@@ -138,7 +177,7 @@ pub fn cmd_sweep(
         None => registered,
     };
 
-    let busy = idle_guard(&bench, allow_busy)?;
+    let idle = idle_guard(&bench, allow_busy)?;
     let shapes = if quick { quick_shapes() } else { [square_shapes(), qwen_shapes()].concat() };
     let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
     let out = results.join(format!("{host}-{stamp}.jsonl"));
@@ -150,7 +189,7 @@ pub fn cmd_sweep(
             if s.max_flops.is_some_and(|cap| 2 * m * n * k > cap) {
                 continue;
             }
-            if let Some((row, line)) = run_one(&bench, impl_, (m, n, k), s.reps, busy)? {
+            if let Some((row, line)) = run_one(&bench, impl_, (m, n, k), s.reps, &idle)? {
                 writeln!(f, "{line}")?;
                 if row["pass"].as_bool() != Some(true) {
                     failures += 1;
@@ -167,4 +206,34 @@ pub fn cmd_sweep(
         bail!("{failures} correctness failures; failing rows are excluded from winners");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn idle_reading_passes_and_busy_reading_aborts_unless_allowed() {
+        let idle = parse_idle(
+            r#"{"ok":true,"mean_pct":0.40,"max_pct":1,"samples":20,"source":"nvml","limit_pct":2.00,"busy":false}"#,
+        )
+        .unwrap();
+        assert_eq!(idle.mean_pct, Some(0.4));
+        assert!(!idle.busy);
+        assert!(check_idle(&idle, false).is_ok());
+
+        let busy = parse_idle(
+            r#"{"ok":true,"mean_pct":2.90,"max_pct":9,"samples":20,"source":"nvml","limit_pct":2.00,"busy":true}"#,
+        )
+        .unwrap();
+        assert!(busy.busy);
+        let err = check_idle(&busy, false).unwrap_err().to_string();
+        assert!(err.contains("busy"), "{err}");
+        assert!(check_idle(&busy, true).is_ok(), "--allow-busy runs (rows marked)");
+
+        // No source answered: busy, never silently idle.
+        let unreadable = parse_idle(r#"{"ok":false,"mean_pct":0.00,"max_pct":0,"samples":0}"#).unwrap();
+        assert!(unreadable.busy && unreadable.mean_pct.is_none());
+        assert!(check_idle(&unreadable, false).is_err());
+    }
 }

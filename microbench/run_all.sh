@@ -17,6 +17,20 @@ OUT="$ROOT/results/microbench-$HOST-$(date +%Y%m%d-%H%M%S).jsonl"
 SASS="$ROOT/artifacts/microbench"
 MANIFEST="$ROOT/results/manifest-$HOST.json"
 mkdir -p "$ROOT/results" "$SASS"
+
+# Blocking idle guard (Benchmark policy): refuse a busy GPU unless ALLOW_BUSY=1;
+# the reading is stored on the run row.
+IDLE_ARGS=()
+[[ "${ALLOW_BUSY:-0}" == 1 ]] && IDLE_ARGS+=(--allow-busy)
+IDLE_JSON="$("$ROOT/build/bench_gemm" --idle-check "${IDLE_ARGS[@]}")" || {
+  echo "run_all.sh: idle guard refused (GPU busy); stop other GPU work or set ALLOW_BUSY=1 (rows are marked)" >&2
+  exit 3
+}
+INGEST_IDLE=(--idle-source "$(jq -r .source <<<"$IDLE_JSON")")
+[[ "$(jq -r .ok <<<"$IDLE_JSON")" == true ]] && INGEST_IDLE+=(--idle-util-pct "$(jq -r .mean_pct <<<"$IDLE_JSON")")
+[[ "$(jq -r .busy <<<"$IDLE_JSON")" == true ]] && INGEST_IDLE+=(--allow-busy)
+
+# After the guard: aegis_manifest measures DRAM bandwidth.
 [[ -f "$MANIFEST" ]] || "$ROOT/build/aegis_manifest" > "$MANIFEST"
 
 status=0
@@ -33,6 +47,6 @@ done
 
 PERF="$ROOT/rust/target/release/aegis-perf"
 [[ -x "$PERF" ]] || { echo "missing $PERF; cargo build --release --manifest-path rust/Cargo.toml" >&2; exit 1; }
-(cd "$ROOT" && "$PERF" ingest-microbench "$OUT" --manifest "$MANIFEST")
+(cd "$ROOT" && "$PERF" ingest-microbench "$OUT" --manifest "$MANIFEST" "${INGEST_IDLE[@]}")
 echo "results: $OUT" >&2
 exit $status

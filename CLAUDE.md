@@ -239,8 +239,12 @@ only to compare with old rows (`--protocol 1`).
 - **Benchmark over SSH, remote desktop off.** A remote-desktop session
   (gnome-remote-desktop) encodes video on the GPU and shares L2 and DRAM with
   the benchmark; disconnect it before a sweep, tune or microbench run.
-- **Idle guard.** `aegis-perf sweep` and `tune` (and `aegis_tune`) sample GPU
-  utilization for 2 s first and refuse to start above 2% mean. Source: NVML
+- **Idle guard (blocking).** `aegis-perf sweep`, `tune` and `paired-ab` (and
+  `aegis_tune`, `microbench/run_all.sh`) sample GPU utilization for 2 s first
+  and abort above 2% mean (or when no source can tell) unless `--allow-busy`
+  (`ALLOW_BUSY=1` for run_all.sh). `AEGIS_IDLE_MAX_PCT` can only lower the
+  limit (tests use -1 to force the busy path). The reading is stored on every
+  run row (`runs.idle_util_pct`, `idle_source`, `allow_busy`). Source: NVML
   (loaded with dlopen) where it exists; on Tegra (no NVML) the sysfs GPU load
   file (`.../gpu.0/load` or `.../17000000.gpu/load`, per mille), else
   `tegrastats` GR3D_FREQ. The source is logged.

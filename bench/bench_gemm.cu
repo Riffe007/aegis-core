@@ -5,11 +5,14 @@
 //   bench_gemm --impl cublaslt_best ...  fastest passing cuBLASLt heuristic algorithm (of 8);
 //              [--lt-rank R]           only the algorithm at heuristic rank R (no selection)
 //   bench_gemm --list                  registered impls as JSON lines
-//   bench_gemm --idle-check [--allow-busy]   the idle guard alone (aegis-perf sweep
-//                                      runs it once before the sweep); exit 3 = busy
+//   bench_gemm --idle-check [--allow-busy]   the idle guard alone (aegis-perf sweep and
+//                                      paired-ab, microbench/run_all.sh run it once
+//                                      first); exit 3 = busy. Prints {"ok","mean_pct",
+//                                      "max_pct","samples","source","limit_pct","busy"}.
 //
-// --allow-busy --idle-util-pct U (passed by aegis-perf sweep after a busy idle
-// check) adds ,"idle_util_pct":U,"allow_busy":true to the row.
+// --idle-util-pct U [--idle-source S] [--allow-busy] (passed by aegis-perf sweep
+// after its idle check) add ,"idle_util_pct":U,"idle_source":S,"allow_busy":B
+// to the row; allow_busy is true only when the check found the GPU busy.
 //
 // The timing protocol and JSON row live in src/bench/harness.{h,cu}, shared
 // with aegis_tune. --check exits 1 if max_abs_err / max|ref| exceeds the
@@ -34,6 +37,7 @@ struct Args {
   bool list = false;
   bool idle_check = false, allow_busy = false;
   double idle_util_pct = -1;  // < 0: not recorded
+  std::string idle_source;
   int lt_rank = -1;           // cublaslt_best: only this heuristic rank (no selection)
   unsigned seed = 42;
 };
@@ -69,6 +73,7 @@ Args parse(int argc, char** argv) {
     else if (k == "--idle-check") a.idle_check = true;
     else if (k == "--allow-busy") a.allow_busy = true;
     else if (k == "--idle-util-pct") a.idle_util_pct = std::atof(next());
+    else if (k == "--idle-source") a.idle_source = next();
     else if (k == "--lt-rank") a.lt_rank = std::atoi(next());
     else { std::fprintf(stderr, "unknown arg %s\n", k.c_str()); std::exit(2); }
   }
@@ -95,8 +100,11 @@ int main(int argc, char** argv) {
   }
   if (a.idle_check) {
     const aegis::bench::IdleSample s = aegis::bench::idle_guard(a.allow_busy);  // exits 3 if busy
-    std::printf("{\"ok\":%s,\"mean_pct\":%.2f,\"max_pct\":%.0f,\"samples\":%d}\n",
-                s.ok ? "true" : "false", s.mean_pct, s.max_pct, s.samples);
+    const double limit = aegis::bench::idle_max_pct();
+    std::printf("{\"ok\":%s,\"mean_pct\":%.2f,\"max_pct\":%.0f,\"samples\":%d,\"source\":\"%s\",\"limit_pct\":%.2f,"
+                "\"busy\":%s}\n",
+                s.ok ? "true" : "false", s.mean_pct, s.max_pct, s.samples, s.ok ? s.source.c_str() : "none", limit,
+                aegis::bench::idle_busy(s, limit) ? "true" : "false");
     return 0;
   }
   // Resolved once, before timing, so lookup cost never lands in a timed rep.
@@ -115,11 +123,11 @@ int main(int argc, char** argv) {
   opt.warmup = a.warmup;
   opt.reps = a.reps;
   std::string extra;
-  if (a.idle_util_pct >= 0) {
-    char buf[96];
-    std::snprintf(buf, sizeof buf, ",\"idle_util_pct\":%.1f,\"allow_busy\":%s", a.idle_util_pct,
-                  a.allow_busy ? "true" : "false");
-    extra = buf;
+  if (a.idle_util_pct >= 0 || a.allow_busy || !a.idle_source.empty()) {
+    char util[32] = "null";
+    if (a.idle_util_pct >= 0) std::snprintf(util, sizeof util, "%.1f", a.idle_util_pct);
+    extra = std::string(",\"idle_util_pct\":") + util + ",\"allow_busy\":" + (a.allow_busy ? "true" : "false");
+    if (!a.idle_source.empty()) extra += ",\"idle_source\":\"" + a.idle_source + "\"";
   }
 
   // cublaslt_best: every heuristic algorithm is run, checked and timed; the
