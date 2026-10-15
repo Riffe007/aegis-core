@@ -17,76 +17,62 @@
   },
   "device": "NVIDIA GB10",
   "dram_latency": {
-    "source": {
-      "probe": "ptr_chase_latency",
-      "runs": [
-        {
-          "layout": "both",
-          "run_id": "6141123bbcc4"
-        },
-        {
-          "layout": "cross_page",
-          "run_id": "f1925d6a0fa4"
-        },
-        {
-          "layout": "both",
-          "run_id": "a825f4e557a3"
-        }
-      ]
+    "clock_spread_pct": 0.0,
+    "combine": "clocks within 2%: cycles and measured ns both combined",
+    "cycles": 956.6305,
+    "cycles_max": 964.767,
+    "cycles_min": 952.092,
+    "method": "dependent-load pointer chase, one thread, 128 B node stride, median of 5 repeats per point; cycles = median across points and runs; ns_at_ref = cycles / ref_clock_mhz, ref = the highest source-run SM clock",
+    "ns_at_ref": 397.4731799333549,
+    "ns_measured": {
+      "max": 400.853,
+      "median": 397.47249999999997,
+      "min": 395.587
     },
-    "value": {
-      "cycles": 960.66,
-      "method": "dependent-load pointer chase, one thread, 128 B node stride, median of 5 repeats per point; the value is the median across points and runs",
-      "ns": 381.25,
-      "ns_max": 400.853,
-      "ns_min": 370.439,
-      "points": 25,
-      "working_sets": ">= 32 MiB"
-    }
+    "points": 10,
+    "probe": "ptr_chase_latency",
+    "ref_clock_mhz": 2406.78,
+    "runs": [
+      {
+        "cycles": 956.6305,
+        "layout": "both",
+        "ns": 397.47249999999997,
+        "points": 10,
+        "run_id": "a825f4e557a3",
+        "sm_clock_mhz": 2406.78
+      }
+    ],
+    "working_sets": ">= 32 MiB"
   },
-  "generated_by": "aegis-perf emit-arch on spark-5822, 2026-10-14 20:14 UTC",
+  "generated_by": "aegis-perf emit-arch on spark-5822, 2026-10-15 00:30 UTC",
   "l2_bytes": 25165824,
   "l2_latency": {
-    "source": {
-      "clocks": [
-        {
-          "run_id": "6141123bbcc4",
-          "sm_clock_mhz": 2557.22
-        },
-        {
-          "run_id": "f1925d6a0fa4",
-          "sm_clock_mhz": 2558.06
-        },
-        {
-          "run_id": "a825f4e557a3",
-          "sm_clock_mhz": 2406.78
-        }
-      ],
-      "probe": "ptr_chase_latency",
-      "runs": [
-        {
-          "layout": "both",
-          "run_id": "6141123bbcc4"
-        },
-        {
-          "layout": "cross_page",
-          "run_id": "f1925d6a0fa4"
-        },
-        {
-          "layout": "both",
-          "run_id": "a825f4e557a3"
-        }
-      ]
+    "clock_spread_pct": 0.0,
+    "combine": "clocks within 2%: cycles and measured ns both combined",
+    "cycles": 335.437,
+    "cycles_max": 335.448,
+    "cycles_min": 335.379,
+    "method": "dependent-load pointer chase, one thread, 128 B node stride, median of 5 repeats per point; cycles = median across points and runs; ns_at_ref = cycles / ref_clock_mhz, ref = the highest source-run SM clock",
+    "ns_at_ref": 139.3716916377899,
+    "ns_measured": {
+      "max": 139.376,
+      "median": 139.37150000000003,
+      "min": 139.347
     },
-    "value": {
-      "cycles": 337.9465,
-      "method": "dependent-load pointer chase, one thread, 128 B node stride, median of 5 repeats per point; the value is the median across points and runs",
-      "ns": 132.292,
-      "ns_max": 139.376,
-      "ns_min": 132.115,
-      "points": 30,
-      "working_sets": "256 KiB - 8 MiB"
-    }
+    "points": 12,
+    "probe": "ptr_chase_latency",
+    "ref_clock_mhz": 2406.78,
+    "runs": [
+      {
+        "cycles": 335.437,
+        "layout": "both",
+        "ns": 139.37150000000003,
+        "points": 12,
+        "run_id": "a825f4e557a3",
+        "sm_clock_mhz": 2406.78
+      }
+    ],
+    "working_sets": "256 KiB - 8 MiB"
   },
   "mma_peak": {
     "at": {
@@ -120,7 +106,7 @@
     "value": 257.841
   },
   "roof_rule": "memory roof: read_bw_gbps for GEMV and decode shapes (M <= 16), copy_bw_gbps elsewhere",
-  "schema": "aegis-arch-params/1",
+  "schema": "aegis-arch-params/2",
   "sm_arch": 121,
   "sm_count": 48
 }

@@ -280,6 +280,11 @@ only to compare with old rows (`--protocol 1`).
   `AEGIS_SM87_GATE`, ctest `sm87_gate`, on in the pre-commit hook), and the
   Jetson items in the milestone list wait.
 
+- **Generated hardware-model files belong to Core (2026-10-15).** Hardware-model
+  files (arch/*.json, winners headers) are generated only by Core sessions.
+  Other projects may change the aegis-perf library API, via a separate git
+  worktree, never the main working tree.
+
 ## Architecture notes you must respect
 
 - GB10 (sm_121) is consumer-lineage Blackwell. It does **not** have the sm_100
