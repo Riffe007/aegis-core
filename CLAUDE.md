@@ -32,12 +32,12 @@ exports only `aegis_*`; changing a signature there means bumping
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DAEGIS_SM87_GATE=ON  # arch: local GPU ("native"); + sm_87 compile gate
 cmake --build build -j                            # kernels, bench, C ABI (.a/.so), microbench
-ctest --test-dir build --output-on-failure        # every impl on odd shapes, matmul dispatch, C ABI, sm87_gate
+tools/gpu_lock.sh ctest --test-dir build --output-on-failure   # GPU lock (rule 15); every impl on odd shapes, matmul dispatch, C ABI, sm87_gate
 ./build/aegis_manifest > results/manifest-$(hostname).json
 
 # Rust (needs the CMake build first: aegis-sys links build/libaegis_capi.so)
 cargo build --release --manifest-path rust/Cargo.toml
-cargo test --release --manifest-path rust/Cargo.toml   # bindings vs CPU reference, schema parity
+tools/gpu_lock.sh cargo test --release --manifest-path rust/Cargo.toml   # bindings vs CPU reference (GPU), schema parity
 cargo clippy --release --all-targets --manifest-path rust/Cargo.toml
 # AEGIS_LIB_DIR=/path/to/build overrides where aegis-sys finds the library.
 
@@ -48,7 +48,7 @@ rust/target/release/aegis-perf emit-header        # winners -> include/aegis/win
 rust/target/release/aegis-perf roofline --arch 121  # results/roofline-sm121.svg from measured roofs
 rust/target/release/aegis-perf emit-arch --arch 121  # include/aegis/arch/sm_121.json: measured L2/DRAM latency, DRAM bw, mma peak
 tools/sass_dump.sh                                # SASS + register usage per kernel
-microbench/run_all.sh                             # hardware probes -> perf DB microbench table
+microbench/run_all.sh                             # hardware probes -> perf DB microbench table (takes the GPU lock)
 ./build/aegis_fuzz --cases 2000 --seed 1          # randomized correctness vs FP64 / cuBLASLt (ctest fuzz_2000)
 cmake --build build --target fuzz_nightly         # 50,000 fuzz cases
 tools/sanitize.sh                                 # ctest suite under compute-sanitizer memcheck/racecheck/initcheck/synccheck
@@ -158,6 +158,19 @@ docs/               LOG.md (dated run log), analysis/ (consolidated analyses, e.
    free when `free` said 112). This, not the cgroup cap, is the real protection
    on unified memory: the driver does not charge device allocations to the
    job's cgroup. Tests: ctest `gpu_budget_*` (deliberate oversize requests).
+14. **One session owns main at a time. Nobody force-pushes main.** Every
+   other session works on its own branch (in a separate `git worktree add`
+   when the main working tree is in use) and stops for review; the owner of
+   main merges. No session pushes or rewrites another's branch.
+15. **All GPU work holds the exclusive GPU lock**: an flock on
+   `results/gpu.lock` (`tools/gpu_lock.sh CMD`, or in-process in aegis-perf).
+   Tunes, sweeps, paired-ab, microbench (`run_all.sh`), sanitizers, the
+   nightly fuzz (`tools/gpu_job.sh` locks too) and GPU ctests. Every ctest
+   but the compile-only `sm87_gate` is labelled `gpu` and fails its
+   `gpu_lock_guard` fixture unless the run holds the lock. The holder is
+   written into the lock file. A busy lock is refused (exit 75), never waited
+   for silently; the pre-commit hook then runs `ctest -LE gpu` only and says
+   that it skipped the GPU tests.
 
 ## Production bar (minimum for "done")
 

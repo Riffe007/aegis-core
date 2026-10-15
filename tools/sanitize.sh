@@ -23,6 +23,8 @@
 # error or ended without a sanitizer summary.
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# The whole run holds the GPU lock (rule 15).
+[[ -n "${AEGIS_GPU_LOCK_HELD:-}" ]] || exec "$ROOT/tools/gpu_lock.sh" "$0" "$@"
 BUILD="${BUILD:-$ROOT/build}"
 SAN="${SANITIZER:-$(command -v compute-sanitizer || echo /usr/local/cuda/bin/compute-sanitizer)}"
 FUZZ_CASES="${FUZZ_CASES:-100}"
@@ -30,7 +32,7 @@ TOOLS=("$@")
 [[ ${#TOOLS[@]} -eq 0 ]] && TOOLS=(memcheck racecheck initcheck synccheck)
 
 mapfile -t ALL < <(ctest --test-dir "$BUILD" --show-only=json-v1 |
-  jq -r '.tests[] | select(.name != "sm87_gate" and (.name | startswith("memcheck_") | not)
+  jq -r '.tests[] | select(.name != "sm87_gate" and .name != "gpu_lock_guard" and (.name | startswith("memcheck_") | not)
                            and (.name | startswith("gpu_budget_") | not))
          | .name + "\t" + (.command | @sh)')
 

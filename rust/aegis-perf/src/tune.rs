@@ -32,6 +32,7 @@ pub fn cmd_tune(a: &TuneArgs) -> Result<()> {
     if !exe.exists() {
         bail!("{} not found; run cmake --build build first", exe.display());
     }
+    let _gpu = crate::gpujob::lock(&format!("aegis-perf tune --shapes {}", a.shapes.display()))?;
     std::fs::create_dir_all(a.results)?;
     let host = db::hostname();
     let manifest = a.results.join(format!("manifest-{host}.json"));

@@ -118,6 +118,7 @@ pub fn cmd_sweep(
         bail!("{} not found; run cmake --build build first", bench.display());
     }
     std::fs::create_dir_all(results)?;
+    let _gpu = crate::gpujob::lock("aegis-perf sweep")?;
     let host = db::hostname();
     let manifest = results.join(format!("manifest-{host}.json"));
     if !manifest.exists() {

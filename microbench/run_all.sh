@@ -9,6 +9,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# The whole run holds the GPU lock (rule 15).
+[[ -n "${AEGIS_GPU_LOCK_HELD:-}" ]] || exec "$ROOT/tools/gpu_lock.sh" "$0" "$@"
 BIN="$ROOT/build/microbench"
 HOST="$(hostname)"
 OUT="$ROOT/results/microbench-$HOST-$(date +%Y%m%d-%H%M%S).jsonl"

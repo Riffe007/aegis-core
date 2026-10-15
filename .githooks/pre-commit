@@ -41,7 +41,18 @@ if ! cmake --build build -j >/tmp/aegis-precommit-build.log 2>&1; then
   echo "pre-commit: build failed; commit refused (full log: /tmp/aegis-precommit-build.log)" >&2
   exit 1
 fi
-if ! ctest --test-dir build --output-on-failure -j4 >/tmp/aegis-precommit-ctest.log 2>&1; then
+# GPU tests run under the GPU lock (rule 15). If another job holds it (a tune,
+# a sweep, another session's ctest), only the non-GPU tests run: GPU tests
+# would contaminate that job, so they are skipped, and the hook says so.
+rc=0
+tools/gpu_lock.sh ctest --test-dir build --output-on-failure -j4 >/tmp/aegis-precommit-ctest.log 2>&1 || rc=$?
+if [[ $rc -eq 75 ]]; then
+  echo "pre-commit: GPU lock held by: $(head -c 300 results/gpu.lock 2>/dev/null)" >&2
+  echo "pre-commit: SKIPPING GPU tests (ctest -LE gpu); run them before merging: tools/gpu_lock.sh ctest --test-dir build" >&2
+  rc=0
+  ctest --test-dir build --output-on-failure -j4 -LE gpu >/tmp/aegis-precommit-ctest.log 2>&1 || rc=$?
+fi
+if [[ $rc -ne 0 ]]; then
   tail -40 /tmp/aegis-precommit-ctest.log >&2
   echo "pre-commit: ctest failed; commit refused (full log: /tmp/aegis-precommit-ctest.log)" >&2
   exit 1

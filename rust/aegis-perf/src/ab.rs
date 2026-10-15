@@ -75,6 +75,7 @@ pub fn bootstrap(ratios: &[f64], resamples: usize, seed: u64) -> (f64, f64, f64)
 }
 
 pub fn cmd_paired_ab(a: &AbArgs) -> Result<()> {
+    let _gpu = crate::gpujob::lock(&format!("aegis-perf paired-ab {} vs {}", a.impl_a, a.impl_b))?;
     let (mut ta, mut tb, mut ratios) = (Vec::new(), Vec::new(), Vec::new());
     for i in 0..a.pairs {
         // Alternate which side runs first so neither always follows the other.

@@ -22,5 +22,9 @@ CAP="${AEGIS_MEM_MAX:-24G}"
 for tool in systemd-run choom; do
   command -v "$tool" >/dev/null || { echo "gpu_job.sh: $tool not found; refusing to run an unguarded GPU job" >&2; exit 2; }
 done
+# The GPU lock (rule 15): taken here unless the caller already holds it.
+if [[ -z "${AEGIS_GPU_LOCK_HELD:-}" ]]; then
+  exec "$(dirname "$0")/gpu_lock.sh" "$0" "$@"
+fi
 exec systemd-run --user --scope --quiet --collect -p MemoryMax="$CAP" -p MemorySwapMax=0 -- \
   choom -n 1000 -- "$@"
