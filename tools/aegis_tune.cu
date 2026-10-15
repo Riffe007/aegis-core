@@ -210,7 +210,10 @@ int main(int argc, char** argv) {
       done.push_back(d);
     }
     // Paired tie tests (v2): the fastest cold config against the runner-up and
-    // against cublaslt_best, kPairedWindows alternating windows each.
+    // against cublaslt_best, kPairedWindows alternating windows each. When the
+    // runner-up can be dispatched (tie, or faster in the paired windows: CI not
+    // entirely above 1.0), it is also paired with cublaslt_best, so the winner's
+    // baseline CI is always of the config aegis::matmul runs.
     if (a.protocol == 2 && a.paired) {
       std::vector<const Done*> ours;
       const Done* ltd = nullptr;
@@ -233,9 +236,12 @@ int main(int argc, char** argv) {
         std::fflush(stdout);
         std::fprintf(stderr, "  paired %-28s vs %-28s ratio %.4f [%.4f, %.4f] %s\n", w.name, o.name, r.median,
                      r.ci_lo, r.ci_hi, r.tied ? "TIED" : "");
+        return r;
       };
-      if (ours.size() >= 2) pair_row(*ours[0], *ours[1], "runner_up");
+      bool runner_up_can_win = false;
+      if (ours.size() >= 2) runner_up_can_win = !(pair_row(*ours[0], *ours[1], "runner_up").ci_lo > 1.0);
       if (!ours.empty() && ltd) pair_row(*ours[0], *ltd, "cublaslt_best");
+      if (runner_up_can_win && ltd) pair_row(*ours[1], *ltd, "cublaslt_best");
       if (!a.pair_with.empty() && !ours.empty())  // e.g. the previous winner
         for (const Done* d : ours)
           if (d->name == a.pair_with && d != ours[0] && (ours.size() < 2 || d != ours[1]))

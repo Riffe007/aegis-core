@@ -587,10 +587,6 @@ pub fn cmd_winners(db: &Path, arch: Option<i64>) -> Result<()> {
         let ours: Vec<&Latest> = rs.iter().copied().filter(|r| !is_baseline(&r.impl_)).collect();
         let call = tie_set(&ours, &paired);
         let tie = &call.set;
-        let lt_ci = match (tie.first(), lt_best) {
-            (Some(w), Some(lt)) => paired_ci(&paired, w, &lt.impl_, &lt.run_id),
-            _ => None,
-        };
         let Some(&fastest) = tie.first() else { continue };
         let (pick, reason) = if tie.len() == 1 {
             let why = if call.method == "paired_swap" {
@@ -625,6 +621,11 @@ pub fn cmd_winners(db: &Path, arch: Option<i64>) -> Result<()> {
             };
             (pick, format!("tie-break: {by}"))
         };
+        // The cublaslt_best CI of the dispatched config: from a paired test of
+        // the pick itself, never of the other config in its tie (aegis_tune
+        // pairs the runner-up too whenever it can become the pick). None when
+        // no such test exists (rows tuned before that).
+        let lt_ci = lt_best.and_then(|lt| paired_ci(&paired, pick, &lt.impl_, &lt.run_id));
         let pct = cublas.map(|c| c.median_us / pick.median_us * 100.0);
         let pct_lt = lt_best.map(|c| c.median_us / pick.median_us * 100.0);
         let set_json = serde_json::to_string(&tie.iter().map(|r| r.impl_.as_str()).collect::<Vec<_>>())?;
@@ -826,6 +827,60 @@ mod tests {
             })
             .unwrap();
         assert_eq!((p, busy, cache), (1, 0, None));
+    }
+
+    /// A tie where the tie-break dispatches the runner-up (fewer registers):
+    /// the winner's cublaslt_best CI is the runner-up's own paired test, and
+    /// absent (never the fastest config's) when only the fastest was paired.
+    #[test]
+    fn winner_lt_ci_is_of_the_dispatched_config() {
+        let p = std::env::temp_dir().join(format!("aegis-perf-ltci-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        let seed = |with_pick_pairing: bool| {
+            let con = connect(&p).unwrap();
+            con.execute_batch(
+                "DELETE FROM winners; DELETE FROM measurements; DELETE FROM paired; DELETE FROM runs; DELETE FROM kernels;
+                 INSERT INTO runs (run_id, device_id, sm_arch, started_at) VALUES ('r', 'dev', 121, '2026-01-01');
+                 INSERT INTO kernels (kernel_id, op, impl, config_json, regs, smem_bytes) VALUES
+                   ('kf', 'gemm', 'fast', '{}', 128, 0), ('kp', 'gemm', 'pick', '{}', 64, 0),
+                   ('kl', 'gemm', 'cublaslt_best', '{}', -1, 0);
+                 INSERT INTO measurements (run_id, kernel_id, dtype, m, n, k, median_us, p10_us, p90_us, tflops,
+                                           checked, pass, protocol_version, cache_mode, allow_busy) VALUES
+                   ('r', 'kf', 'f16f32f16', 64, 64, 64, 10.0, 9.9, 10.1, 1, 1, 1, 2, 'cold', 0),
+                   ('r', 'kp', 'f16f32f16', 64, 64, 64, 10.05, 9.9, 10.2, 1, 1, 1, 2, 'cold', 0),
+                   ('r', 'kl', 'f16f32f16', 64, 64, 64, 9.0, 8.9, 9.1, 1, 0, 0, 2, 'cold', 0);
+                 INSERT INTO paired (run_id, op, dtype, m, n, k, a_impl, b_impl, role, pairs, ratio_median,
+                                     ratio_ci_lo, ratio_ci_hi, tied, protocol_version, cache_mode) VALUES
+                   ('r', 'gemm', 'f16f32f16', 64, 64, 64, 'fast', 'pick', 'runner_up', 30, 1.0, 0.99, 1.01, 1, 2, 'cold'),
+                   ('r', 'gemm', 'f16f32f16', 64, 64, 64, 'fast', 'cublaslt_best', 'cublaslt_best', 30, 0.9, 0.89, 0.91, 0, 2, 'cold');",
+            )
+            .unwrap();
+            if with_pick_pairing {
+                con.execute_batch(
+                    "INSERT INTO paired (run_id, op, dtype, m, n, k, a_impl, b_impl, role, pairs, ratio_median,
+                                         ratio_ci_lo, ratio_ci_hi, tied, protocol_version, cache_mode) VALUES
+                       ('r', 'gemm', 'f16f32f16', 64, 64, 64, 'pick', 'cublaslt_best', 'cublaslt_best', 30, 0.88,
+                        0.87, 0.89, 0, 2, 'cold');",
+                )
+                .unwrap();
+            }
+        };
+        let winner = || -> (String, Option<f64>, Option<f64>) {
+            let con = connect(&p).unwrap();
+            con.query_row(
+                "SELECT k.impl, w.lt_ratio_ci_lo, w.lt_ratio_ci_hi FROM winners w JOIN kernels k USING(kernel_id)",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap()
+        };
+        seed(false);
+        cmd_winners(&p, Some(121)).unwrap();
+        assert_eq!(winner(), ("pick".to_string(), None, None), "fastest config's CI must not be borrowed");
+        seed(true);
+        cmd_winners(&p, Some(121)).unwrap();
+        assert_eq!(winner(), ("pick".to_string(), Some(0.87), Some(0.89)));
+        std::fs::remove_file(&p).unwrap();
     }
 
     #[test]
