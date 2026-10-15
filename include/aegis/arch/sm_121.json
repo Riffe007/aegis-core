@@ -22,25 +22,41 @@
       "runs": [
         {
           "layout": "both",
+          "run_id": "6141123bbcc4"
+        },
+        {
+          "layout": "cross_page",
+          "run_id": "f1925d6a0fa4"
+        },
+        {
+          "layout": "both",
           "run_id": "a825f4e557a3"
         }
       ]
     },
     "value": {
-      "cycles": 956.6305,
+      "cycles": 960.66,
       "method": "dependent-load pointer chase, one thread, 128 B node stride, median of 5 repeats per point; the value is the median across points and runs",
-      "ns": 397.47249999999997,
+      "ns": 381.25,
       "ns_max": 400.853,
-      "ns_min": 395.587,
-      "points": 10,
+      "ns_min": 370.439,
+      "points": 25,
       "working_sets": ">= 32 MiB"
     }
   },
-  "generated_by": "aegis-perf emit-arch on spark-5822, 2026-10-15 00:09 UTC",
+  "generated_by": "aegis-perf emit-arch on spark-5822, 2026-10-14 20:14 UTC",
   "l2_bytes": 25165824,
   "l2_latency": {
     "source": {
       "clocks": [
+        {
+          "run_id": "6141123bbcc4",
+          "sm_clock_mhz": 2557.22
+        },
+        {
+          "run_id": "f1925d6a0fa4",
+          "sm_clock_mhz": 2558.06
+        },
         {
           "run_id": "a825f4e557a3",
           "sm_clock_mhz": 2406.78
@@ -50,17 +66,25 @@
       "runs": [
         {
           "layout": "both",
+          "run_id": "6141123bbcc4"
+        },
+        {
+          "layout": "cross_page",
+          "run_id": "f1925d6a0fa4"
+        },
+        {
+          "layout": "both",
           "run_id": "a825f4e557a3"
         }
       ]
     },
     "value": {
-      "cycles": 335.437,
+      "cycles": 337.9465,
       "method": "dependent-load pointer chase, one thread, 128 B node stride, median of 5 repeats per point; the value is the median across points and runs",
-      "ns": 139.37150000000003,
+      "ns": 132.292,
       "ns_max": 139.376,
-      "ns_min": 139.347,
-      "points": 12,
+      "ns_min": 132.115,
+      "points": 30,
       "working_sets": "256 KiB - 8 MiB"
     }
   },
