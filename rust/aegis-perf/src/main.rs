@@ -57,6 +57,17 @@ enum Cmd {
         #[arg(long)]
         allow_busy: bool,
     },
+    /// Mark a microbench run's rows invalidated (known bad; hidden everywhere).
+    Invalidate {
+        #[arg(long)]
+        run: String,
+        /// Only this probe's rows (default: every probe of the run).
+        #[arg(long)]
+        probe: Option<String>,
+        /// Why the measurement is bad (required).
+        #[arg(long)]
+        reason: String,
+    },
     /// Recompute the best kernel per (arch, shape).
     Winners {
         #[arg(long)]
@@ -145,7 +156,8 @@ enum Cmd {
         #[arg(long)]
         arch: i64,
         /// Pointer-chase runs to use, RUN or RUN:LAYOUT (cross_page / page_local_64k);
-        /// repeatable. Default: every current (non-superseded) run.
+        /// repeatable (replaced runs allowed, invalidated refused). Default: the newest
+        /// valid run (else the newest replaced one).
         #[arg(long = "ptr-chase")]
         ptr_chase: Vec<String>,
         #[arg(long)]
@@ -192,6 +204,7 @@ fn main() -> Result<()> {
             let idle = db::RunIdle { pct: idle_util_pct, source: idle_source, allow_busy };
             db::cmd_ingest_microbench(&cli.db, &results, manifest.as_deref(), run_id, &idle)
         }
+        Cmd::Invalidate { run, probe, reason } => db::cmd_invalidate(&cli.db, &run, probe.as_deref(), &reason),
         Cmd::Winners { arch } => db::cmd_winners(&cli.db, arch),
         Cmd::Report { arch, protocol, cache, include_busy, baseline } => {
             db::cmd_report(&cli.db, arch, &db::Selection { protocol, cache, include_busy }, baseline.as_deref())

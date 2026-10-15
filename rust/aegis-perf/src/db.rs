@@ -9,7 +9,7 @@ use std::process::{Command, Stdio};
 
 use anyhow::{bail, Context, Result};
 use rusqlite::types::Value as SqlValue;
-use rusqlite::{params, Connection, OpenFlags};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde_json::Value;
 use sha1::{Digest, Sha1};
 
@@ -58,8 +58,10 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("winners", "tied", "INTEGER NOT NULL DEFAULT 0"),
     ("winners", "tie_set", "TEXT"),
     ("winners", "pick_reason", "TEXT"),
-    ("microbench", "superseded", "INTEGER NOT NULL DEFAULT 0"),
-    ("microbench", "superseded_by", "TEXT"),
+    // Microbench row status (replaced the superseded flag; see migrate()).
+    ("microbench", "status", "TEXT NOT NULL DEFAULT 'valid' CHECK (status IN ('valid', 'replaced', 'invalidated'))"),
+    ("microbench", "status_reason", "TEXT CHECK (status <> 'invalidated' OR length(trim(coalesce(status_reason, ''))) > 0)"),
+    ("microbench", "replaced_by", "TEXT"),
     // Timing protocol v2: rows from before it get protocol_version = 1.
     ("measurements", "protocol_version", "INTEGER NOT NULL DEFAULT 1"),
     ("measurements", "batch_n", "INTEGER"),
@@ -136,6 +138,19 @@ fn migrate(con: &Connection) -> Result<()> {
                 )?;
             }
         }
+    }
+    // superseded (0/1) -> status: superseded rows were re-measured by a later
+    // run, which is "replaced" (still valid history), never "invalidated".
+    let has_superseded: bool =
+        con.prepare("SELECT 1 FROM pragma_table_info('microbench') WHERE name = 'superseded'")?.exists([])?;
+    if has_superseded {
+        con.execute_batch(
+            "SAVEPOINT superseded_to_status;
+             UPDATE microbench SET status = 'replaced', replaced_by = superseded_by WHERE superseded = 1;
+             ALTER TABLE microbench DROP COLUMN superseded_by;
+             ALTER TABLE microbench DROP COLUMN superseded;
+             RELEASE superseded_to_status;",
+        )?;
     }
     Ok(())
 }
@@ -409,18 +424,85 @@ pub fn cmd_ingest_microbench(
             probes.push(probe);
         }
     }
-    // Older rows of a re-measured probe on the same arch are kept, marked superseded.
-    let mut superseded = 0;
+    // Older valid rows of a re-measured probe on the same arch are kept as
+    // history, marked replaced (never invalidated: nothing says they were wrong).
+    let mut replaced = 0;
     for probe in &probes {
-        superseded += tx.execute(
-            "UPDATE microbench SET superseded = 1, superseded_by = ?1 \
-             WHERE probe = ?2 AND run_id <> ?1 AND superseded = 0 \
+        replaced += tx.execute(
+            "UPDATE microbench SET status = 'replaced', replaced_by = ?1 \
+             WHERE probe = ?2 AND run_id <> ?1 AND status = 'valid' \
                AND run_id IN (SELECT run_id FROM runs WHERE sm_arch = ?3)",
             params![run_id, probe, sql(Some(get(first, "sm_arch")?))],
         )?;
     }
     tx.commit()?;
-    println!("run {run_id}: ingested {} microbench rows; marked {superseded} older rows superseded", rows.len());
+    println!("run {run_id}: ingested {} microbench rows; marked {replaced} older rows replaced", rows.len());
+    Ok(())
+}
+
+/// The run the hardware model uses for a probe on an arch: the newest run with
+/// valid rows; if there is none, the newest replaced one (still valid history).
+/// Invalidated rows never count.
+pub fn current_run(con: &Connection, arch: i64, probe: &str) -> Result<Option<String>> {
+    for status in ["valid", "replaced"] {
+        let run: Option<String> = con
+            .query_row(
+                "SELECT m.run_id FROM microbench m JOIN runs r USING(run_id) \
+                 WHERE m.probe = ?1 AND r.sm_arch = ?2 AND m.status = ?3 ORDER BY r.started_at DESC LIMIT 1",
+                params![probe, arch, status],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if run.is_some() {
+            return Ok(run);
+        }
+    }
+    Ok(None)
+}
+
+/// Mark a run's microbench rows (all probes, or one) invalidated: known bad,
+/// hidden everywhere. The reason is required. If those rows were the current
+/// (valid) ones, the rows they had replaced become valid again, so the probe
+/// still has a current run; rows of a run that was itself already replaced
+/// leave the newer run current.
+pub fn invalidate_microbench(con: &mut Connection, run_id: &str, probe: Option<&str>, reason: &str) -> Result<usize> {
+    if reason.trim().is_empty() {
+        bail!("invalidating needs a reason");
+    }
+    let tx = con.transaction()?;
+    let probes: Vec<(String, String)> = tx
+        .prepare(
+            "SELECT DISTINCT probe, status FROM microbench WHERE run_id = ?1 AND (?2 IS NULL OR probe = ?2) \
+             AND status <> 'invalidated'",
+        )?
+        .query_map(params![run_id, probe], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    if probes.is_empty() {
+        bail!("run {run_id} has no microbench rows to invalidate{}", probe.map(|p| format!(" for probe {p}")).unwrap_or_default());
+    }
+    let mut n = 0;
+    for (p, status) in &probes {
+        n += tx.execute(
+            "UPDATE microbench SET status = 'invalidated', status_reason = ?3, replaced_by = NULL \
+             WHERE run_id = ?1 AND probe = ?2 AND status <> 'invalidated'",
+            params![run_id, p, reason],
+        )?;
+        if status == "valid" {
+            tx.execute(
+                "UPDATE microbench SET status = 'valid', replaced_by = NULL \
+                 WHERE probe = ?2 AND replaced_by = ?1 AND status = 'replaced'",
+                params![run_id, p],
+            )?;
+        }
+    }
+    tx.commit()?;
+    Ok(n)
+}
+
+pub fn cmd_invalidate(db: &Path, run_id: &str, probe: Option<&str>, reason: &str) -> Result<()> {
+    let mut con = connect(db)?;
+    let n = invalidate_microbench(&mut con, run_id, probe, reason)?;
+    println!("run {run_id}: invalidated {n} microbench rows ({reason})");
     Ok(())
 }
 
@@ -908,6 +990,103 @@ mod tests {
         assert_eq!(get("idle_run"), (Some(0.4), Some("nvml".into()), 0));
         assert_eq!(get("busy_run"), (Some(2.9), Some("nvml".into()), 1));
         assert_eq!(get("mb_run"), (Some(0.7), Some("nvml".into()), 0));
+        drop(con);
+        std::fs::remove_file(&db).ok();
+    }
+
+    /// The pre-status DB: superseded = 1 becomes replaced (with replaced_by),
+    /// superseded = 0 valid; the old columns are gone.
+    #[test]
+    fn migrate_superseded_to_status() {
+        let con = Connection::open_in_memory().unwrap();
+        con.execute_batch(
+            "CREATE TABLE runs (run_id TEXT PRIMARY KEY, device_id TEXT NOT NULL, sm_arch INTEGER NOT NULL,
+               gpu_name TEXT, cuda_ver INTEGER, driver_ver INTEGER, git_sha TEXT, power_mode TEXT, clocks_locked INTEGER,
+               temp_start_c REAL, measured_bw_gbps REAL, started_at TEXT NOT NULL);
+             CREATE TABLE microbench (run_id TEXT NOT NULL REFERENCES runs(run_id), probe TEXT NOT NULL,
+               param_json TEXT NOT NULL, value REAL, unit TEXT NOT NULL,
+               superseded INTEGER NOT NULL DEFAULT 0, superseded_by TEXT);
+             INSERT INTO runs (run_id, device_id, sm_arch, started_at) VALUES ('old', 'd', 121, '1'), ('new', 'd', 121, '2');
+             INSERT INTO microbench VALUES ('old', 'p', '{}', 1.0, 'ns', 1, 'new'), ('new', 'p', '{}', 2.0, 'ns', 0, NULL);",
+        )
+        .unwrap();
+        con.execute_batch(SCHEMA).unwrap();
+        migrate(&con).unwrap();
+        let rows: Vec<(String, String, Option<String>)> = con
+            .prepare("SELECT run_id, status, replaced_by FROM microbench ORDER BY run_id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![("new".into(), "valid".into(), None), ("old".into(), "replaced".into(), Some("new".into()))]
+        );
+        let has_old: bool = con
+            .prepare("SELECT 1 FROM pragma_table_info('microbench') WHERE name LIKE 'superseded%'")
+            .unwrap()
+            .exists([])
+            .unwrap();
+        assert!(!has_old, "superseded columns dropped");
+        migrate(&con).unwrap(); // idempotent
+    }
+
+    /// invalidated needs a reason; status takes only the three values.
+    #[test]
+    fn status_constraints() {
+        let con = Connection::open_in_memory().unwrap();
+        con.execute_batch(SCHEMA).unwrap();
+        migrate(&con).unwrap();
+        con.execute_batch("INSERT INTO runs (run_id, device_id, sm_arch, started_at) VALUES ('r', 'd', 121, '1');").unwrap();
+        let ins = |status: &str, reason: Option<&str>| {
+            con.execute(
+                "INSERT INTO microbench (run_id, probe, param_json, value, unit, status, status_reason) \
+                 VALUES ('r', 'p', '{}', 1.0, 'ns', ?1, ?2)",
+                params![status, reason],
+            )
+        };
+        assert!(ins("invalidated", None).is_err());
+        assert!(ins("invalidated", Some("  ")).is_err());
+        assert!(ins("invalidated", Some("clock throttled")).is_ok());
+        assert!(ins("superseded", None).is_err());
+        assert!(ins("replaced", None).is_ok());
+    }
+
+    /// Re-measuring replaces; invalidating the current run brings back the run
+    /// it had replaced; the hardware model's run follows (current_run).
+    #[test]
+    fn replace_invalidate_and_current_run() {
+        let db = tmp("status.db");
+        let _ = std::fs::remove_file(&db);
+        let idle = RunIdle::default();
+        for id in ["a", "b"] {
+            let f = tmp(&format!("{id}-mb.jsonl"));
+            std::fs::write(&f, r#"{"probe":"p","param":{},"value":1.0,"unit":"ns","sm_arch":121}"#.to_string() + "\n")
+                .unwrap();
+            cmd_ingest_microbench(&db, &f, None, Some(id.into()), &idle).unwrap();
+            std::fs::remove_file(&f).ok();
+            std::thread::sleep(std::time::Duration::from_millis(5)); // distinct started_at
+        }
+        let mut con = connect(&db).unwrap();
+        let status = |con: &Connection, id: &str| -> (String, Option<String>) {
+            con.query_row("SELECT status, replaced_by FROM microbench WHERE run_id = ?", [id], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap()
+        };
+        assert_eq!(status(&con, "a"), ("replaced".into(), Some("b".into())));
+        assert_eq!(current_run(&con, 121, "p").unwrap().as_deref(), Some("b"));
+
+        assert!(invalidate_microbench(&mut con, "b", None, " ").is_err(), "reason required");
+        assert_eq!(invalidate_microbench(&mut con, "b", Some("p"), "throttled run").unwrap(), 1);
+        assert_eq!(status(&con, "b").0, "invalidated");
+        assert_eq!(status(&con, "a"), ("valid".into(), None));
+        assert_eq!(current_run(&con, 121, "p").unwrap().as_deref(), Some("a"));
+
+        // Only replaced rows left: the newest replaced run is the fallback.
+        con.execute("UPDATE microbench SET status = 'replaced', replaced_by = 'b' WHERE run_id = 'a'", []).unwrap();
+        assert_eq!(current_run(&con, 121, "p").unwrap().as_deref(), Some("a"));
         drop(con);
         std::fs::remove_file(&db).ok();
     }

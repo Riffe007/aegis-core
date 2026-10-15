@@ -388,28 +388,40 @@ pub struct Microbench {
     pub param_json: String,
     pub value: Option<f64>,
     pub unit: String,
-    pub superseded: bool,
-    pub superseded_by: Option<String>,
+    pub status: MicrobenchStatus,
+    /// Replaced: the run_id of the newer run of the same probe.
+    pub replaced_by: Option<String>,
 }
 
-/// Microbench rows of an arch, oldest run first. Superseded rows (a later run
-/// re-measured the probe) are history: left out unless asked for.
-pub fn microbench(con: &Connection, arch: i64, include_superseded: bool) -> Result<Vec<Microbench>> {
+/// A microbench row's status. Invalidated rows (known bad) are never returned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MicrobenchStatus {
+    /// The probe's current measurement.
+    Valid,
+    /// A newer run of the same probe exists; still valid history.
+    Replaced,
+}
+
+/// Microbench rows of an arch, oldest run first: valid and replaced rows, each
+/// labelled. Invalidated rows (known bad, with a reason) are hidden everywhere.
+/// The hardware model uses the newest valid run per probe (db::current_run).
+pub fn microbench(con: &Connection, arch: i64) -> Result<Vec<Microbench>> {
     let mut stmt = con.prepare(
-        "SELECT m.run_id, m.probe, m.param_json, m.value, m.unit, m.superseded, m.superseded_by \
+        "SELECT m.run_id, m.probe, m.param_json, m.value, m.unit, m.status, m.replaced_by \
          FROM microbench m JOIN runs r USING(run_id) \
-         WHERE r.sm_arch = ?1 AND (?2 OR m.superseded = 0) ORDER BY r.started_at, m.rowid",
+         WHERE r.sm_arch = ?1 AND m.status <> 'invalidated' ORDER BY r.started_at, m.rowid",
     )?;
     let rows = stmt
-        .query_map(params![arch, include_superseded], |r| {
+        .query_map(params![arch], |r| {
+            let status: String = r.get(5)?;
             Ok(Microbench {
                 run_id: r.get(0)?,
                 probe: r.get(1)?,
                 param_json: r.get(2)?,
                 value: r.get(3)?,
                 unit: r.get(4)?,
-                superseded: r.get::<_, i64>(5)? != 0,
-                superseded_by: r.get(6)?,
+                status: if status == "replaced" { MicrobenchStatus::Replaced } else { MicrobenchStatus::Valid },
+                replaced_by: r.get(6)?,
             })
         })?
         .collect::<rusqlite::Result<_>>()?;
@@ -449,8 +461,9 @@ mod tests {
              INSERT INTO paired (run_id, op, dtype, m, n, k, a_impl, b_impl, role, ratio_median, ratio_ci_lo,
                                  ratio_ci_hi, tied, protocol_version, cache_mode) VALUES
                ('r1', 'gemm', 'f16f32f16', 64, 64, 64, 'mma_x', 'mma_y', 'runner_up', 1.0, 0.99, 1.01, 1, 2, 'cold');
-             INSERT INTO microbench (run_id, probe, param_json, value, unit, superseded) VALUES
-               ('r1', 'dram_bandwidth', '{}', 200.0, 'GB/s', 1), ('r2', 'dram_bandwidth', '{}', 230.0, 'GB/s', 0);",
+             INSERT INTO microbench (run_id, probe, param_json, value, unit, status, status_reason, replaced_by) VALUES
+               ('r1', 'dram_bandwidth', '{}', 200.0, 'GB/s', 'replaced', NULL, 'r2'), ('r2', 'dram_bandwidth', '{}', 230.0, 'GB/s', 'valid', NULL, NULL),
+               ('r2', 'ptr_chase_latency', '{}', 1.0, 'ns', 'invalidated', 'clock not recorded', NULL);",
         )
         .unwrap();
         p
@@ -502,11 +515,20 @@ mod tests {
     }
 
     #[test]
-    fn microbench_hides_superseded() {
+    fn microbench_hides_only_invalidated() {
         let p = seeded("mb");
         let con = db::connect_ro(&p).unwrap();
-        assert_eq!(microbench(&con, 121, false).unwrap().len(), 1);
-        assert_eq!(microbench(&con, 121, true).unwrap().len(), 2);
+        let rows = microbench(&con, 121).unwrap();
+        let got: Vec<(&str, &str, MicrobenchStatus)> =
+            rows.iter().map(|r| (r.run_id.as_str(), r.probe.as_str(), r.status)).collect();
+        assert_eq!(
+            got,
+            vec![
+                ("r1", "dram_bandwidth", MicrobenchStatus::Replaced),
+                ("r2", "dram_bandwidth", MicrobenchStatus::Valid),
+            ]
+        );
+        assert_eq!(rows[0].replaced_by.as_deref(), Some("r2"));
         std::fs::remove_file(&p).unwrap();
     }
 }

@@ -3,7 +3,7 @@
 //! from the perf DB (CLAUDE.md rule 8); each carries its source runs.
 //!
 //! - L2 / DRAM latency: ptr_chase_latency medians over the L2-resident working
-//!   sets (256 KiB..8 MiB) and the DRAM ones (>= 32 MiB), from non-superseded
+//!   sets (256 KiB..8 MiB) and the DRAM ones (>= 32 MiB), from non-invalidated
 //!   rows of the selected (run, layout) pairs. **Cycles are the primary value**
 //!   (clock-invariant); each source run's SM clock (sm_clock probe) is recorded,
 //!   and ns appears only derived, at a stated reference clock. When the runs'
@@ -56,13 +56,13 @@ pub struct RunPoints {
     pub ns: Vec<f64>,
 }
 
-/// Non-superseded pointer-chase medians of one (run, layout) in `unit`, with
+/// Non-invalidated pointer-chase medians of one (run, layout) in `unit`, with
 /// the working set inside [lo, hi].
 fn chase(con: &Connection, arch: i64, run: &str, variant: Option<&str>, unit: &str, lo: i64, hi: i64) -> Result<Vec<f64>> {
     let mut stmt = con.prepare(
         "SELECT m.value FROM microbench m JOIN runs r USING(run_id) \
          WHERE m.run_id = ?1 AND r.sm_arch = ?2 AND m.probe = 'ptr_chase_latency' AND m.unit = ?3 \
-           AND m.superseded = 0 \
+           AND m.status <> 'invalidated' \
            AND json_extract(m.param_json, '$.stat') = 'median' \
            AND (?4 IS NULL OR json_extract(m.param_json, '$.variant') = ?4) \
            AND json_extract(m.param_json, '$.working_set_bytes') BETWEEN ?5 AND ?6",
@@ -72,7 +72,7 @@ fn chase(con: &Connection, arch: i64, run: &str, variant: Option<&str>, unit: &s
         .collect::<rusqlite::Result<_>>()?;
     if vals.is_empty() {
         bail!(
-            "no current (non-superseded) ptr_chase_latency rows for run {run} ({}) on sm_{arch}",
+            "no ptr_chase_latency rows (invalidated excluded) for run {run} ({}) on sm_{arch}",
             variant.unwrap_or("both layouts")
         );
     }
@@ -150,14 +150,10 @@ pub fn latency_value(runs: &[RunPoints], sets: &str) -> Value {
 pub fn cmd_emit_arch(db_path: &Path, arch: i64, ptr_chase: &[String], results: &Path, out: Option<&Path>) -> Result<()> {
     let con = db::connect(db_path)?;
 
-    // Pointer-chase runs: given, or every current (non-superseded) one.
+    // Pointer-chase runs: given (replaced runs allowed; invalidated rows are
+    // never read), or the newest valid run (db::current_run).
     let sel = if ptr_chase.is_empty() {
-        let mut stmt = con.prepare(
-            "SELECT DISTINCT m.run_id FROM microbench m JOIN runs r USING(run_id) \
-             WHERE m.probe = 'ptr_chase_latency' AND m.superseded = 0 AND r.sm_arch = ?",
-        )?;
-        let runs: Vec<String> = stmt.query_map([arch], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
-        runs.into_iter().map(|r| (r, None)).collect()
+        db::current_run(&con, arch, "ptr_chase_latency")?.map(|r| (r, None)).into_iter().collect()
     } else {
         parse_selection(ptr_chase)
     };
@@ -167,15 +163,16 @@ pub fn cmd_emit_arch(db_path: &Path, arch: i64, ptr_chase: &[String], results: &
     let l2 = latency_value(&run_points(&con, arch, &sel, L2_SETS.0, L2_SETS.1)?, "256 KiB - 8 MiB");
     let dram = latency_value(&run_points(&con, arch, &sel, DRAM_MIN_SET, i64::MAX)?, ">= 32 MiB");
 
-    // DRAM bandwidth, per stream: the latest current median and its reps.
+    // DRAM bandwidth, per stream: the median and reps of the newest valid run.
+    let bw_run = db::current_run(&con, arch, "dram_bandwidth")?.context("no dram_bandwidth run; run microbench")?;
     let bandwidth = |method: &str, desc: &str| -> Result<Value> {
         let (value, run): (f64, String) = con
             .query_row(
-                "SELECT m.value, m.run_id FROM microbench m JOIN runs r USING(run_id) \
-                 WHERE m.probe = 'dram_bandwidth' AND m.superseded = 0 AND r.sm_arch = ?1 \
+                "SELECT m.value, m.run_id FROM microbench m \
+                 WHERE m.probe = 'dram_bandwidth' AND m.status <> 'invalidated' AND m.run_id = ?1 \
                    AND json_extract(m.param_json, '$.method') = ?2 \
-                   AND json_extract(m.param_json, '$.stat') = 'median' ORDER BY r.started_at DESC LIMIT 1",
-                params![arch, method],
+                   AND json_extract(m.param_json, '$.stat') = 'median'",
+                params![bw_run, method],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .with_context(|| format!("no dram_bandwidth {method} row; run build/microbench/mb_dram_bw and ingest"))?;
@@ -199,13 +196,14 @@ pub fn cmd_emit_arch(db_path: &Path, arch: i64, ptr_chase: &[String], results: &
          bytes read / time; median of 20 runs per rep, median of reps",
     )?;
 
-    // MMA peak: the highest current mma_throughput point.
+    // MMA peak: the highest point of the newest valid mma_throughput run.
+    let mma_cur = db::current_run(&con, arch, "mma_throughput")?.context("no mma_throughput run; run microbench")?;
     let (tflops, mma_param, mma_run): (f64, String, String) = con
         .query_row(
-            "SELECT m.value, m.param_json, m.run_id FROM microbench m JOIN runs r USING(run_id) \
-             WHERE m.probe = 'mma_throughput' AND m.unit = 'TFLOPS' AND m.superseded = 0 AND r.sm_arch = ? \
-             ORDER BY m.value DESC LIMIT 1",
-            [arch],
+            "SELECT m.value, m.param_json, m.run_id FROM microbench m \
+             WHERE m.probe = 'mma_throughput' AND m.unit = 'TFLOPS' AND m.status <> 'invalidated' \
+               AND m.run_id = ? ORDER BY m.value DESC LIMIT 1",
+            [&mma_cur],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .context("no mma_throughput rows")?;

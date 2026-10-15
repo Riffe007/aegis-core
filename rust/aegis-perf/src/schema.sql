@@ -74,8 +74,11 @@ CREATE TABLE IF NOT EXISTS microbench (
   param_json TEXT NOT NULL,
   value REAL,
   unit TEXT NOT NULL,
-  superseded INTEGER NOT NULL DEFAULT 0,  -- 1 once a later run re-measured this probe
-  superseded_by TEXT                      -- run_id of that later run
+  -- valid: current. replaced: a newer run of the same probe exists (still valid
+  -- history). invalidated: known bad; status_reason says why (required).
+  status TEXT NOT NULL DEFAULT 'valid' CHECK (status IN ('valid', 'replaced', 'invalidated')),
+  status_reason TEXT CHECK (status <> 'invalidated' OR length(trim(coalesce(status_reason, ''))) > 0),
+  replaced_by TEXT                        -- replaced: run_id of the newer run
 );
 CREATE INDEX IF NOT EXISTS idx_micro_probe ON microbench(probe);
 -- Paired tie tests (aegis_tune, protocol v2): `pairs` alternating windows of
