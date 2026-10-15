@@ -20,9 +20,11 @@ pub const SCHEMA: &str = include_str!("schema.sql");
 
 /// The schema version this binary reads and writes (table `schema_version`).
 /// 1: every DB before the table existed (microbench.superseded);
-/// 2: microbench status / clocks, runs idle reading, paired_results.
+/// 2: microbench status / clocks, runs idle reading, paired_results;
+/// 3: disturbed (the idle guard during the run) on runs, measurements, paired,
+///    microbench and paired_results.
 /// Bump it with every migration in migrate().
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// The DB's schema version: None when it has no schema_version table (a v1
 /// DB, or not yet created).
@@ -130,6 +132,16 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("runs", "idle_util_pct", "REAL"),
     ("runs", "idle_source", "TEXT"),
     ("runs", "allow_busy", "INTEGER NOT NULL DEFAULT 0"),
+    // The idle guard during the run (bench_gemm --idle-watch): 1 = other
+    // processes used the GPU above the limit mid-run, 0 = watched and clean,
+    // NULL = not watched. Every row of a disturbed run is marked.
+    ("runs", "disturbed", "INTEGER"),
+    ("runs", "disturbed_detail", "TEXT"),
+    ("measurements", "disturbed", "INTEGER"),
+    ("paired", "disturbed", "INTEGER"),
+    ("microbench", "disturbed", "INTEGER"),
+    ("paired_results", "disturbed", "INTEGER"),
+    ("paired_results", "disturbed_detail", "TEXT"),
 ];
 
 /// Reference implementations: always eligible (they are what --check compares
@@ -146,7 +158,7 @@ pub struct Selection {
     pub protocol: i64,
     /// v2 cache mode ("cold" / "warm"); ignored for protocol 1.
     pub cache: String,
-    /// Include rows measured on a busy GPU (--allow-busy).
+    /// Include rows measured on a busy GPU (--allow-busy) or disturbed mid-run.
     pub include_busy: bool,
 }
 
@@ -162,7 +174,7 @@ impl Selection {
             s += &format!(" AND m.cache_mode = '{}'", self.cache.replace('\'', "''"));
         }
         if !self.include_busy {
-            s += " AND m.allow_busy = 0";
+            s += " AND m.allow_busy = 0 AND coalesce(m.disturbed, 0) = 0";
         }
         s
     }
@@ -290,6 +302,27 @@ pub struct RunIdle {
     pub allow_busy: bool,
 }
 
+/// Store what the in-run idle watch saw on a run and on every row of it
+/// (measurements, paired tie tests, microbench): disturbed 1 / 0, or NULL when
+/// the watch had no source.
+pub fn mark_disturbed(con: &Connection, run_id: &str, w: &crate::watch::WatchReport) -> Result<()> {
+    let v = w.disturbed.map(i64::from);
+    let n = con.execute(
+        "UPDATE runs SET disturbed = ?2, disturbed_detail = ?3 WHERE run_id = ?1",
+        params![run_id, v, w.detail()],
+    )?;
+    if n == 0 {
+        bail!("no run {run_id}");
+    }
+    for table in ["measurements", "paired", "microbench"] {
+        con.execute(&format!("UPDATE {table} SET disturbed = ?2 WHERE run_id = ?1"), params![run_id, v])?;
+    }
+    if w.disturbed == Some(true) {
+        eprintln!("run {run_id}: every row marked disturbed=1 ({})", w.detail());
+    }
+    Ok(())
+}
+
 pub fn cmd_init(db: &Path) -> Result<()> {
     connect(db)?;
     println!("initialized {}", db.display());
@@ -302,7 +335,7 @@ pub fn cmd_ingest(
     manifest: Option<&Path>,
     run_id: Option<String>,
     temp_start: Option<f64>,
-) -> Result<()> {
+) -> Result<String> {
     let text = std::fs::read_to_string(results).with_context(|| format!("read {}", results.display()))?;
     let all: Vec<Value> = text
         .lines()
@@ -413,7 +446,7 @@ pub fn cmd_ingest(
     }
     tx.commit()?;
     println!("run {run_id}: ingested {} measurements, {} paired tie tests", rows.len(), paired.len());
-    Ok(())
+    Ok(run_id)
 }
 
 // arch, op, dtype, m, n, k, impl. Keyed by impl, not kernel_id: a code change that
@@ -430,7 +463,7 @@ pub fn cmd_ingest_microbench(
     manifest: Option<&Path>,
     run_id: Option<String>,
     idle: &RunIdle,
-) -> Result<()> {
+) -> Result<String> {
     let text = std::fs::read_to_string(results).with_context(|| format!("read {}", results.display()))?;
     let rows: Vec<Value> = text
         .lines()
@@ -497,7 +530,7 @@ pub fn cmd_ingest_microbench(
     }
     tx.commit()?;
     println!("run {run_id}: ingested {} microbench rows; marked {replaced} older rows replaced", rows.len());
-    Ok(())
+    Ok(run_id)
 }
 
 /// The run the hardware model uses for a probe on an arch: the newest run with
@@ -508,7 +541,7 @@ pub fn current_run(con: &Connection, arch: i64, probe: &str) -> Result<Option<St
         let run: Option<String> = con
             .query_row(
                 "SELECT m.run_id FROM microbench m JOIN runs r USING(run_id) \
-                 WHERE m.probe = ?1 AND r.sm_arch = ?2 AND m.status = ?3 ORDER BY r.started_at DESC LIMIT 1",
+                 WHERE m.probe = ?1 AND r.sm_arch = ?2 AND m.status = ?3 AND coalesce(m.disturbed, 0) = 0 ORDER BY r.started_at DESC LIMIT 1",
                 params![probe, arch, status],
                 |r| r.get(0),
             )
@@ -684,7 +717,7 @@ type PairedMap = HashMap<(String, i64, i64, i64, String, String), (f64, f64)>;
 fn load_paired(con: &Connection) -> Result<PairedMap> {
     let mut stmt = con.prepare(
         "SELECT run_id, m, n, k, a_impl, b_impl, ratio_ci_lo, ratio_ci_hi FROM paired \
-         WHERE protocol_version = 2 AND cache_mode = 'cold' AND allow_busy = 0",
+         WHERE protocol_version = 2 AND cache_mode = 'cold' AND allow_busy = 0 AND coalesce(disturbed, 0) = 0",
     )?;
     let rows = stmt.query_map([], |r| {
         Ok(((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?), (r.get(6)?, r.get(7)?)))
@@ -885,7 +918,7 @@ pub fn report_text(con: &Connection, arch: Option<i64>, sel: &Selection, baselin
     }
     let cache = if sel.protocol >= 2 { format!(", cache_mode={}", sel.cache) } else { String::new() };
     let busy = if sel.include_busy { "including" } else { "excluding" };
-    writeln!(out, "Rows: timing protocol v{}{cache}, {busy} --allow-busy rows.", sel.protocol)?;
+    writeln!(out, "Rows: timing protocol v{}{cache}, {busy} --allow-busy and disturbed rows.", sel.protocol)?;
     Ok(out)
 }
 
@@ -1054,6 +1087,53 @@ mod tests {
         std::fs::remove_file(&db).ok();
     }
 
+    /// A disturbed run: the run and every row of it are marked, its rows drop
+    /// out of ranking (Selection), and a clean run's rows get 0.
+    #[test]
+    fn mark_disturbed_marks_every_row_and_hides_it_from_ranking() {
+        let db = tmp("disturbed.db");
+        let _ = std::fs::remove_file(&db);
+        let f = tmp("disturbed.jsonl");
+        std::fs::write(&f, row(0.0, false) + "\n").unwrap();
+        let bad = cmd_ingest(&db, &f, None, Some("bad".into()), None).unwrap();
+        let good = cmd_ingest(&db, &f, None, Some("good".into()), None).unwrap();
+        std::fs::remove_file(&f).ok();
+        let con = connect(&db).unwrap();
+        let w = |d| crate::watch::WatchReport {
+            disturbed: Some(d),
+            windows: 5,
+            windows_over: if d { 2 } else { 0 },
+            max_other_pct: if d { 30.0 } else { 0.5 },
+            limit_pct: 2.0,
+            worst: "firefox (pid 7) 30.0% at T".into(),
+            error: String::new(),
+        };
+        mark_disturbed(&con, &bad, &w(true)).unwrap();
+        mark_disturbed(&con, &good, &w(false)).unwrap();
+        let rows: Vec<(String, Option<i64>)> = con
+            .prepare("SELECT run_id, disturbed FROM measurements ORDER BY run_id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(rows, vec![("bad".into(), Some(1)), ("good".into(), Some(0))]);
+        let detail: String =
+            con.query_row("SELECT disturbed_detail FROM runs WHERE run_id = 'bad'", [], |r| r.get(0)).unwrap();
+        assert!(detail.contains("2 of 5") && detail.contains("firefox"), "{detail}");
+        let ranked: Vec<String> = con
+            .prepare(&format!("SELECT m.run_id FROM measurements m WHERE 1 = 1{}", Selection::ranking().sql()))
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(ranked, vec!["good".to_string()]);
+        assert!(mark_disturbed(&con, "nope", &w(true)).is_err());
+        drop(con);
+        std::fs::remove_file(&db).ok();
+    }
+
     /// The pre-status DB: superseded = 1 becomes replaced (with replaced_by),
     /// superseded = 0 valid; the old columns are gone.
     #[test]
@@ -1109,19 +1189,20 @@ mod tests {
             )
             .unwrap();
         let err = connect_ro(&p).unwrap_err().to_string();
-        assert!(err.contains("DB schema v1, binary expects v2"), "{err}");
+        assert!(err.contains(&format!("DB schema v1, binary expects v{SCHEMA_VERSION}")), "{err}");
 
         drop(connect(&p).unwrap());
         let con = connect_ro(&p).unwrap();
         assert_eq!(schema_version(&con).unwrap(), Some(SCHEMA_VERSION));
         drop(con);
 
-        Connection::open(&p).unwrap().execute("UPDATE schema_version SET version = 3", []).unwrap();
+        let newer = SCHEMA_VERSION + 1;
+        Connection::open(&p).unwrap().execute("UPDATE schema_version SET version = ?", [newer]).unwrap();
         for err in [connect_ro(&p).unwrap_err().to_string(), connect(&p).unwrap_err().to_string()] {
-            assert!(err.contains("DB schema v3, binary expects v2"), "{err}");
+            assert!(err.contains(&format!("DB schema v{newer}, binary expects v{SCHEMA_VERSION}")), "{err}");
         }
         let con = Connection::open(&p).unwrap();
-        assert_eq!(schema_version(&con).unwrap(), Some(3), "a newer DB is not rewritten");
+        assert_eq!(schema_version(&con).unwrap(), Some(newer), "a newer DB is not rewritten");
         std::fs::remove_file(&p).unwrap();
     }
 

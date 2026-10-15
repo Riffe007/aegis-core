@@ -13,7 +13,7 @@
 //!     aegis-perf paired-ab --a OLD/build/bench_gemm --b build/bench_gemm --impl X --shape M N K
 use std::path::PathBuf;
 
-use aegis_perf::{ab, arch, db, roofline, sweep, tune};
+use aegis_perf::{ab, arch, db, regress, roofline, sweep, tune, watch};
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
@@ -56,6 +56,10 @@ enum Cmd {
         /// The guard found the GPU busy and the run went ahead anyway.
         #[arg(long)]
         allow_busy: bool,
+        /// bench_gemm --idle-watch output for the run (the idle guard during it):
+        /// disturbed is stored on the run and every row.
+        #[arg(long)]
+        watch: Option<PathBuf>,
     },
     /// Mark a microbench run's rows invalidated (known bad; hidden everywhere).
     Invalidate {
@@ -83,7 +87,7 @@ enum Cmd {
         /// v2 cache mode: cold or warm.
         #[arg(long, default_value = "cold")]
         cache: String,
-        /// Also show rows measured on a busy GPU (--allow-busy).
+        /// Also show rows measured on a busy GPU (--allow-busy) or disturbed mid-run.
         #[arg(long)]
         include_busy: bool,
         /// Baseline for the % cells: cublas or cublaslt_best (default: cublaslt_best
@@ -189,6 +193,12 @@ enum Cmd {
         /// 3 shapes, for iterating.
         #[arg(long)]
         quick: bool,
+        /// Shape file (M N K per line); overrides --quick and the default set.
+        #[arg(long)]
+        shapes: Option<PathBuf>,
+        /// Ingest only; do not recompute the winners table (nightly regression sweep).
+        #[arg(long)]
+        no_winners: bool,
         /// Run even if the idle guard finds the GPU busy (> 2% utilization); rows are marked.
         #[arg(long)]
         allow_busy: bool,
@@ -197,6 +207,15 @@ enum Cmd {
         #[arg(long, default_value = "results")]
         results_dir: PathBuf,
     },
+    /// Nightly regression check: each winners-header shape's dispatched impl, %
+    /// of cublaslt_best in RUN vs the newest earlier clean measurement (>3% drop
+    /// = regression). Read-only; the last line is a one-line summary.
+    Regress {
+        #[arg(long)]
+        run: String,
+        #[arg(long, default_value = "include/aegis/winners/sm_121.h")]
+        header: PathBuf,
+    },
 }
 
 fn main() -> Result<()> {
@@ -204,11 +223,19 @@ fn main() -> Result<()> {
     match cli.cmd {
         Cmd::Init => db::cmd_init(&cli.db),
         Cmd::Ingest { results, manifest, run_id, temp_start } => {
-            db::cmd_ingest(&cli.db, &results, manifest.as_deref(), run_id, temp_start)
+            db::cmd_ingest(&cli.db, &results, manifest.as_deref(), run_id, temp_start).map(|_| ())
         }
-        Cmd::IngestMicrobench { results, manifest, run_id, idle_util_pct, idle_source, allow_busy } => {
+        Cmd::IngestMicrobench { results, manifest, run_id, idle_util_pct, idle_source, allow_busy, watch } => {
             let idle = db::RunIdle { pct: idle_util_pct, source: idle_source, allow_busy };
-            db::cmd_ingest_microbench(&cli.db, &results, manifest.as_deref(), run_id, &idle)
+            let report = match &watch {
+                Some(p) => Some(watch::parse(&std::fs::read_to_string(p)?)?),
+                None => None,
+            };
+            let run_id = db::cmd_ingest_microbench(&cli.db, &results, manifest.as_deref(), run_id, &idle)?;
+            if let Some(r) = report {
+                db::mark_disturbed(&db::connect(&cli.db)?, &run_id, &r)?;
+            }
+            Ok(())
         }
         Cmd::Invalidate { run, probe, reason } => db::cmd_invalidate(&cli.db, &run, probe.as_deref(), &reason),
         Cmd::Winners { arch } => db::cmd_winners(&cli.db, arch),
@@ -251,8 +278,17 @@ fn main() -> Result<()> {
             let out = out.unwrap_or_else(|| PathBuf::from(format!("results/roofline-sm{arch}.svg")));
             roofline::cmd_roofline(&cli.db, arch, &out, arch_file.as_deref())
         }
-        Cmd::Sweep { impls, quick, allow_busy, build_dir, results_dir } => {
-            sweep::cmd_sweep(&cli.db, &build_dir, &results_dir, impls, quick, allow_busy)
-        }
+        Cmd::Sweep { impls, quick, shapes, no_winners, allow_busy, build_dir, results_dir } => sweep::cmd_sweep(&sweep::SweepArgs {
+            db: &cli.db,
+            build: &build_dir,
+            results: &results_dir,
+            impls,
+            quick,
+            shapes: shapes.as_deref(),
+            allow_busy,
+            no_winners,
+        })
+        .map(|_| ()),
+        Cmd::Regress { run, header } => regress::cmd_regress(&cli.db, &run, &header),
     }
 }

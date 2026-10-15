@@ -1,0 +1,11 @@
+# 03:00 every night. Not Persistent: a missed night is skipped, never run at
+# boot or login, when the desktop is busy.
+[Unit]
+Description=AEGIS Core nightly job at 03:00
+
+[Timer]
+OnCalendar=*-*-* 03:00:00
+Persistent=false
+
+[Install]
+WantedBy=timers.target

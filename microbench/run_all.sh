@@ -33,6 +33,11 @@ INGEST_IDLE=(--idle-source "$(jq -r .source <<<"$IDLE_JSON")")
 # After the guard: aegis_manifest measures DRAM bandwidth.
 [[ -f "$MANIFEST" ]] || "$ROOT/build/aegis_manifest" > "$MANIFEST"
 
+# The idle guard keeps sampling during the probes (rows marked disturbed if
+# other processes use the GPU above the limit mid-run).
+source "$ROOT/tools/idle_watch.sh"
+idle_watch_start "$ROOT/build/bench_gemm" "$OUT.watch.json"
+
 status=0
 for probe in ptr_chase mma_latency mma_throughput ldmatrix smem_banks cp_async dram_bw launch_overhead; do
   exe="$BIN/mb_$probe"
@@ -44,9 +49,10 @@ for probe in ptr_chase mma_latency mma_throughput ldmatrix smem_banks cp_async d
   fi
   grep -E "^    check|FAILED" "$SASS/$probe.sass.txt" >&2 || true
 done
+idle_watch_stop
 
 PERF="$ROOT/rust/target/release/aegis-perf"
 [[ -x "$PERF" ]] || { echo "missing $PERF; cargo build --release --manifest-path rust/Cargo.toml" >&2; exit 1; }
-(cd "$ROOT" && "$PERF" ingest-microbench "$OUT" --manifest "$MANIFEST" "${INGEST_IDLE[@]}")
+(cd "$ROOT" && "$PERF" ingest-microbench "$OUT" --manifest "$MANIFEST" "${INGEST_IDLE[@]}" --watch "$OUT.watch.json")
 echo "results: $OUT" >&2
 exit $status

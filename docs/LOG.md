@@ -1213,6 +1213,9 @@ runs any tuned winner and falls back to plain cuBLAS only for untuned shapes.
   73–75%.
 - e. **Power-controls probe** (deferred). Needs a passwordless sudoers entry
   for `nvidia-smi` and `cpupower`, which is not in place.
+- f. **Locked-clock pointer-chase re-run (headless, nightly or text console).**
+  Run `e3d94274b31d` was disturbed by Firefox and is invalidated; the arch
+  file still uses the unlocked run `a825f4e557a3`.
 
 ## 2026-10-15 — Phase B a re-run (prepared, then run by hand)
 
@@ -1298,6 +1301,13 @@ the file. To fall back meanwhile, invalidate the run:
 `aegis-perf invalidate --run e3d94274b31d --probe ptr_chase_latency --reason "..."`
 (emit-arch then uses the newest replaced run, `a825f4e557a3`).
 
+**Done (2026-10-15):** `e3d94274b31d` is invalidated (108 ptr_chase rows,
+reason "Firefox started on the GPU mid-run"), and the 144 rows of
+`a825f4e557a3` it had replaced are valid again. `emit-arch --arch 121` now
+selects `a825f4e557a3`. Its output equals the committed `sm_121.json` except
+for the `generated_by` timestamp, so the file is unchanged. The stash
+holding the disturbed file was dropped. The re-run is queued (item f).
+
 ## 2026-10-15 — Perf DB schema_version; aegis-perf 0.2.0
 
 The perf DB gets a `schema_version` table (one row). The current schema is
@@ -1310,3 +1320,72 @@ The live DB is stamped v2 (backup:
 `results/aegis_perf.db.bak-2026-10-14-pre-schema-version`). Binaries built
 before this change do not check the version; on a v2 DB they fail on the
 missing `superseded` column.
+
+## 2026-10-15 — Idle guard during the run; nightly job; schema v3
+
+**Idle guard during the run.** `bench_gemm --idle-watch --root <pid>` keeps
+sampling while a sweep, tune, paired-ab or microbench run executes. Every
+2 s it sums the SM utilization that NVML reports per process
+(`nvmlDeviceGetProcessUtilization`) over GPU processes outside the run's own
+process tree. Each window above the limit (2%) is logged on stderr. Any such
+window marks the run `disturbed = 1`, along with every row of it
+(measurements, paired, microbench, paired_results), plus a detail line naming
+the busiest process. Disturbed rows are excluded like `--allow-busy` rows.
+On GB10 the per-process numbers and the device total disagree in both
+directions. A cuBLAS 4096³ loop reads 92% on the device but 16–20% on its own
+process. The idle desktop reads ~1% on the device, while the per-process sum
+is ~5% (Xorg 3.9%). So with a desktop session up, most runs will be marked
+disturbed.
+
+The first version filtered samples by wall-clock time and failed in the
+pre-commit ctest. NVML on GB10 ignores `lastSeenTimeStamp`, and its sample
+timestamps are not a clock: they jumped from 3.4e9 to 5.6e10 within seconds,
+and one read near 2^64. Wall-clock filtering had worked only by accident. The
+watcher now polls every 250 ms, ignores timestamps, and averages each process
+over a 2 s window's polls; it passed 4 of 4 runs, alone and next to two fuzz
+processes. ctest
+`idle_watch_paths` checks that the run's own load is excluded while a watcher
+rooted at pid 1 counts it, and that a forced limit marks every window.
+
+**Perf DB schema v3** (the `disturbed` columns; additive). The live DB was
+migrated after a backup (`results/aegis_perf.db.bak-2026-10-14-pre-v3`); all
+older rows are `disturbed = NULL` (not watched). aegis-perf is 0.3.0. Not
+tagged: aegis-perf-v0.2.0 binaries refuse this DB with
+"DB schema v3, binary expects v2".
+
+**Nightly job** (`tools/nightly.sh`, user timer `aegis-nightly.timer` at 03:00,
+installed with `tools/nightly.sh --install`). Steps:
+1. Take the GPU lock and run the preflight and the idle guard. Busy or locked:
+   one line in `results/nightly.log`, exit 0.
+2. 50,000-case fuzz, seeded with the date.
+3. Regression sweep of `shapes/default.txt`: the impls of the committed
+   winners header plus cublas and cublaslt_best, with `--no-winners`, ingested.
+4. `aegis-perf regress` compares each shape's % of cublaslt_best with the
+   newest earlier clean measurement; a relative drop over 3% is flagged.
+5. Back up the DB to `~/backups/aegis_perf-<date>.db`, keeping the 14 newest.
+6. Write one summary line.
+
+The nightly job never touches the winners table, the winners headers or the
+arch files. The user manager has `Linger=no`, so the timer fires only while
+the user is logged in.
+
+**First run (manual, 2026-10-14 20:15, `systemctl --user start
+aegis-nightly.service`):** the guard read 0.9%.
+- **Fuzz: 1 failure in 50,000** (1003 s, seed 20261014). Case 24632:
+  `mma_pipe_128x128x32_2x4_s3`, the dispatched winner at 2048³.
+  - The case: 1951x624x3159, CR (column-major A, row-major B), lda=1956
+    ldb=625 ldc=635, alpha=-0.0127, beta=-1, B offset 2 (misaligned).
+  - Element (871, 532): got 1.00684, cuBLASLt reference 1.00977, allowed
+    0.00265 (about 10% over).
+  - It reproduces with `build/aegis_fuzz --seed 20261014 --case 24632
+    --poison` (0.4 s).
+  - `--cpu-ref-only` generates a different case for that number (not
+    misaligned), so it doesn't tell whether our kernel or the cuBLASLt
+    reference is off. **Open.**
+- **Sweep: skipped.** By the time the fuzz finished, the GPU was busy (2.8%
+  mean, max 8%) and the sweep's own idle guard refused. `nightly.sh` now logs
+  that as "sweep skipped: GPU busy" instead of FAIL. `aegis-perf regress` was
+  checked on existing tune runs instead (`41cc8ffb03fd`: 14/14 shapes, min
+  71.0%; it flags 1x896x4864 77.8 -> 74.9% against an older tune run).
+- The backup and the summary line work: `~/backups/aegis_perf-2026-10-14.db`,
+  integrity ok.

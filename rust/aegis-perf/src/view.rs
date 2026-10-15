@@ -33,11 +33,16 @@ pub struct Run {
     pub idle_source: Option<String>,
     /// The guard found the GPU busy and the run went ahead (--allow-busy).
     pub allow_busy: bool,
+    /// The idle guard during the run: Some(true) other processes used the GPU
+    /// above the limit mid-run (every row of the run is marked); Some(false)
+    /// watched and clean; None not watched.
+    pub disturbed: Option<bool>,
+    pub disturbed_detail: Option<String>,
 }
 
 const RUN_COLS: &str = "run_id, device_id, sm_arch, gpu_name, cuda_ver, driver_ver, git_sha, power_mode, \
                         clocks_locked, temp_start_c, measured_bw_gbps, started_at, idle_util_pct, idle_source, \
-                        allow_busy";
+                        allow_busy, disturbed, disturbed_detail";
 
 fn run_row(r: &Row) -> rusqlite::Result<Run> {
     Ok(Run {
@@ -56,6 +61,8 @@ fn run_row(r: &Row) -> rusqlite::Result<Run> {
         idle_util_pct: r.get(12)?,
         idle_source: r.get(13)?,
         allow_busy: r.get::<_, i64>(14)? != 0,
+        disturbed: r.get::<_, Option<i64>>(15)?.map(|d| d != 0),
+        disturbed_detail: r.get(16)?,
     })
 }
 
@@ -267,7 +274,7 @@ pub fn paired(con: &Connection, run_id: &str, (m, n, k): (i64, i64, i64)) -> Res
     let mut stmt = con.prepare(
         "SELECT run_id, a_impl, b_impl, role, pairs, ratio_median, ratio_ci_lo, ratio_ci_hi, tied FROM paired \
          WHERE run_id = ? AND m = ? AND n = ? AND k = ? \
-           AND protocol_version = 2 AND cache_mode = 'cold' AND allow_busy = 0",
+           AND protocol_version = 2 AND cache_mode = 'cold' AND allow_busy = 0 AND coalesce(disturbed, 0) = 0",
     )?;
     let rows = stmt
         .query_map(params![run_id, m, n, k], |r| {
@@ -472,6 +479,9 @@ pub struct PairedResult {
     pub clocks_locked: bool,
     pub started_at: String,
     pub finished_at: String,
+    /// The idle guard during the run (see [`Run::disturbed`]).
+    pub disturbed: Option<bool>,
+    pub disturbed_detail: Option<String>,
 }
 
 impl PairedResult {
@@ -500,7 +510,7 @@ pub fn paired_results(con: &Connection, f: &PairedResultFilter) -> Result<Vec<Pa
     let sha = f.sha.as_ref().map(|s| format!("{}%", s.replace('%', "")));
     let mut stmt = con.prepare(
         "SELECT id, sha_a, sha_b, shape, impl_a, impl_b, ratio, ci_lo, ci_hi, n, protocol_version, cache_mode, \
-                idle_reading, clocks_locked, started_at, finished_at FROM paired_results \
+                idle_reading, clocks_locked, started_at, finished_at, disturbed, disturbed_detail FROM paired_results \
          WHERE (?1 IS NULL OR impl_a = ?1 OR impl_b = ?1) AND (?2 IS NULL OR shape = ?2) \
            AND (?3 IS NULL OR sha_a LIKE ?3 OR sha_b LIKE ?3) ORDER BY started_at, id",
     )?;
@@ -528,6 +538,8 @@ pub fn paired_results(con: &Connection, f: &PairedResultFilter) -> Result<Vec<Pa
                 clocks_locked: r.get::<_, i64>(13)? != 0,
                 started_at: r.get(14)?,
                 finished_at: r.get(15)?,
+                disturbed: r.get::<_, Option<i64>>(16)?.map(|d| d != 0),
+                disturbed_detail: r.get(17)?,
             })
         })?
         .collect::<rusqlite::Result<_>>()?;
@@ -661,6 +673,8 @@ mod tests {
                     clocks_locked: false,
                     started_at: "2026-10-15T00:00:00+00:00".into(),
                     finished_at: "2026-10-15T00:05:00+00:00".into(),
+                    disturbed: None,
+                    disturbed_detail: None,
                 }
             };
             crate::ab::store(&con, &r("abc123-dirty", "mma_a", (4096, 4096, 4096), Some(2.9), 0.983, 1.016)).unwrap();

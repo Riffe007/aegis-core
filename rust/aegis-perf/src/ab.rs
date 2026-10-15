@@ -123,6 +123,10 @@ pub struct NewPairedResult {
     pub clocks_locked: bool,
     pub started_at: String,
     pub finished_at: String,
+    /// The idle guard during the run: Some(true) other processes used the GPU
+    /// above the limit mid-run; None not watched.
+    pub disturbed: Option<bool>,
+    pub disturbed_detail: Option<String>,
 }
 
 /// Insert one result; returns its id.
@@ -130,10 +134,12 @@ pub fn store(con: &rusqlite::Connection, r: &NewPairedResult) -> Result<i64> {
     let (m, n, k) = r.shape;
     con.execute(
         "INSERT INTO paired_results (sha_a, sha_b, shape, impl_a, impl_b, ratio, ci_lo, ci_hi, n, protocol_version, \
-         cache_mode, idle_reading, clocks_locked, started_at, finished_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+         cache_mode, idle_reading, clocks_locked, started_at, finished_at, disturbed, disturbed_detail) \
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         params![
             r.sha_a, r.sha_b, format!("{m}x{n}x{k}"), r.impl_a, r.impl_b, r.ratio, r.ci_lo, r.ci_hi, r.n as i64,
             r.protocol_version, r.cache_mode, r.idle_reading, r.clocks_locked as i64, r.started_at, r.finished_at,
+            r.disturbed.map(i64::from), r.disturbed_detail,
         ],
     )?;
     Ok(con.last_insert_rowid())
@@ -150,6 +156,7 @@ pub fn cmd_paired_ab(a: &AbArgs) -> Result<()> {
     let sha_a = a.sha_a.map(str::to_string).or_else(|| build_sha(a.a));
     let sha_b = a.sha_b.map(str::to_string).or_else(|| build_sha(a.b));
     let started_at = now();
+    let watch = crate::watch::Watch::start(a.b)?;
     let (mut ta, mut tb, mut ratios) = (Vec::new(), Vec::new(), Vec::new());
     let mut protocols = Vec::new();
     for i in 0..a.pairs {
@@ -167,6 +174,7 @@ pub fn cmd_paired_ab(a: &AbArgs) -> Result<()> {
         protocols.extend([x.1, y.1]);
     }
     let finished_at = now();
+    let report = watch.finish()?;
     if protocols.iter().any(|&p| p != protocols[0]) {
         bail!("builds A and B ran different timing protocols ({protocols:?}); not comparable");
     }
@@ -188,6 +196,8 @@ pub fn cmd_paired_ab(a: &AbArgs) -> Result<()> {
         clocks_locked: false, // paired-ab does not lock clocks
         started_at,
         finished_at,
+        disturbed: report.disturbed,
+        disturbed_detail: Some(report.detail()),
     };
     let id = store(&crate::db::connect(a.db)?, &result)?;
     println!(
@@ -213,6 +223,11 @@ pub fn cmd_paired_ab(a: &AbArgs) -> Result<()> {
         idle.limit_pct,
         if idle.busy { "; GPU BUSY, --allow-busy: not evidence for a performance claim" } else { "" }
     );
+    match result.disturbed {
+        Some(true) => println!("  DISTURBED mid-run (not evidence for a performance claim): {}", report.detail()),
+        Some(false) => println!("  idle watch: clean ({})", report.detail()),
+        None => println!("  idle watch: {}", report.detail()),
+    }
     Ok(())
 }
 

@@ -195,6 +195,9 @@ set_tests_properties(gpu_budget_minfree PROPERTIES ENVIRONMENT "AEGIS_GPU_MIN_FR
 # The blocking idle guard: busy aborts (exit 3) unless --allow-busy; rows carry the reading.
 add_test(NAME idle_guard_paths
          COMMAND ${CMAKE_SOURCE_DIR}/tests/test_idle_guard.sh $<TARGET_FILE:bench_gemm> $<TARGET_FILE:aegis_tune>)
+# The idle guard during a run: the run's own processes are excluded, others
+# over the limit make the run disturbed.
+add_test(NAME idle_watch_paths COMMAND ${CMAKE_SOURCE_DIR}/tests/test_idle_watch.sh $<TARGET_FILE:bench_gemm>)
 
 # GPU lock (CLAUDE.md rule 15): every test except the compile-only sm87_gate
 # touches the GPU, is labelled "gpu" and requires the gpu_lock_guard fixture,

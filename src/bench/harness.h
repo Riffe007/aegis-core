@@ -276,6 +276,25 @@ double idle_max_pct();
 inline bool idle_busy(const IdleSample& s, double limit) { return !s.ok || s.mean_pct > limit; }
 IdleSample idle_guard(bool allow_busy);
 
+// In-run idle watch: the idle guard keeps sampling while a run executes.
+// Every `window_ms` it sums, over GPU processes OUTSIDE the run's process tree
+// (pid `root` and its descendants), each process's mean SM utilization in the
+// window (NVML per-process samples, nvmlDeviceGetProcessUtilization, polled every
+// 250 ms; each process averaged over the polls of the window). A window
+// above `limit` makes the run disturbed; each such window is logged on stderr
+// as it happens. Stops when `stop(timeout_ms)` returns true (called every poll).
+// No per-process source (Tegra): ok = false, disturbed unknown.
+struct WatchReport {
+  bool ok = false;
+  std::string source, error;
+  double limit_pct = 0;
+  int windows = 0, windows_over = 0;
+  double max_other_pct = 0;  // the highest window sum
+  std::string worst;         // "name (pid P) X% at <UTC time>" for the highest window
+  bool disturbed() const { return ok && windows_over > 0; }
+};
+WatchReport watch_other_utilization(int root, double limit, int window_ms, bool (*stop)(int timeout_ms));
+
 // Event pairs around `samples` spin kernels of increasing length. Aborts on error.
 TimerResolution measure_timer_resolution(cudaStream_t stream, int samples = 1000);
 

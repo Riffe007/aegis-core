@@ -57,6 +57,8 @@ pub fn cmd_tune(a: &TuneArgs) -> Result<()> {
     if a.allow_busy {
         cmd.arg("--allow-busy");
     }
+    // aegis_tune runs its own idle guard first; the watch covers the whole tune.
+    let watch = crate::watch::Watch::start(&a.build.join("bench_gemm"))?;
     let t0 = Instant::now();
     let out = cmd
         .stdout(Stdio::piped())
@@ -64,12 +66,14 @@ pub fn cmd_tune(a: &TuneArgs) -> Result<()> {
         .output()
         .context("run aegis_tune")?;
     let wall = t0.elapsed().as_secs_f64();
+    let report = watch.finish()?;
     if !out.status.success() {
         bail!("aegis_tune failed ({})", out.status);
     }
     std::fs::write(&out_path, &out.stdout)?;
 
-    db::cmd_ingest(a.db, &out_path, Some(&manifest), None, None)?;
+    let run_id = db::cmd_ingest(a.db, &out_path, Some(&manifest), None, None)?;
+    db::mark_disturbed(&db::connect(a.db)?, &run_id, &report)?;
     db::cmd_winners(a.db, None)?;
     println!("\nresults: {}", out_path.display());
     println!("tune wall time (aegis_tune, measured by aegis-perf): {wall:.1} s\n");

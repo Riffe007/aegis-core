@@ -144,14 +144,37 @@ fn run_one(
     Ok(Some((row, line.to_string())))
 }
 
-pub fn cmd_sweep(
-    db: &Path,
-    build: &Path,
-    results: &Path,
-    impls: Option<Vec<String>>,
-    quick: bool,
-    allow_busy: bool,
-) -> Result<()> {
+pub struct SweepArgs<'a> {
+    pub db: &'a Path,
+    pub build: &'a Path,
+    pub results: &'a Path,
+    pub impls: Option<Vec<String>>,
+    pub quick: bool,
+    /// Shape file (M N K per line, # comments); overrides quick / the default set.
+    pub shapes: Option<&'a Path>,
+    pub allow_busy: bool,
+    /// Do not recompute the winners table (nightly regression sweeps).
+    pub no_winners: bool,
+}
+
+/// Read a shape file: one "M N K" per line, blank lines and # comments skipped.
+pub fn read_shapes(path: &Path) -> Result<Vec<(i64, i64, i64)>> {
+    let text = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    let mut v = Vec::new();
+    for line in text.lines().map(|l| l.split('#').next().unwrap_or("").trim()).filter(|l| !l.is_empty()) {
+        let d: Vec<i64> = line.split_whitespace().map(str::parse).collect::<Result<_, _>>()
+            .with_context(|| format!("{}: bad shape line '{line}'", path.display()))?;
+        if d.len() != 3 {
+            bail!("{}: bad shape line '{line}' (want M N K)", path.display());
+        }
+        v.push((d[0], d[1], d[2]));
+    }
+    Ok(v)
+}
+
+/// Returns the run id of the ingested rows.
+pub fn cmd_sweep(a: &SweepArgs) -> Result<String> {
+    let (db, build, results, allow_busy) = (a.db, a.build, a.results, a.allow_busy);
     let bench = build.join("bench_gemm");
     if !bench.exists() {
         bail!("{} not found; run cmake --build build first", bench.display());
@@ -165,7 +188,7 @@ pub fn cmd_sweep(
         std::fs::write(&manifest, out.stdout)?;
     }
     let registered = default_impls(&bench)?;
-    let impls = match impls {
+    let impls = match a.impls.clone() {
         Some(list) => {
             for i in &list {
                 if !registered.contains(i) {
@@ -178,7 +201,12 @@ pub fn cmd_sweep(
     };
 
     let idle = idle_guard(&bench, allow_busy)?;
-    let shapes = if quick { quick_shapes() } else { [square_shapes(), qwen_shapes()].concat() };
+    let shapes = match a.shapes {
+        Some(p) => read_shapes(p)?,
+        None if a.quick => quick_shapes(),
+        None => [square_shapes(), qwen_shapes()].concat(),
+    };
+    let watch = crate::watch::Watch::start(&bench)?;
     let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
     let out = results.join(format!("{host}-{stamp}.jsonl"));
     let mut f = std::fs::File::create(&out)?;
@@ -198,14 +226,18 @@ pub fn cmd_sweep(
         }
     }
     drop(f);
+    let report = watch.finish()?;
 
-    db::cmd_ingest(db, &out, Some(&manifest), None, None)?;
-    db::cmd_winners(db, None)?;
-    println!("\nresults: {}", out.display());
+    let run_id = db::cmd_ingest(db, &out, Some(&manifest), None, None)?;
+    db::mark_disturbed(&db::connect(db)?, &run_id, &report)?;
+    if !a.no_winners {
+        db::cmd_winners(db, None)?;
+    }
+    println!("\nresults: {} (run {run_id})", out.display());
     if failures > 0 {
         bail!("{failures} correctness failures; failing rows are excluded from winners");
     }
-    Ok(())
+    Ok(run_id)
 }
 
 #[cfg(test)]

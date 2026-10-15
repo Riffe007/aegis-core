@@ -9,6 +9,10 @@
 //                                      paired-ab, microbench/run_all.sh run it once
 //                                      first); exit 3 = busy. Prints {"ok","mean_pct",
 //                                      "max_pct","samples","source","limit_pct","busy"}.
+//   bench_gemm --idle-watch --root PID      the idle guard during a run: samples GPU use by
+//                                      processes outside PID's tree every 2 s until stdin
+//                                      closes, then prints {"ok","windows","windows_over",
+//                                      "max_other_pct","disturbed","worst",...}.
 //
 // --idle-util-pct U [--idle-source S] [--allow-busy] (passed by aegis-perf sweep
 // after its idle check) add ,"idle_util_pct":U,"idle_source":S,"allow_busy":B
@@ -21,6 +25,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+
+#include <poll.h>
+#include <unistd.h>
 
 #include "aegis/gemm.h"
 #include "bench/harness.h"
@@ -36,6 +43,8 @@ struct Args {
   bool check = false;
   bool list = false;
   bool idle_check = false, allow_busy = false;
+  int idle_watch_root = 0;    // --idle-watch --root PID
+  bool idle_watch = false;
   double idle_util_pct = -1;  // < 0: not recorded
   std::string idle_source;
   int lt_rank = -1;           // cublaslt_best: only this heuristic rank (no selection)
@@ -71,6 +80,8 @@ Args parse(int argc, char** argv) {
     }
     else if (k == "--list") a.list = true;
     else if (k == "--idle-check") a.idle_check = true;
+    else if (k == "--idle-watch") a.idle_watch = true;
+    else if (k == "--root") a.idle_watch_root = std::atoi(next());
     else if (k == "--allow-busy") a.allow_busy = true;
     else if (k == "--idle-util-pct") a.idle_util_pct = std::atof(next());
     else if (k == "--idle-source") a.idle_source = next();
@@ -105,6 +116,30 @@ int main(int argc, char** argv) {
                 "\"busy\":%s}\n",
                 s.ok ? "true" : "false", s.mean_pct, s.max_pct, s.samples, s.ok ? s.source.c_str() : "none", limit,
                 aegis::bench::idle_busy(s, limit) ? "true" : "false");
+    return 0;
+  }
+  if (a.idle_watch) {
+    if (a.idle_watch_root <= 0) {
+      std::fprintf(stderr, "--idle-watch needs --root PID (the run's top process)\n");
+      return 2;
+    }
+    // Runs until stdin reaches EOF (the caller closes its end when the run is done).
+    auto stdin_closed = [](int timeout_ms) {
+      pollfd p{0, POLLIN, 0};
+      if (poll(&p, 1, timeout_ms) <= 0) return false;
+      char buf[256];
+      return read(0, buf, sizeof buf) <= 0;
+    };
+    const aegis::bench::WatchReport w =
+        aegis::bench::watch_other_utilization(a.idle_watch_root, aegis::bench::idle_max_pct(), 2000, stdin_closed);
+    std::string worst = w.worst, error = w.error;
+    for (std::string* s : {&worst, &error})
+      for (char& c : *s)
+        if (c == '"' || c == '\\') c = '\'';
+    std::printf("{\"ok\":%s,\"source\":\"%s\",\"limit_pct\":%.2f,\"windows\":%d,\"windows_over\":%d,"
+                "\"max_other_pct\":%.2f,\"disturbed\":%s,\"worst\":\"%s\",\"error\":\"%s\"}\n",
+                w.ok ? "true" : "false", w.source.c_str(), w.limit_pct, w.windows, w.windows_over, w.max_other_pct,
+                w.ok ? (w.disturbed() ? "true" : "false") : "null", worst.c_str(), error.c_str());
     return 0;
   }
   // Resolved once, before timing, so lookup cost never lands in a timed rep.

@@ -14,6 +14,9 @@
 #include <dlfcn.h>
 
 #include <cstring>
+#include <ctime>
+#include <string>
+#include <vector>
 #include <type_traits>
 
 #include "aegis/common.cuh"
@@ -632,6 +635,159 @@ IdleSample idle_guard(bool allow_busy) {
   }
   if (busy) std::fprintf(stderr, "idle guard: --allow-busy given; rows are marked allow_busy\n");
   return s;
+}
+
+namespace {
+
+// nvmlProcessUtilizationSample_t
+struct NvmlProcSample {
+  unsigned pid;
+  unsigned long long timeStamp;  // documented as CPU microseconds; not usable on GB10 (see the watch loop)
+  unsigned smUtil, memUtil, encUtil, decUtil;
+};
+constexpr int kNvmlNotFound = 6, kNvmlInsufficientSize = 7;
+
+// Parent pid from /proc/<pid>/stat (the field after the parenthesized name); 0 if gone.
+int parent_pid(int pid) {
+  std::FILE* f = std::fopen(("/proc/" + std::to_string(pid) + "/stat").c_str(), "r");
+  if (!f) return 0;
+  char buf[1024] = {};
+  const size_t n = std::fread(buf, 1, sizeof buf - 1, f);
+  std::fclose(f);
+  buf[n] = 0;
+  const char* close = std::strrchr(buf, ')');
+  int ppid = 0;
+  if (!close || std::sscanf(close + 1, " %*c %d", &ppid) != 1) return 0;
+  return ppid;
+}
+
+bool in_tree(int pid, int root) {
+  for (int p = pid, hops = 0; p > 1 && hops < 64; p = parent_pid(p), ++hops)
+    if (p == root) return true;
+  return false;
+}
+
+std::string comm(int pid) {
+  std::FILE* f = std::fopen(("/proc/" + std::to_string(pid) + "/comm").c_str(), "r");
+  char buf[64] = "?";
+  if (f) {
+    if (!std::fgets(buf, sizeof buf, f)) std::strcpy(buf, "?");
+    std::fclose(f);
+  }
+  buf[std::strcspn(buf, "\n")] = 0;
+  return buf;
+}
+
+std::string utc_now() {
+  const std::time_t t = std::time(nullptr);
+  char buf[32];
+  std::strftime(buf, sizeof buf, "%Y-%m-%dT%H:%M:%SZ", std::gmtime(&t));
+  return buf;
+}
+
+}  // namespace
+
+WatchReport watch_other_utilization(int root, double limit, int window_ms, bool (*stop)(int timeout_ms)) {
+  WatchReport w;
+  w.limit_pct = limit;
+  w.source = "nvml-process";
+  Nvml nv;
+  auto drain = [&] { while (!stop(window_ms)) {} };  // keep the caller's protocol: run until stopped
+  if (!nv.load(w.error)) return drain(), w;
+  using ProcUtil = Nvml::Ret (*)(Nvml::Dev, NvmlProcSample*, unsigned*, unsigned long long);
+  auto proc_util = reinterpret_cast<ProcUtil>(dlsym(nv.lib, "nvmlDeviceGetProcessUtilization"));
+  if (!proc_util) {
+    w.error = "libnvidia-ml.so.1 lacks nvmlDeviceGetProcessUtilization";
+    return drain(), w;
+  }
+  if (Nvml::Ret r = nv.init(); r != 0) {
+    w.error = std::string("nvmlInit: ") + nv.err(r);
+    return drain(), w;
+  }
+  // Device 0: the watcher must not create a CUDA context of its own for the
+  // whole run (GB10 and the Jetsons have one GPU).
+  Nvml::Dev dev = nullptr;
+  if (Nvml::Ret r = nv.by_index(0, &dev); r != 0) {
+    w.error = std::string("nvmlDeviceGetHandleByIndex: ") + nv.err(r);
+    nv.shutdown();
+    return drain(), w;
+  }
+  w.ok = true;
+  // AEGIS_IDLE_WATCH_TRACE=1: one stderr line per process sample (tests, diagnosis).
+  const char* tr = std::getenv("AEGIS_IDLE_WATCH_TRACE");
+  const bool trace = tr && std::strcmp(tr, "1") == 0;
+  std::vector<NvmlProcSample> buf(64);
+  // NVML on GB10 ignores lastSeenTimeStamp and its sample timestamps are not a
+  // usable clock (they jump by orders of magnitude), so timestamps are not
+  // used: every poll returns each process's latest sample, and a process's
+  // share of a window is the mean of its samples over the window's polls
+  // (absent from a poll = 0).
+  constexpr int kPollMs = 250;
+  const int polls_per_window = std::max(1, window_ms / kPollMs);
+  for (bool stopping = false; !stopping;) {
+    std::vector<std::pair<int, double>> per;  // pid -> sum of samples over the polls
+    int polls = 0;
+    while (polls < polls_per_window && !stopping) {
+      stopping = stop(kPollMs);
+      unsigned count = unsigned(buf.size());
+      Nvml::Ret r = proc_util(dev, buf.data(), &count, 0);
+      if (r == kNvmlInsufficientSize) {
+        buf.resize(count + 64);
+        count = unsigned(buf.size());
+        r = proc_util(dev, buf.data(), &count, 0);
+      }
+      if (r == kNvmlNotFound) count = 0;  // no process sampled
+      else if (r != 0) {
+        w.ok = false;
+        w.error = std::string("nvmlDeviceGetProcessUtilization: ") + nv.err(r);
+        break;
+      }
+      ++polls;
+      std::vector<std::pair<int, unsigned>> now;  // pid -> this poll's sample (max if repeated)
+      for (unsigned i = 0; i < count; ++i) {
+        const NvmlProcSample& s = buf[i];
+        auto it = std::find_if(now.begin(), now.end(), [&](const auto& p) { return p.first == int(s.pid); });
+        if (it == now.end()) now.push_back({int(s.pid), s.smUtil});
+        else it->second = std::max(it->second, s.smUtil);
+      }
+      for (const auto& [pid, sm] : now) {
+        const bool ours = in_tree(pid, root);
+        if (trace)
+          std::fprintf(stderr, "idle watch trace: %s pid %d sm %u%% %s\n", comm(pid).c_str(), pid, sm,
+                       ours ? "excluded (run's own tree)" : "counted");
+        if (ours) continue;
+        auto it = std::find_if(per.begin(), per.end(), [&](const auto& p) { return p.first == pid; });
+        if (it == per.end()) per.push_back({pid, double(sm)});
+        else it->second += sm;
+      }
+    }
+    if (!w.ok) break;
+    if (polls == 0) continue;
+    double total = 0, top = -1;
+    int top_pid = 0;
+    for (const auto& [pid, sum] : per) {
+      const double mean = sum / polls;
+      total += mean;
+      if (mean > top) top = mean, top_pid = pid;
+    }
+    ++w.windows;
+    char line[256] = "";
+    if (top_pid)
+      std::snprintf(line, sizeof line, "%s (pid %d) %.1f%% at %s", comm(top_pid).c_str(), top_pid, top,
+                    utc_now().c_str());
+    if (total > limit) {
+      ++w.windows_over;
+      std::fprintf(stderr, "idle watch: DISTURBED: other processes used %.1f%% of the GPU (limit %.0f%%): %s\n",
+                   total, limit, top_pid ? line : "no process named");
+    }
+    if (w.windows == 1 || total > w.max_other_pct) {
+      w.max_other_pct = total;
+      w.worst = line;
+    }
+  }
+  nv.shutdown();
+  if (!w.ok) drain();
+  return w;
 }
 
 }  // namespace aegis::bench

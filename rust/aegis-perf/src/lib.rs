@@ -12,6 +12,8 @@ pub mod roofline;
 pub mod sweep;
 pub mod tune;
 pub mod view;
+pub mod watch;
+pub mod regress;
 
 /// The rusqlite this crate is built against, so viewers name the same `Connection`.
 pub use rusqlite;

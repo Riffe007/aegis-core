@@ -54,6 +54,8 @@ cmake --build build --target fuzz_nightly         # 50,000 fuzz cases
 tools/sanitize.sh                                 # ctest suite under compute-sanitizer memcheck/racecheck/initcheck/synccheck
 tools/ncu_gemm.sh IMPL M N K; tools/ncu_summary.sh artifacts/ncu/*.ncu-rep   # Nsight profile + key metrics
 rust/target/release/aegis-perf paired-ab --a OLD/bench_gemm --b build/bench_gemm --impl X --shape M N K  # A/B across builds
+tools/nightly.sh                                  # nightly (user timer 03:00; --install): 50k fuzz, regression sweep, DB backup -> results/nightly.log
+rust/target/release/aegis-perf regress --run R   # winners-header shapes: % of cublaslt_best in run R vs the newest earlier clean run
 ```
 
 Once per clone: `git config core.hooksPath .githooks` (pre-commit builds and runs
@@ -261,6 +263,21 @@ only to compare with old rows (`--protocol 1`).
   `tegrastats` GR3D_FREQ. The source is logged.
   `--allow-busy` overrides and marks every row (`allow_busy`, `idle_util_pct`);
   marked rows are not evidence for a performance claim.
+- **Idle guard during the run.** The same commands (and `run_latency_locked.sh`)
+  keep sampling while they run: `bench_gemm --idle-watch --root <pid>` sums,
+  every 2 s, the SM utilization of GPU processes outside the run's own process
+  tree (NVML per-process samples) and logs every window above the limit. Any
+  such window marks the run and every row of it `disturbed = 1`
+  (`runs.disturbed`, `disturbed_detail`: windows over, the busiest process;
+  also on `measurements`, `paired`, `microbench`, `paired_results`); 0 =
+  watched and clean, NULL = not watched. Disturbed rows are excluded with
+  busy ones (winners, reports, `emit-arch`) and are not evidence. On GB10 the
+  per-process numbers and the device total disagree in both directions (a
+  cuBLAS load: 92% device, 16-20% per process; the idle desktop: ~1% device,
+  Xorg alone 3-4% per process), so with a desktop session up most runs are
+  marked disturbed: benchmark over SSH with the desktop idle or stopped.
+  NVML ignores `lastSeenTimeStamp` on GB10 and its sample timestamps are not
+  a clock; the watcher polls every 250 ms and uses no timestamps.
 - **GPU memory.** First line of defence: the in-process GPU budget (rule 13),
   which refuses oversize device allocations before they happen. Second line:
   the guarded-job wrapper (next item).
