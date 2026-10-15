@@ -18,20 +18,55 @@ use crate::pyjson::dumps_sorted;
 /// The perf DB schema. Source of truth; v1 columns are frozen (add, never rename).
 pub const SCHEMA: &str = include_str!("schema.sql");
 
+/// The schema version this binary reads and writes (table `schema_version`).
+/// 1: every DB before the table existed (microbench.superseded);
+/// 2: microbench status / clocks, runs idle reading, paired_results.
+/// Bump it with every migration in migrate().
+pub const SCHEMA_VERSION: i64 = 2;
+
+/// The DB's schema version: None when it has no schema_version table (a v1
+/// DB, or not yet created).
+pub fn schema_version(con: &Connection) -> Result<Option<i64>> {
+    let has_table: bool =
+        con.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_version'")?.exists([])?;
+    if !has_table {
+        return Ok(None);
+    }
+    Ok(con.query_row("SELECT max(version) FROM schema_version", [], |r| r.get::<_, Option<i64>>(0))?)
+}
+
+fn version_mismatch(db: &Path, found: i64) -> anyhow::Error {
+    let fix = if found < SCHEMA_VERSION {
+        "migrate it with this binary: aegis-perf --db <DB> init"
+    } else {
+        "rebuild aegis-perf from a newer checkout"
+    };
+    anyhow::anyhow!("{}: DB schema v{found}, binary expects v{SCHEMA_VERSION} ({fix})", db.display())
+}
+
+/// Open (creating if needed) and migrate the perf DB to SCHEMA_VERSION.
+/// Refuses a DB from a newer aegis-perf instead of touching it.
 pub fn connect(db: &Path) -> Result<Connection> {
     if let Some(parent) = db.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent)?;
     }
     let con = Connection::open(db).with_context(|| format!("open {}", db.display()))?;
+    if let Some(v) = schema_version(&con).with_context(|| format!("{} is not an AEGIS perf DB", db.display()))? {
+        if v > SCHEMA_VERSION {
+            return Err(version_mismatch(db, v));
+        }
+    }
     con.execute_batch(SCHEMA)?;
     migrate(&con)?;
+    con.execute("INSERT OR REPLACE INTO schema_version (id, version) VALUES (1, ?1)", [SCHEMA_VERSION])?;
     Ok(con)
 }
 
 /// Open an existing perf DB read-only (SQLite URI `mode=ro`), for viewers: no
 /// schema creation, no migration, never a write, so a running tune or sweep
-/// is never blocked. Refuses a DB whose schema predates the columns this
-/// crate reads (run any writing aegis-perf command on it once to migrate).
+/// is never blocked. Refuses a DB whose schema_version is not SCHEMA_VERSION
+/// ("DB schema vN, binary expects vM"), and one missing a column this crate
+/// reads.
 pub fn connect_ro(db: &Path) -> Result<Connection> {
     let path = db.to_str().with_context(|| format!("non-UTF-8 path {}", db.display()))?;
     let uri = format!("file:{}?mode=ro", path.replace('%', "%25").replace('?', "%3f").replace('#', "%23"));
@@ -40,6 +75,10 @@ pub fn connect_ro(db: &Path) -> Result<Connection> {
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .with_context(|| format!("open {} read-only", db.display()))?;
+    let found = schema_version(&con).with_context(|| format!("{} is not an AEGIS perf DB", db.display()))?;
+    if found != Some(SCHEMA_VERSION) {
+        return Err(version_mismatch(db, found.unwrap_or(1)));
+    }
     for (table, column, _) in ADDED_COLUMNS {
         let exists: bool = con
             .prepare(&format!("SELECT 1 FROM pragma_table_info('{table}') WHERE name = ?"))?
@@ -1051,6 +1090,39 @@ mod tests {
             .unwrap();
         assert!(!has_old, "superseded columns dropped");
         migrate(&con).unwrap(); // idempotent
+    }
+
+    /// A DB without schema_version is v1: readers refuse it with the version
+    /// message, connect migrates it to SCHEMA_VERSION; a newer DB is refused
+    /// by readers and writers alike and left untouched.
+    #[test]
+    fn schema_version_checked_by_every_reader() {
+        let p = tmp("schema-version");
+        let _ = std::fs::remove_file(&p);
+        Connection::open(&p)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE runs (run_id TEXT PRIMARY KEY, device_id TEXT NOT NULL, sm_arch INTEGER NOT NULL,
+                   started_at TEXT NOT NULL);
+                 CREATE TABLE microbench (run_id TEXT NOT NULL, probe TEXT NOT NULL, param_json TEXT NOT NULL,
+                   value REAL, unit TEXT NOT NULL, superseded INTEGER NOT NULL DEFAULT 0, superseded_by TEXT);",
+            )
+            .unwrap();
+        let err = connect_ro(&p).unwrap_err().to_string();
+        assert!(err.contains("DB schema v1, binary expects v2"), "{err}");
+
+        drop(connect(&p).unwrap());
+        let con = connect_ro(&p).unwrap();
+        assert_eq!(schema_version(&con).unwrap(), Some(SCHEMA_VERSION));
+        drop(con);
+
+        Connection::open(&p).unwrap().execute("UPDATE schema_version SET version = 3", []).unwrap();
+        for err in [connect_ro(&p).unwrap_err().to_string(), connect(&p).unwrap_err().to_string()] {
+            assert!(err.contains("DB schema v3, binary expects v2"), "{err}");
+        }
+        let con = Connection::open(&p).unwrap();
+        assert_eq!(schema_version(&con).unwrap(), Some(3), "a newer DB is not rewritten");
+        std::fs::remove_file(&p).unwrap();
     }
 
     /// invalidated needs a reason; status takes only the three values.

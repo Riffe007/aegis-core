@@ -241,6 +241,12 @@ only to compare with old rows (`--protocol 1`).
 - **Timer.** The event timer's resolution is measured at startup (32 ns on
   GB10). v1 rows are quantized to 2.048 us steps by the memset in front of each
   start event; do not rank shapes under ~50 us on v1 rows.
+- **Latency probes run with clocks locked at 2418 MHz** (GB10's default
+  applications clock; `nvidia-smi -lgc` works on GB10 as root):
+  `sudo nvidia-smi -lgc 2418,2418; microbench/run_latency_locked.sh 2418;
+  sudo nvidia-smi -rgc`. Keep the desktop idle for the whole run, not just
+  the idle check: an app that starts on the GPU mid-run spreads the L2 plateau
+  (LOG 2026-10-15, run `e3d94274b31d`).
 - **Benchmark over SSH, remote desktop off.** A remote-desktop session
   (gnome-remote-desktop) encodes video on the GPU and shares L2 and DRAM with
   the benchmark; disconnect it before a sweep, tune or microbench run.

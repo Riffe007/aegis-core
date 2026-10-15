@@ -134,3 +134,10 @@ CREATE TABLE IF NOT EXISTS paired_results (
   started_at TEXT NOT NULL,
   finished_at TEXT NOT NULL
 );
+-- Schema version (one row, id 1): what aegis-perf migrated this DB to
+-- (db::SCHEMA_VERSION). Every reader refuses a DB at another version with
+-- "DB schema vN, binary expects vM". A DB without this table is v1.
+CREATE TABLE IF NOT EXISTS schema_version (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  version INTEGER NOT NULL
+);
