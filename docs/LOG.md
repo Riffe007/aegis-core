@@ -1440,3 +1440,47 @@ exactly one cuBLASLt failure was overruled by FP64 (case 24632). 995 s.
 Note for `tools/sanitize.sh` (synccheck with `--cpu-ref-only --max-dim 512`):
 cases are no longer capped at 2^24 MACs, so they reach up to 512³ x 4
 batches; expect a longer synccheck run.
+
+## 2026-10-15 — In-run watcher: device-level foreign share, compute contexts
+
+The first watcher summed foreign per-process SM samples. On GB10 those are on
+another scale than the device total, so an idle desktop read ~5% summed
+(Xorg 3.9%) while the device read ~1%. That would have marked nearly every
+row disturbed.
+
+**Why "device minus ours" alone does not work.** Per-process samples lag.
+Measured with a cuBLAS 4096³ warm load, polled every 250 ms: the device read
+96% throughout, while the load's own per-process value ramped 59 -> 82%
+over 3 s. Device minus ours would count the lag as foreign use (~37% at the
+start of every run process; a sweep starts a new process per measurement).
+
+**Rule now.**
+- The watcher takes a 2 s baseline before the run's GPU work (callers wait
+  for its ready line): device D0 and foreign per-process sum F0, giving the
+  scale k = D0 / F0 (D0 floored at 0.5%, k at most 1, k = 1 when F0 = 0).
+- Per 2 s window: foreign = min(device - ours, k * foreign per-process). Device
+  minus ours is the device-level use not attributed to the run. The scaled
+  term caps it: a desktop idling as at baseline counts as its baseline
+  device-level share (~1%), not 5%.
+- Any foreign process holding a compute context (NVML
+  `nvmlDeviceGetComputeRunningProcesses`) flags the window, whatever its
+  utilization.
+- Over: foreign > 2%, or a foreign compute context.
+
+**Tests.**
+- ctest `idle_rule` (new) checks the arithmetic on these measured readings.
+  The idle desktop (D0 1, F0 5, k 0.2) gives 1.0%: clean, where the old rule
+  read 5%. The same desktop during our 96% load (ours 59) gives 1.0%: clean.
+  Foreign per-process 40, during our load or not, gives 8%: disturbed. Also
+  the k edge cases.
+- ctest `idle_watch_paths` (kept, extended):
+  - Our own load is excluded, and its compute context is not foreign.
+  - A watcher rooted at pid 1 sees that load's compute context as foreign and
+    reports the run disturbed.
+  - The ready line comes first.
+  - A forced limit marks every window, and a missing --root is refused.
+  - It runs RUN_SERIAL: in the hook's `ctest -j4`, a parallel fuzz test was
+    (correctly) seen as a foreign compute context.
+- Live: the desktop was fully idle when I checked (no per-process samples at
+  all), so the ~5%-summed case could not be reproduced live. Two 8 s
+  watches read 0.0%, clean.

@@ -9,8 +9,10 @@
 //                                      paired-ab, microbench/run_all.sh run it once
 //                                      first); exit 3 = busy. Prints {"ok","mean_pct",
 //                                      "max_pct","samples","source","limit_pct","busy"}.
-//   bench_gemm --idle-watch --root PID      the idle guard during a run: samples GPU use by
-//                                      processes outside PID's tree every 2 s until stdin
+//   bench_gemm --idle-watch --root PID      the idle guard during a run: 2 s baseline, then a
+//                                      {"ready":true,...} line; then every 2 s the device-level
+//                                      GPU use not from PID's tree, plus foreign compute contexts
+//                                      (NVML), until stdin
 //                                      closes, then prints {"ok","windows","windows_over",
 //                                      "max_other_pct","disturbed","worst",...}.
 //
@@ -130,15 +132,23 @@ int main(int argc, char** argv) {
       char buf[256];
       return read(0, buf, sizeof buf) <= 0;
     };
-    const aegis::bench::WatchReport w =
-        aegis::bench::watch_other_utilization(a.idle_watch_root, aegis::bench::idle_max_pct(), 2000, stdin_closed);
+    // First stdout line once the baseline is taken: the caller starts its GPU work after it.
+    auto ready = [](const aegis::bench::WatchReport& r) {
+      std::printf("{\"ready\":true,\"baseline_device_pct\":%.2f,\"baseline_foreign_pp\":%.2f,\"scale\":%.3f}\n",
+                  r.baseline_device_pct, r.baseline_foreign_pp, r.scale);
+      std::fflush(stdout);
+    };
+    const aegis::bench::WatchReport w = aegis::bench::watch_other_utilization(
+        a.idle_watch_root, aegis::bench::idle_max_pct(), 2000, stdin_closed, ready);
     std::string worst = w.worst, error = w.error;
     for (std::string* s : {&worst, &error})
       for (char& c : *s)
         if (c == '"' || c == '\\') c = '\'';
     std::printf("{\"ok\":%s,\"source\":\"%s\",\"limit_pct\":%.2f,\"windows\":%d,\"windows_over\":%d,"
-                "\"max_other_pct\":%.2f,\"disturbed\":%s,\"worst\":\"%s\",\"error\":\"%s\"}\n",
+                "\"max_other_pct\":%.2f,\"foreign_compute\":%s,\"baseline_device_pct\":%.2f,\"baseline_foreign_pp\":%.2f,"
+                "\"scale\":%.3f,\"disturbed\":%s,\"worst\":\"%s\",\"error\":\"%s\"}\n",
                 w.ok ? "true" : "false", w.source.c_str(), w.limit_pct, w.windows, w.windows_over, w.max_other_pct,
+                w.foreign_compute ? "true" : "false", w.baseline_device_pct, w.baseline_foreign_pp, w.scale,
                 w.ok ? (w.disturbed() ? "true" : "false") : "null", worst.c_str(), error.c_str());
     return 0;
   }

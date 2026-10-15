@@ -1107,6 +1107,7 @@ mod tests {
             limit_pct: 2.0,
             worst: "firefox (pid 7) 30.0% at T".into(),
             error: String::new(),
+            ..Default::default()
         };
         mark_disturbed(&con, &bad, &w(true)).unwrap();
         mark_disturbed(&con, &good, &w(false)).unwrap();

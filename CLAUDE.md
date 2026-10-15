@@ -264,20 +264,24 @@ only to compare with old rows (`--protocol 1`).
   `--allow-busy` overrides and marks every row (`allow_busy`, `idle_util_pct`);
   marked rows are not evidence for a performance claim.
 - **Idle guard during the run.** The same commands (and `run_latency_locked.sh`)
-  keep sampling while they run: `bench_gemm --idle-watch --root <pid>` sums,
-  every 2 s, the SM utilization of GPU processes outside the run's own process
-  tree (NVML per-process samples) and logs every window above the limit. Any
-  such window marks the run and every row of it `disturbed = 1`
-  (`runs.disturbed`, `disturbed_detail`: windows over, the busiest process;
-  also on `measurements`, `paired`, `microbench`, `paired_results`); 0 =
-  watched and clean, NULL = not watched. Disturbed rows are excluded with
-  busy ones (winners, reports, `emit-arch`) and are not evidence. On GB10 the
-  per-process numbers and the device total disagree in both directions (a
-  cuBLAS load: 92% device, 16-20% per process; the idle desktop: ~1% device,
-  Xorg alone 3-4% per process), so with a desktop session up most runs are
-  marked disturbed: benchmark over SSH with the desktop idle or stopped.
-  NVML ignores `lastSeenTimeStamp` on GB10 and its sample timestamps are not
-  a clock; the watcher polls every 250 ms and uses no timestamps.
+  keep watching while they run: `bench_gemm --idle-watch --root <pid>` ("ours"
+  = that process tree) polls NVML every 250 ms. It first takes a 2 s baseline
+  before the run's GPU work: device utilization D0 and the per-process sum of
+  foreign processes F0, which give the scale k = D0 / F0 (at most 1). Then,
+  per 2 s window, the foreign share is min(device - ours, k * foreign
+  per-process), all window means. A window is over when that exceeds 2% or
+  when any foreign process holds a compute context. Each such window is
+  logged, and any one of them marks the run and every row of it
+  `disturbed = 1` (`runs.disturbed`, `disturbed_detail`; also on
+  `measurements`, `paired`, `microbench`, `paired_results`). 0 = watched and
+  clean, NULL = not watched. Disturbed rows are excluded with busy ones
+  (winners, reports, `emit-arch`) and are not evidence.
+  - Why the scale: on GB10, per-process samples are on another scale than the
+    device total (idle desktop: ~1% device, ~5% summed per process), and they
+    lag (a steady full load reads 59 -> 82% per process over 3 s while the
+    device reads 96%).
+  - NVML ignores `lastSeenTimeStamp` on GB10, and its sample timestamps are
+    not a clock, so none are used.
 - **GPU memory.** First line of defence: the in-process GPU budget (rule 13),
   which refuses oversize device allocations before they happen. Second line:
   the guarded-job wrapper (next item).

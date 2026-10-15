@@ -36,6 +36,7 @@
 //
 // The harness is benchmark code: it aborts the process on CUDA/cuBLAS errors.
 // The library path (aegis::matmul, the C ABI) never does.
+#include <algorithm>
 #include <cublasLt.h>
 #include <cublas_v2.h>
 #include <cuda_fp16.h>
@@ -277,23 +278,42 @@ inline bool idle_busy(const IdleSample& s, double limit) { return !s.ok || s.mea
 IdleSample idle_guard(bool allow_busy);
 
 // In-run idle watch: the idle guard keeps sampling while a run executes.
-// Every `window_ms` it sums, over GPU processes OUTSIDE the run's process tree
-// (pid `root` and its descendants), each process's mean SM utilization in the
-// window (NVML per-process samples, nvmlDeviceGetProcessUtilization, polled every
-// 250 ms; each process averaged over the polls of the window). A window
-// above `limit` makes the run disturbed; each such window is logged on stderr
-// as it happens. Stops when `stop(timeout_ms)` returns true (called every poll).
-// No per-process source (Tegra): ok = false, disturbed unknown.
+// "Ours" is the process tree of pid `root`; everything else is foreign. Polls
+// NVML every 250 ms: device utilization, per-process SM samples
+// (nvmlDeviceGetProcessUtilization) and compute contexts
+// (nvmlDeviceGetComputeRunningProcesses). First a 2 s baseline, before the
+// run's GPU work (the caller waits for `ready`): device D0 and foreign
+// per-process sum F0 give the per-process -> device scale k = D0 / F0 (<= 1).
+// Then per `window_ms` window: foreign = min(device - ours, k * foreign
+// per-process sum), window means. A window is over when foreign > `limit` or
+// any foreign process holds a compute context; any such window makes the run
+// disturbed, and each is logged on stderr as it happens. Stops when
+// `stop(timeout_ms)` returns true (called every poll).
+// No NVML (Tegra): ok = false, disturbed unknown.
 struct WatchReport {
   bool ok = false;
   std::string source, error;
   double limit_pct = 0;
+  double baseline_device_pct = 0, baseline_foreign_pp = 0, scale = 1;  // D0, F0, k
   int windows = 0, windows_over = 0;
-  double max_other_pct = 0;  // the highest window sum
-  std::string worst;         // "name (pid P) X% at <UTC time>" for the highest window
+  double max_other_pct = 0;  // the worst window's foreign share (device level)
+  bool foreign_compute = false;     // a foreign compute context was seen
+  bool worst_has_compute = false;
+  std::string worst;  // the worst window: "name (pid P) ... at <UTC time>"
   bool disturbed() const { return ok && windows_over > 0; }
 };
-WatchReport watch_other_utilization(int root, double limit, int window_ms, bool (*stop)(int timeout_ms));
+WatchReport watch_other_utilization(int root, double limit, int window_ms, bool (*stop)(int timeout_ms),
+                                    void (*ready)(const WatchReport&));
+
+// The watch's arithmetic (tests/test_idle_rule.cpp). Per-process -> device scale
+// from the baseline: k = D0 / F0, D0 floored at 0.5%, at most 1; 1 when F0 = 0.
+inline double watch_scale(double d0, double f0) {
+  return f0 > 0 ? std::min(1.0, std::max(d0, 0.5) / f0) : 1.0;
+}
+// A window's foreign share (device level): min(device - ours, k * foreign_pp).
+inline double foreign_share(double device, double ours, double foreign_pp, double k) {
+  return std::min(std::max(0.0, device - ours), k * foreign_pp);
+}
 
 // Event pairs around `samples` spin kernels of increasing length. Aborts on error.
 TimerResolution measure_timer_resolution(cudaStream_t stream, int samples = 1000);

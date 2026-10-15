@@ -202,6 +202,11 @@ add_test(NAME idle_guard_paths
 # The idle guard during a run: the run's own processes are excluded, others
 # over the limit make the run disturbed.
 add_test(NAME idle_watch_paths COMMAND ${CMAKE_SOURCE_DIR}/tests/test_idle_watch.sh $<TARGET_FILE:bench_gemm>)
+# It watches for other GPU users, so no other test may run beside it (ctest -j).
+set_tests_properties(idle_watch_paths PROPERTIES RUN_SERIAL TRUE)
+add_executable(test_idle_rule tests/test_idle_rule.cu)
+target_link_libraries(test_idle_rule PRIVATE aegis_bench_harness)
+add_test(NAME idle_rule COMMAND test_idle_rule)
 
 # GPU lock (CLAUDE.md rule 15): every test except the compile-only sm87_gate
 # touches the GPU, is labelled "gpu" and requires the gpu_lock_guard fixture,

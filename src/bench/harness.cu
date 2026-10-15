@@ -645,6 +645,12 @@ struct NvmlProcSample {
   unsigned long long timeStamp;  // documented as CPU microseconds; not usable on GB10 (see the watch loop)
   unsigned smUtil, memUtil, encUtil, decUtil;
 };
+// nvmlProcessInfo_t (v2 layout, used by the _v3 entry points)
+struct NvmlProcInfo {
+  unsigned pid;
+  unsigned long long usedGpuMemory;
+  unsigned gpuInstanceId, computeInstanceId;
+};
 constexpr int kNvmlNotFound = 6, kNvmlInsufficientSize = 7;
 
 // Parent pid from /proc/<pid>/stat (the field after the parenthesized name); 0 if gone.
@@ -687,17 +693,23 @@ std::string utc_now() {
 
 }  // namespace
 
-WatchReport watch_other_utilization(int root, double limit, int window_ms, bool (*stop)(int timeout_ms)) {
+WatchReport watch_other_utilization(int root, double limit, int window_ms, bool (*stop)(int timeout_ms),
+                                    void (*ready)(const WatchReport&)) {
   WatchReport w;
   w.limit_pct = limit;
-  w.source = "nvml-process";
+  w.source = "nvml";
   Nvml nv;
-  auto drain = [&] { while (!stop(window_ms)) {} };  // keep the caller's protocol: run until stopped
+  auto drain = [&] {  // keep the caller's protocol: signal ready, run until stopped
+    if (ready) ready(w);
+    while (!stop(window_ms)) {}
+  };
   if (!nv.load(w.error)) return drain(), w;
   using ProcUtil = Nvml::Ret (*)(Nvml::Dev, NvmlProcSample*, unsigned*, unsigned long long);
+  using ComputeProcs = Nvml::Ret (*)(Nvml::Dev, unsigned*, NvmlProcInfo*);
   auto proc_util = reinterpret_cast<ProcUtil>(dlsym(nv.lib, "nvmlDeviceGetProcessUtilization"));
-  if (!proc_util) {
-    w.error = "libnvidia-ml.so.1 lacks nvmlDeviceGetProcessUtilization";
+  auto compute_procs = reinterpret_cast<ComputeProcs>(dlsym(nv.lib, "nvmlDeviceGetComputeRunningProcesses_v3"));
+  if (!proc_util || !compute_procs) {
+    w.error = "libnvidia-ml.so.1 lacks nvmlDeviceGetProcessUtilization / nvmlDeviceGetComputeRunningProcesses_v3";
     return drain(), w;
   }
   if (Nvml::Ret r = nv.init(); r != 0) {
@@ -712,81 +724,175 @@ WatchReport watch_other_utilization(int root, double limit, int window_ms, bool 
     nv.shutdown();
     return drain(), w;
   }
-  w.ok = true;
-  // AEGIS_IDLE_WATCH_TRACE=1: one stderr line per process sample (tests, diagnosis).
+  // AEGIS_IDLE_WATCH_TRACE=1: one stderr line per poll (tests, diagnosis).
   const char* tr = std::getenv("AEGIS_IDLE_WATCH_TRACE");
   const bool trace = tr && std::strcmp(tr, "1") == 0;
+
+  // One poll: device utilization (%), per-process SM samples split into ours /
+  // foreign, and foreign processes holding a compute context. NVML on GB10
+  // ignores lastSeenTimeStamp and its sample timestamps are not a clock, so
+  // each poll takes every process's latest sample and no timestamps are used.
+  struct Poll {
+    double device = 0, ours = 0;
+    std::vector<std::pair<int, double>> foreign;  // pid -> sample
+    std::vector<int> foreign_compute;
+  };
   std::vector<NvmlProcSample> buf(64);
-  // NVML on GB10 ignores lastSeenTimeStamp and its sample timestamps are not a
-  // usable clock (they jump by orders of magnitude), so timestamps are not
-  // used: every poll returns each process's latest sample, and a process's
-  // share of a window is the mean of its samples over the window's polls
-  // (absent from a poll = 0).
+  std::vector<NvmlProcInfo> procs(64);
+  std::vector<std::pair<int, std::string>> names;  // comm at first sight (a process may exit before the report)
+  auto name_of = [&](int pid) {
+    for (const auto& [p, n] : names)
+      if (p == pid) return n;
+    names.push_back({pid, comm(pid)});
+    return names.back().second;
+  };
+  auto poll = [&](Poll& p) -> bool {
+    Nvml::Util u{};
+    if (Nvml::Ret r = nv.util(dev, &u); r != 0) {
+      w.error = std::string("nvmlDeviceGetUtilizationRates: ") + nv.err(r);
+      return false;
+    }
+    p.device = u.gpu;
+    unsigned count = unsigned(buf.size());
+    Nvml::Ret r = proc_util(dev, buf.data(), &count, 0);
+    if (r == kNvmlInsufficientSize) {
+      buf.resize(count + 64);
+      count = unsigned(buf.size());
+      r = proc_util(dev, buf.data(), &count, 0);
+    }
+    if (r == kNvmlNotFound) count = 0;  // no process sampled
+    else if (r != 0) {
+      w.error = std::string("nvmlDeviceGetProcessUtilization: ") + nv.err(r);
+      return false;
+    }
+    std::vector<std::pair<int, unsigned>> now;  // pid -> latest sample (max if repeated)
+    for (unsigned i = 0; i < count; ++i) {
+      auto it = std::find_if(now.begin(), now.end(), [&](const auto& q) { return q.first == int(buf[i].pid); });
+      if (it == now.end()) now.push_back({int(buf[i].pid), buf[i].smUtil});
+      else it->second = std::max(it->second, buf[i].smUtil);
+    }
+    for (const auto& [pid, sm] : now) {
+      const bool ours = in_tree(pid, root);
+      if (trace)
+        std::fprintf(stderr, "idle watch trace: %s pid %d sm %u%% %s\n", name_of(pid).c_str(), pid, sm,
+                     ours ? "excluded (run's own tree)" : "counted");
+      if (ours) p.ours += sm;
+      else p.foreign.push_back({pid, double(sm)});
+    }
+    unsigned np = unsigned(procs.size());
+    r = compute_procs(dev, &np, procs.data());
+    if (r == kNvmlInsufficientSize) {
+      procs.resize(np + 16);
+      np = unsigned(procs.size());
+      r = compute_procs(dev, &np, procs.data());
+    }
+    if (r != 0) np = 0;
+    for (unsigned i = 0; i < np; ++i)
+      if (!in_tree(int(procs[i].pid), root)) {
+        p.foreign_compute.push_back(int(procs[i].pid));
+        const std::string n = name_of(int(procs[i].pid));
+        if (trace)
+          std::fprintf(stderr, "idle watch trace: %s pid %u holds a compute context (foreign)\n", n.c_str(),
+                       procs[i].pid);
+      }
+    if (trace) std::fprintf(stderr, "idle watch trace: device %.0f%%, ours %.0f\n", p.device, p.ours);
+    return true;
+  };
+
   constexpr int kPollMs = 250;
   const int polls_per_window = std::max(1, window_ms / kPollMs);
+  // Baseline, before the run starts its GPU work (the caller waits for ready):
+  // device-level utilization D0 and the foreign per-process sum F0. Per-process
+  // numbers are on another scale than the device total (the idle desktop: ~1%
+  // device, ~5% summed per process), so foreign per-process use is converted to
+  // device level with k = D0 / F0 (k <= 1; 1 when F0 = 0; D0 floored at 0.5%).
+  {
+    double d = 0, f = 0;
+    for (int i = 0; i < polls_per_window; ++i) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(kPollMs));
+      Poll p;
+      if (!poll(p)) return nv.shutdown(), drain(), w;
+      d += p.device;
+      for (const auto& q : p.foreign) f += q.second;
+    }
+    w.baseline_device_pct = d / polls_per_window;
+    w.baseline_foreign_pp = f / polls_per_window;
+    w.scale = watch_scale(w.baseline_device_pct, w.baseline_foreign_pp);
+  }
+  w.ok = true;
+  if (ready) ready(w);
+
+  // Each window: foreign = min(device - ours, k * foreign per-process), both
+  // window means. device - ours is the device-level use not attributed to the
+  // run; the k-scaled term caps it because per-process samples lag (a steady
+  // full load reads 59% -> 82% per process over 3 s while the device reads
+  // 96%), which would otherwise leave the lag counted as foreign at the start
+  // of every run process. Any foreign compute context flags the window too.
   for (bool stopping = false; !stopping;) {
-    std::vector<std::pair<int, double>> per;  // pid -> sum of samples over the polls
+    double dev_sum = 0, ours_sum = 0;
+    std::vector<std::pair<int, double>> per;  // foreign pid -> sum over polls
+    std::vector<int> compute;
     int polls = 0;
     while (polls < polls_per_window && !stopping) {
       stopping = stop(kPollMs);
-      unsigned count = unsigned(buf.size());
-      Nvml::Ret r = proc_util(dev, buf.data(), &count, 0);
-      if (r == kNvmlInsufficientSize) {
-        buf.resize(count + 64);
-        count = unsigned(buf.size());
-        r = proc_util(dev, buf.data(), &count, 0);
-      }
-      if (r == kNvmlNotFound) count = 0;  // no process sampled
-      else if (r != 0) {
+      Poll p;
+      if (!poll(p)) {
         w.ok = false;
-        w.error = std::string("nvmlDeviceGetProcessUtilization: ") + nv.err(r);
         break;
       }
       ++polls;
-      std::vector<std::pair<int, unsigned>> now;  // pid -> this poll's sample (max if repeated)
-      for (unsigned i = 0; i < count; ++i) {
-        const NvmlProcSample& s = buf[i];
-        auto it = std::find_if(now.begin(), now.end(), [&](const auto& p) { return p.first == int(s.pid); });
-        if (it == now.end()) now.push_back({int(s.pid), s.smUtil});
-        else it->second = std::max(it->second, s.smUtil);
-      }
-      for (const auto& [pid, sm] : now) {
-        const bool ours = in_tree(pid, root);
-        if (trace)
-          std::fprintf(stderr, "idle watch trace: %s pid %d sm %u%% %s\n", comm(pid).c_str(), pid, sm,
-                       ours ? "excluded (run's own tree)" : "counted");
-        if (ours) continue;
-        auto it = std::find_if(per.begin(), per.end(), [&](const auto& p) { return p.first == pid; });
-        if (it == per.end()) per.push_back({pid, double(sm)});
+      dev_sum += p.device;
+      ours_sum += p.ours;
+      for (const auto& [pid, sm] : p.foreign) {
+        auto it = std::find_if(per.begin(), per.end(), [&](const auto& q) { return q.first == pid; });
+        if (it == per.end()) per.push_back({pid, sm});
         else it->second += sm;
       }
+      for (int pid : p.foreign_compute)
+        if (std::find(compute.begin(), compute.end(), pid) == compute.end()) compute.push_back(pid);
     }
     if (!w.ok) break;
     if (polls == 0) continue;
-    double total = 0, top = -1;
+    const double device = dev_sum / polls, ours = ours_sum / polls;
+    double foreign_pp = 0, top = -1;
     int top_pid = 0;
     for (const auto& [pid, sum] : per) {
       const double mean = sum / polls;
-      total += mean;
+      foreign_pp += mean;
       if (mean > top) top = mean, top_pid = pid;
     }
+    const double foreign = foreign_share(device, ours, foreign_pp, w.scale);
     ++w.windows;
-    char line[256] = "";
-    if (top_pid)
-      std::snprintf(line, sizeof line, "%s (pid %d) %.1f%% at %s", comm(top_pid).c_str(), top_pid, top,
+    char line[320] = "";
+    if (!compute.empty())
+      std::snprintf(line, sizeof line, "%s (pid %d) holds a compute context at %s", name_of(compute[0]).c_str(),
+                    compute[0], utc_now().c_str());
+    else if (top_pid)
+      std::snprintf(line, sizeof line, "%s (pid %d) %.1f%% per process at %s", name_of(top_pid).c_str(), top_pid, top,
                     utc_now().c_str());
-    if (total > limit) {
+    const bool over = foreign > limit || !compute.empty();
+    if (over) {
       ++w.windows_over;
-      std::fprintf(stderr, "idle watch: DISTURBED: other processes used %.1f%% of the GPU (limit %.0f%%): %s\n",
-                   total, limit, top_pid ? line : "no process named");
+      std::fprintf(stderr,
+                   "idle watch: DISTURBED: foreign GPU use %.1f%% (limit %.0f%%; device %.0f%%, ours %.0f, foreign "
+                   "%.1f per process x %.2f)%s: %s\n",
+                   foreign, limit, device, ours, foreign_pp, w.scale,
+                   compute.empty() ? "" : ", foreign compute context", line[0] ? line : "no process named");
     }
-    if (w.windows == 1 || total > w.max_other_pct) {
-      w.max_other_pct = total;
+    if (!compute.empty()) w.foreign_compute = true;
+    // The worst window: any with a foreign compute context, else the highest share.
+    const bool worse = w.windows == 1 || (!compute.empty() && !w.worst_has_compute) ||
+                       (compute.empty() == !w.worst_has_compute && foreign > w.max_other_pct);
+    if (worse) {
+      w.max_other_pct = foreign;
       w.worst = line;
+      w.worst_has_compute = !compute.empty();
     }
   }
   nv.shutdown();
-  if (!w.ok) drain();
+  if (!w.ok) {
+    while (!stop(window_ms)) {}
+  }
   return w;
 }
 
