@@ -1600,3 +1600,64 @@ nightlies:
   The first version of the rule also flagged 1x896x4864 as "2 consecutive",
   where the previous run was the tune, hence the sweep requirement.
 - eb5bcee294d4 (Oct 17): 0 regressions, 1 watch: 1x4864x896 98.1 -> 94.0%.
+
+## 2026-10-17 — BK=64 experiment (negative, configs not kept)
+
+**Hypothesis.** At BK=32, A's k-contiguous smem rows are 64 B (4 chunks), so a
+warp's cp.async (32 x 16 B = 512 B) takes 8 shared-store wavefronts instead of
+the ideal 4. BK=64 gives 128 B rows (the full-line XOR swizzle), so 8 should
+drop to 4.
+
+**Variants** (XOR swizzle, row-major NN), with the stages dropped to fit 101,376 B:
+- `mma_pipe_128x128x64_2x4_s3` (2048³ winner's tile): 32,768 B per stage, s3
+  = 98,304 B, same stages.
+- `mma_pipe_256x128x64_4x2_s2` (4096³ winner's tile): 49,152 B per stage, so
+  **s4 -> s2** (98,304 B).
+
+Build:
+- ctest: the 10 new `gemm_*` tests pass.
+- sm_87 gate: ok; the 256x128x64 tile needs 254 registers on sm_87, no spills.
+- SASS (sm_121): 0 spills (STACK 0, LOCAL 0). Registers 122 vs 120 (128x128)
+  and **250** vs 206 (256x128). HMMA/LDSM counts double (4 k16 steps unrolled).
+
+**ncu** (one launch, base clocks, cold). The cp.async counter that works on
+GB10 is `smsp__sass_l1tex_data_pipe_lsu_wavefronts_mem_shared_op_ldgsts`;
+`l1tex__data_pipe_lsu_wavefronts_mem_shared_cmd_write` reads 0 for LDGSTS.
+
+| | 2048³ BK32 s3 | 2048³ BK64 s3 | 4096³ BK32 s4 | 4096³ BK64 s2 |
+|---|---|---|---|---|
+| cp.async wavefronts / instruction | 6.00 | **4.00** | 6.67 | **4.00** |
+| LDSM bank conflicts (sum) | 4,712-5,524 | 0 | 0-3,242 | 0 |
+| cp.async bank conflicts | 0 | 0 | 0 | 0 |
+| tensor pipe busy % | 50.5 | 47.2 | 62.5 | 60.1 |
+| instructions / HMMA | 4.50 | 4.08 | 3.72 | 2.88 |
+| CTAs / SM (smem limit) | 2 | **1** | 1 | 1 |
+| warps active % | 31.1 | 16.5 | 16.6 | 16.6 |
+| stall barrier / long scoreboard (per issue) | 3.60 / 4.86 | 1.74 / 1.88 | 1.05 / 0.75 | **2.67 / 3.14** |
+
+The 6.00 and 6.67 are means over the A and B copies. A's 64 B rows take 8
+wavefronts and B's 256 B rows take 4, and A is 1/2 of the 2048 tile's chunks
+and 2/3 of the 4096 tile's: (8+4)/2 = 6 and 8*2/3 + 4/3 = 6.67. **The
+hypothesis held: A's 8 -> 4, the means -> 4.0.**
+
+**Paired-ab vs the current winners** (30 pairs, cold, display off, watch clean):
+- 2048³: BK64 / winner time **1.1106 [1.1050, 1.1159]**: 11% slower.
+- 4096³: BK64 / winner time **1.0440 [1.0324, 1.0485]**: 4% slower.
+- % of cublaslt_best, derived from the winners' paired CIs (0.840-0.845 and
+  0.701-0.708) and these ratios (no direct pairing): about 75-76% (2048³,
+  from 83.6%) and about 67% (4096³, from 70.2%). Worse at both shapes.
+
+**Verdict.** The wavefront fix is real but was not the limiter. LDGSTS stores
+are a third of shared wavefronts at 2048³ (3.1M vs LDSM's 6.3M), there were
+no cp.async conflicts to remove, and the tensor pipe was at 50-62%. Doubling
+the stage bytes costs more:
+- 2048³: occupancy halves (2 -> 1 CTA per SM), and the tensor pipe goes
+  50.5 -> 47.2%.
+- 4096³: losing two stages exposes load latency (barrier and long-scoreboard
+  stalls up 2.5x and 4x). The instruction-count gain (3.72 -> 2.88 per HMMA)
+  does not make up for it.
+
+The configs are removed (not winners). `tools/ncu_summary.sh` now collects the
+LDGSTS wavefront, LDGSTS instruction and HMMA counters. Ideas left: BK=64 only
+where occupancy is not smem-bound already, or a BK=32 A layout with 128 B
+lines (two k-tiles per row); both untested.

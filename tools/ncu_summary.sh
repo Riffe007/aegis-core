@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # Key metrics from tools/ncu_gemm.sh reports, one column per report (the last
 # profiled kernel in each: for cublaslt_best, the chosen algorithm).
+# cp.async shared-store wavefronts per instruction: the ldgsts wavefronts row
+# divided by smsp__inst_executed_op_ldgsts (ideal 4 for 16 B per thread; on GB10
+# l1tex__data_pipe_lsu_wavefronts_mem_shared_cmd_write does not count LDGSTS).
+# Instructions per HMMA: smsp__inst_executed / ..._subpipe_hmma.
 #
 #   tools/ncu_summary.sh artifacts/ncu/*.ncu-rep
 set -euo pipefail
@@ -18,6 +22,9 @@ METRICS=(
   sm__inst_executed_pipe_tensor_subpipe_hmma.avg.pct_of_peak_sustained_active
   sm__issue_active.avg.pct_of_peak_sustained_elapsed
   smsp__inst_executed.sum
+  sm__inst_executed_pipe_tensor_subpipe_hmma.sum
+  smsp__inst_executed_op_ldgsts.sum
+  smsp__sass_l1tex_data_pipe_lsu_wavefronts_mem_shared_op_ldgsts.sum
   l1tex__throughput.avg.pct_of_peak_sustained_elapsed
   l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum
   l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_st.sum
