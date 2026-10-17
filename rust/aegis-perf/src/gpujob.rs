@@ -97,7 +97,18 @@ mod tests {
         let err = lock_at(&path, "second").err().expect("lock is exclusive").to_string();
         assert!(err.contains("held by") && err.contains("first"), "{err}");
         drop(first);
-        let again = lock_at(&path, "third").expect("released on drop");
+        // Another test spawning a process can fork while the lock fd is open; the
+        // child holds the flock until its exec closes the fd (O_CLOEXEC), a few
+        // microseconds. Retry briefly instead of failing on that window.
+        let mut again = lock_at(&path, "third");
+        for _ in 0..100 {
+            if again.is_ok() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            again = lock_at(&path, "third");
+        }
+        let again = again.expect("released on drop");
         drop(again);
         std::fs::remove_file(&path).ok();
     }
