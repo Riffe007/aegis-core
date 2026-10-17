@@ -2,6 +2,7 @@
 // resolution probe and the NVML idle guard.
 #include "harness.h"
 #include "gpu_budget.h"
+#include "lt_algo.h"
 
 #include <algorithm>
 #include <chrono>
@@ -994,12 +995,12 @@ LtBest Harness::cublaslt_best(Problem& p, const TimingOptions& o, int only_rank)
 std::string Harness::lt_json(const LtBest& b) {
   if (b.best < 0) return "";
   const LtAlgo& al = b.plan->algos[size_t(b.best)];
-  char buf[256];
-  std::snprintf(buf, sizeof buf,
-                ",\"lt\":{\"heuristic_rank\":%d,\"algo_id\":%d,\"tile_id\":%d,\"stages_id\":%d,"
-                "\"splitk\":%d,\"workspace\":%zu,\"candidates\":%d,\"passed\":%d}",
-                al.rank, al.id, al.tile, al.stages, al.splitk, al.workspace, b.candidates, b.passed);
-  return buf;
+  // Every config attribute (aegis::lt::config_json), enough to rebuild the
+  // algorithm: ingested as measurements.lt_algo, emitted into the winners header.
+  char buf[128];
+  std::snprintf(buf, sizeof buf, ",\"workspace\":%zu,\"heuristic_rank\":%d,\"candidates\":%d,\"passed\":%d}", al.workspace,
+                al.rank, b.candidates, b.passed);
+  return ",\"lt\":{" + lt::config_json(lt::read_config(al.algo)) + buf;
 }
 
 }  // namespace aegis::bench

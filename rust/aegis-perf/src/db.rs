@@ -22,9 +22,12 @@ pub const SCHEMA: &str = include_str!("schema.sql");
 /// 1: every DB before the table existed (microbench.superseded);
 /// 2: microbench status / clocks, runs idle reading, paired_results;
 /// 3: disturbed (the idle guard during the run) on runs, measurements, paired,
-///    microbench and paired_results.
-/// Bump it with every migration in migrate().
-pub const SCHEMA_VERSION: i64 = 3;
+///    microbench and paired_results;
+/// 4: lt_algo (the cuBLASLt algorithm cublaslt_best picked, every config
+///    attribute, JSON) on measurements and winners.
+/// Bump it with every migration in migrate(). connect() backs the DB up
+/// (VACUUM INTO <db>.bak-v<old>-<date>) before migrating an older one.
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// The DB's schema version: None when it has no schema_version table (a v1
 /// DB, or not yet created).
@@ -57,11 +60,31 @@ pub fn connect(db: &Path) -> Result<Connection> {
         if v > SCHEMA_VERSION {
             return Err(version_mismatch(db, v));
         }
+        if v < SCHEMA_VERSION {
+            let bak = backup_path(db, v);
+            con.execute("VACUUM INTO ?1", [bak.to_string_lossy()])
+                .with_context(|| format!("back up {} to {} before migrating", db.display(), bak.display()))?;
+            eprintln!("perf DB: v{v} -> v{SCHEMA_VERSION}; backup {}", bak.display());
+        }
     }
     con.execute_batch(SCHEMA)?;
     migrate(&con)?;
     con.execute("INSERT OR REPLACE INTO schema_version (id, version) VALUES (1, ?1)", [SCHEMA_VERSION])?;
     Ok(con)
+}
+
+/// Where connect() backs up a DB before migrating it from schema `v`
+/// (a free name: never overwrites an earlier backup).
+fn backup_path(db: &Path, v: i64) -> std::path::PathBuf {
+    let day = chrono::Local::now().format("%Y-%m-%d");
+    let base = format!("{}.bak-v{v}-{day}", db.display());
+    let mut p = std::path::PathBuf::from(&base);
+    let mut i = 1;
+    while p.exists() {
+        p = format!("{base}.{i}").into();
+        i += 1;
+    }
+    p
 }
 
 /// Open an existing perf DB read-only (SQLite URI `mode=ro`), for viewers: no
@@ -142,11 +165,19 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("microbench", "disturbed", "INTEGER"),
     ("paired_results", "disturbed", "INTEGER"),
     ("paired_results", "disturbed_detail", "TEXT"),
+    // v4: the cuBLASLt algorithm cublaslt_best picked (JSON: algo_id and every
+    // config attribute; src/lt_algo.h), so aegis::matmul can rebuild it.
+    ("measurements", "lt_algo", "TEXT"),
+    ("winners", "lt_algo", "TEXT"),
 ];
 
 /// Reference implementations: always eligible (they are what --check compares
 /// against), never winners.
 const BASELINES: &str = "'cublas', 'cublaslt_best'";
+
+/// aegis::matmul itself (bench_gemm --impl aegis_matmul): the dispatch as a
+/// library caller sees it. Measured (nightly sweep, paired-ab), never a winner.
+pub const DISPATCH_IMPL: &str = "aegis_matmul";
 
 pub fn is_baseline(impl_: &str) -> bool {
     impl_ == "cublas" || impl_ == "cublaslt_best"
@@ -405,8 +436,8 @@ pub fn cmd_ingest(
         tx.execute(
             "INSERT INTO measurements (run_id, kernel_id, dtype, m, n, k, median_us, p10_us, p90_us, \
              tflops, gbps, reps, checked, pass, max_abs_err, rel_err, power_w, protocol_version, batch_n, \
-             timer_res_ns, cache_mode, buffer_sets, window_ms, allow_busy, idle_util_pct) \
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+             timer_res_ns, cache_mode, buffer_sets, window_ms, allow_busy, idle_util_pct, lt_algo) \
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             params![
                 run_id, kid, sql(Some(get(r, "dtype")?)),
                 sql(Some(get(s, "M")?)), sql(Some(get(s, "N")?)), sql(Some(get(s, "K")?)),
@@ -424,6 +455,7 @@ pub fn cmd_ingest(
                 sql(r.get("window_ms")),
                 r.get("allow_busy").and_then(Value::as_bool).unwrap_or(false) as i64,
                 sql(r.get("idle_util_pct")),
+                r.get("lt").filter(|v| v.is_object()).map(dumps_sorted),
             ],
         )?;
     }
@@ -783,7 +815,7 @@ pub fn cmd_winners(db: &Path, arch: Option<i64>) -> Result<()> {
     let sets: Vec<(ShapeKey, Vec<String>)> = groups
         .iter()
         .map(|(key, rs)| {
-            let ours: Vec<&Latest> = rs.iter().copied().filter(|r| !is_baseline(&r.impl_)).collect();
+            let ours: Vec<&Latest> = rs.iter().copied().filter(|r| !is_baseline(&r.impl_) && r.impl_ != DISPATCH_IMPL).collect();
             (key.clone(), tie_set(&ours, &paired).set.iter().map(|r| r.impl_.clone()).collect())
         })
         .collect();
@@ -811,7 +843,7 @@ pub fn cmd_winners(db: &Path, arch: Option<i64>) -> Result<()> {
         let (arch, op, dtype, m, nn, k) = key;
         let cublas = rs.iter().find(|r| r.impl_ == "cublas");
         let lt_best = rs.iter().find(|r| r.impl_ == "cublaslt_best");
-        let ours: Vec<&Latest> = rs.iter().copied().filter(|r| !is_baseline(&r.impl_)).collect();
+        let ours: Vec<&Latest> = rs.iter().copied().filter(|r| !is_baseline(&r.impl_) && r.impl_ != DISPATCH_IMPL).collect();
         let call = tie_set(&ours, &paired);
         let tie = &call.set;
         let Some(&fastest) = tie.first() else { continue };
@@ -853,18 +885,32 @@ pub fn cmd_winners(db: &Path, arch: Option<i64>) -> Result<()> {
         // pairs the runner-up too whenever it can become the pick). None when
         // no such test exists (rows tuned before that).
         let lt_ci = lt_best.and_then(|lt| paired_ci(&paired, pick, &lt.impl_, &lt.run_id));
+        // The cuBLASLt algorithm cublaslt_best picked at this shape in the pick's run.
+        let lt_algo: Option<String> = lt_best
+            .map(|lt| {
+                con.query_row(
+                    "SELECT m.lt_algo FROM measurements m WHERE m.run_id = ?1 AND m.kernel_id = ?2 \
+                     AND m.m = ?3 AND m.n = ?4 AND m.k = ?5 AND m.cache_mode = 'cold' AND m.lt_algo IS NOT NULL",
+                    params![lt.run_id, lt.kernel_id, m, nn, k],
+                    |r| r.get(0),
+                )
+                .optional()
+            })
+            .transpose()?
+            .flatten();
         let pct = cublas.map(|c| c.median_us / pick.median_us * 100.0);
         let pct_lt = lt_best.map(|c| c.median_us / pick.median_us * 100.0);
         let set_json = serde_json::to_string(&tie.iter().map(|r| r.impl_.as_str()).collect::<Vec<_>>())?;
         con.execute(
             "INSERT OR REPLACE INTO winners (sm_arch, op, dtype, shape_bucket, kernel_id, run_id, median_us, \
              pct_of_cublas, tied, tie_set, pick_reason, protocol_version, warm_median_us, pct_of_cublaslt_best, \
-             tie_method, ratio_ci_lo, ratio_ci_hi, lt_ratio_ci_lo, lt_ratio_ci_hi) \
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+             tie_method, ratio_ci_lo, ratio_ci_hi, lt_ratio_ci_lo, lt_ratio_ci_hi, lt_algo) \
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             params![arch, op, dtype, shape_bucket(*m, *nn, *k), pick.kernel_id, pick.run_id, pick.median_us, pct,
                     (tie.len() > 1) as i64, set_json, reason, sel.protocol,
                     warm_of(&pick.kernel_id, (*arch, dtype.as_str(), *m, *nn, *k))?, pct_lt, call.method,
-                    call.ci.map(|c| c.0), call.ci.map(|c| c.1), lt_ci.map(|c| c.0), lt_ci.map(|c| c.1)],
+                    call.ci.map(|c| c.0), call.ci.map(|c| c.1), lt_ci.map(|c| c.0), lt_ci.map(|c| c.1),
+                    lt_algo],
         )?;
         n += 1;
     }

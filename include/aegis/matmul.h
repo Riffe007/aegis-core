@@ -32,20 +32,38 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <string>
+
 #include "aegis/gemm.h"
 
 namespace aegis {
 
 namespace detail {
 enum class Dispatch { Aegis, Cublaslt };
+// The cuBLASLt algorithm cublaslt_best picked for the winner's shape in its
+// tune run (every CUBLASLT_ALGO_CONFIG_* attribute; src/lt_algo.h rebuilds
+// it). id < 0: none recorded.
+struct LtAlgoConfig {
+  int id = -1;
+  int tile = 0, stages = 0, splitk = 1, reduction = 0, swizzle = 0, custom = 0, inner_shape = 0, cluster_shape = 0;
+};
 struct Winner {
   int M, N, K;
   const char* impl;  // aegis::gemm registry name (the tuned config, also when not dispatched)
   Dispatch dispatch = Dispatch::Aegis;
   double pct_of_cublaslt = 0;      // winner median vs cublaslt_best (unpaired), %
   double lt_ci_lo = 0, lt_ci_hi = 0;  // paired CI of cublaslt_best / winner time; 0 = none
+  LtAlgoConfig lt = {};               // cublaslt_best's algorithm at this exact shape
 };
 inline constexpr double kDispatchFloor = 0.80;  // Production bar 3
+// For tests. The winner aegis::matmul would use for this shape (exact or
+// nearest M), or nullptr.
+const Winner* winner_for(int M, int N, int K);
+// Which algorithm this thread's cuBLASLt plan for (p, stream, stored) runs:
+// "stored", "heuristic", or "heuristic (stored algo N rejected: ...)"; builds
+// the plan if needed ("" and matmul_last_error() on failure). aegis::matmul
+// passes the exact-shape winner's lt; a test may pass any config.
+std::string cublaslt_plan_source(const gemm::GemmParams& p, cudaStream_t stream, const LtAlgoConfig* stored);
 }  // namespace detail
 
 cudaError_t matmul(const __half* A, const __half* B, __half* C, int M, int N, int K,

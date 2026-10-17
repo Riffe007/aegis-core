@@ -11,6 +11,7 @@
 
 #include "aegis/gemm.h"
 #include "aegis/matmul.h"
+#include "lt_algo.h"
 
 // One generated table per arch; a missing file just means no tuned winners.
 #if __has_include("aegis/winners/sm_121.h")
@@ -119,6 +120,7 @@ struct LtKey {
   long long lda, ldb, ldc, sa, sb, sc;
   unsigned align_a, align_b, align_c;
   cudaStream_t stream;
+  const detail::LtAlgoConfig* stored;  // the winner's recorded algorithm (exact shape), or nullptr
   bool operator==(const LtKey&) const = default;
 };
 
@@ -129,6 +131,7 @@ struct LtPlan {
   cublasLtMatmulAlgo_t algo{};
   void* workspace = nullptr;  // the algorithm's own (split-K partials): this plan, so this stream, only
   size_t workspace_bytes = 0;
+  std::string source;  // "stored", "heuristic", or "heuristic (stored ... rejected: ...)"
 };
 
 // The heuristic's workspace limit: the same as cublaslt_best's (src/bench/harness.cu),
@@ -147,8 +150,14 @@ cudaError_t cublaslt_fail(const char* what, cublasStatus_t s) {
   return cudaErrorUnknown;
 }
 
-// Build the plan for `key`: descriptors, the heuristic's first algorithm and
-// its workspace (one cudaMalloc per plan, only if the algorithm needs one).
+// Build the plan for `key`: descriptors, the algorithm and its workspace (one
+// cudaMalloc per plan, only if the algorithm needs one). The algorithm: the
+// one cublaslt_best picked at this exact shape in the tune (key.stored,
+// rebuilt from its config attributes and accepted by cublasLtMatmulAlgoCheck
+// for these descriptors); else the heuristic's first choice ("rank 1" of its
+// list). A stored algorithm that cannot be rebuilt or is rejected (another
+// driver or cuBLASLt version, another layout or alignment) is logged on
+// stderr once per plan, and the heuristic's choice is used.
 cudaError_t make_lt_plan(cublasLtHandle_t lt, const gemm::GemmParams& p, LtPlan& plan) {
   const LtKey& k = plan.key;
   cublasStatus_t s = cublasLtMatmulDescCreate(&plan.op, CUBLAS_COMPUTE_32F, CUDA_R_32F);
@@ -171,6 +180,38 @@ cudaError_t make_lt_plan(cublasLtHandle_t lt, const gemm::GemmParams& p, LtPlan&
       (s = layout(&plan.b, ra ? p.K : p.M, ra ? p.M : p.K, p.lda, p.stride_a)) != CUBLAS_STATUS_SUCCESS ||
       (s = layout(&plan.c, p.N, p.M, p.ldc, p.stride_c)) != CUBLAS_STATUS_SUCCESS)
     return cublaslt_fail("cublasLtMatrixLayoutCreate", s);
+  auto use_workspace = [&](size_t bytes) -> cudaError_t {
+    if (bytes == 0) return cudaSuccess;
+    if (const cudaError_t e = cudaMalloc(&plan.workspace, bytes); e != cudaSuccess) {
+      plan.workspace = nullptr;
+      return fail(e, "cuBLASLt fallback: workspace allocation (" + std::to_string(bytes) + " B)");
+    }
+    plan.workspace_bytes = bytes;
+    return cudaSuccess;
+  };
+  if (k.stored) {
+    cublasLtMatmulHeuristicResult_t check{};
+    cublasStatus_t st = lt::rebuild(lt, *k.stored, &plan.algo);
+    const char* stage = "rebuild";
+    if (st == CUBLAS_STATUS_SUCCESS) {
+      stage = "cublasLtMatmulAlgoCheck";
+      st = cublasLtMatmulAlgoCheck(lt, plan.op, plan.a, plan.b, plan.c, plan.c, &plan.algo, &check);
+      if (st == CUBLAS_STATUS_SUCCESS && check.workspaceSize > kLtMaxWorkspace) {
+        stage = "workspace limit";
+        st = CUBLAS_STATUS_NOT_SUPPORTED;
+      }
+    }
+    if (st == CUBLAS_STATUS_SUCCESS) {
+      plan.source = "stored";
+      return use_workspace(check.workspaceSize);
+    }
+    plan.source = "heuristic (stored algo " + std::to_string(k.stored->id) + " rejected: " + stage +
+                  ", cuBLAS status " + std::to_string(int(st)) + ")";
+    std::fprintf(stderr, "aegis::matmul: %dx%dx%d: %s; using the heuristic's first choice\n", p.M, p.N, p.K,
+                 plan.source.c_str());
+  } else {
+    plan.source = "heuristic";
+  }
   cublasLtMatmulPreference_t pref = nullptr;
   if ((s = cublasLtMatmulPreferenceCreate(&pref)) != CUBLAS_STATUS_SUCCESS)
     return cublaslt_fail("cublasLtMatmulPreferenceCreate", s);
@@ -189,14 +230,7 @@ cudaError_t make_lt_plan(cublasLtHandle_t lt, const gemm::GemmParams& p, LtPlan&
   if (s != CUBLAS_STATUS_SUCCESS) return cublaslt_fail("cublasLtMatmulAlgoGetHeuristic", s);
   if (found < 1) return cublaslt_fail("cublasLtMatmulAlgoGetHeuristic (no algorithm)", CUBLAS_STATUS_NOT_SUPPORTED);
   plan.algo = res.algo;
-  if (res.workspaceSize > 0) {
-    if (const cudaError_t e = cudaMalloc(&plan.workspace, res.workspaceSize); e != cudaSuccess) {
-      plan.workspace = nullptr;
-      return fail(e, "cuBLASLt fallback: workspace allocation (" + std::to_string(res.workspaceSize) + " B)");
-    }
-    plan.workspace_bytes = res.workspaceSize;
-  }
-  return cudaSuccess;
+  return use_workspace(res.workspaceSize);
 }
 
 void destroy(LtPlan& plan) {
@@ -207,7 +241,9 @@ void destroy(LtPlan& plan) {
   if (plan.workspace) cudaFree(plan.workspace);
 }
 
-cudaError_t cublaslt_gemm(const gemm::GemmParams& p, cudaStream_t stream) {
+// This thread's plan for (p, stream, stored), built on first use.
+cudaError_t lt_plan(const gemm::GemmParams& p, cudaStream_t stream, const detail::LtAlgoConfig* stored,
+                    cublasLtHandle_t* handle, const LtPlan** out) {
   // Per host thread, like the cuBLAS handle; never destroyed (process lifetime).
   thread_local cublasLtHandle_t lt = nullptr;
   thread_local std::vector<LtPlan> plans;
@@ -218,6 +254,7 @@ cudaError_t cublaslt_gemm(const gemm::GemmParams& p, cudaStream_t stream) {
       return cublaslt_fail("cublasLtCreate", s);
     }
   }
+  *handle = lt;
   int dev = 0;
   if (const cudaError_t e = cudaGetDevice(&dev); e != cudaSuccess) return fail(e, "cuBLASLt fallback: cudaGetDevice");
   const LtKey key{dev,          p.M,          p.N,
@@ -229,20 +266,37 @@ cudaError_t cublaslt_gemm(const gemm::GemmParams& p, cudaStream_t stream) {
                   alignment(p.A, p.stride_a, p.batch),
                   alignment(p.B, p.stride_b, p.batch),
                   alignment(p.C, p.stride_c, p.batch),
-                  stream};
-  const LtPlan* plan = nullptr;
+                  stream,
+                  stored};
   for (const LtPlan& q : plans)
-    if (q.key == key) { plan = &q; break; }
-  if (!plan) {
-    LtPlan fresh;
-    fresh.key = key;
-    if (const cudaError_t e = make_lt_plan(lt, p, fresh); e != cudaSuccess) {
-      destroy(fresh);
-      return e;
+    if (q.key == key) {
+      *out = &q;
+      return cudaSuccess;
     }
-    plans.push_back(fresh);
-    plan = &plans.back();
+  LtPlan fresh;
+  fresh.key = key;
+  if (const cudaError_t e = make_lt_plan(lt, p, fresh); e != cudaSuccess) {
+    destroy(fresh);
+    return e;
   }
+  plans.push_back(fresh);
+  *out = &plans.back();
+  return cudaSuccess;
+}
+
+// The winner's recorded algorithm when the call is the problem it was picked
+// for: that exact M, N, K, row-major NN, packed, one batch (how aegis_tune
+// times cublaslt_best). Anything else asks the heuristic.
+const detail::LtAlgoConfig* stored_for(const detail::Winner* w, const gemm::GemmParams& p) {
+  const bool tuned_form = p.layout_a == gemm::Layout::RowMajor && p.layout_b == gemm::Layout::RowMajor &&
+                          p.lda == p.K && p.ldb == p.N && p.ldc == p.N && p.batch == 1;
+  return w && w->lt.id >= 0 && tuned_form && w->M == p.M && w->N == p.N && w->K == p.K ? &w->lt : nullptr;
+}
+
+cudaError_t cublaslt_gemm(const gemm::GemmParams& p, cudaStream_t stream, const detail::LtAlgoConfig* stored) {
+  cublasLtHandle_t lt = nullptr;
+  const LtPlan* plan = nullptr;
+  if (const cudaError_t e = lt_plan(p, stream, stored, &lt, &plan); e != cudaSuccess) return e;
   const cublasStatus_t s = cublasLtMatmul(lt, plan->op, &p.alpha, p.B, plan->a, p.A, plan->b, &p.beta, p.C, plan->c,
                                           p.C, plan->c, &plan->algo, plan->workspace, plan->workspace_bytes, stream);
   return s == CUBLAS_STATUS_SUCCESS ? cudaSuccess : cublaslt_fail("cublasLtMatmul", s);
@@ -277,7 +331,7 @@ cudaError_t matmul(const gemm::GemmParams& p, cudaStream_t stream) {
   if (gemm::is_empty(p)) return cudaSuccess;
   if (p.alpha == 0.f) return scale_c(p, stream);  // BLAS: A*B does not contribute
   const detail::Winner* w = select_winner(p.M, p.N, p.K);
-  if (to_cublaslt(w)) return cublaslt_gemm(p, stream);  // dispatch floor
+  if (to_cublaslt(w)) return cublaslt_gemm(p, stream, stored_for(w, p));  // dispatch floor
   if (const gemm::KernelEntry* e = w ? gemm::find(w->impl) : nullptr; e && e->run) {
     const cudaError_t err = e->run(p, stream);
     return err == cudaSuccess ? err : fail(err, std::string("launch ") + e->name);
@@ -299,3 +353,15 @@ const char* matmul_choice(int M, int N, int K) {
 }
 
 }  // namespace aegis
+
+namespace aegis::detail {
+
+const Winner* winner_for(int M, int N, int K) { return select_winner(M, N, K); }
+
+std::string cublaslt_plan_source(const gemm::GemmParams& p, cudaStream_t stream, const LtAlgoConfig* stored) {
+  cublasLtHandle_t lt = nullptr;
+  const LtPlan* plan = nullptr;
+  return lt_plan(p, stream, stored, &lt, &plan) == cudaSuccess ? plan->source : std::string();
+}
+
+}  // namespace aegis::detail

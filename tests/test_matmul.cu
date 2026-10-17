@@ -16,6 +16,7 @@
 #include "aegis/common.cuh"
 #include "bench/gpu_budget.h"
 #include "bench/reference.h"
+#include "lt_algo.h"
 #include "aegis/matmul.h"
 #if __has_include("aegis/winners/sm_121.h")
 #include "aegis/winners/sm_121.h"
@@ -99,6 +100,67 @@ bool capture_rejects_malloc() {
   return ok;
 }
 
+// The stored form of a cuBLASLt algorithm (src/lt_algo.h) rebuilds it exactly:
+// every algorithm the heuristic offers at `M x N x K` (32 MiB workspace, as
+// cublaslt_best) is read into a config, rebuilt and checked.
+bool lt_config_round_trip(int M, int N, int K) {
+  cublasLtHandle_t lt;
+  cublasLtCreate(&lt);
+  cublasLtMatmulDesc_t op;
+  cublasLtMatmulDescCreate(&op, CUBLAS_COMPUTE_32F, CUDA_R_32F);
+  cublasLtMatrixLayout_t a, b, c;
+  cublasLtMatrixLayoutCreate(&a, CUDA_R_16F, N, K, N);
+  cublasLtMatrixLayoutCreate(&b, CUDA_R_16F, K, M, K);
+  cublasLtMatrixLayoutCreate(&c, CUDA_R_16F, N, M, N);
+  cublasLtMatmulPreference_t pref;
+  cublasLtMatmulPreferenceCreate(&pref);
+  const size_t ws = size_t(32) << 20;
+  cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &ws, sizeof ws);
+  cublasLtMatmulHeuristicResult_t res[8] = {};
+  int n = 0;
+  cublasLtMatmulAlgoGetHeuristic(lt, op, a, b, c, c, pref, 8, res, &n);
+  int same = 0;
+  for (int i = 0; i < n; ++i) {
+    // Every config attribute reads back the same, and cublasLtMatmulAlgoCheck
+    // accepts the rebuilt algorithm with the same workspace. (Raw bytes are not
+    // compared: the heuristic leaves a tag in bits 16-31 of data[4] that no
+    // attribute sets; measured 2026-10-17, the only difference.)
+    cublasLtMatmulAlgo_t back{};
+    const aegis::lt::Config want = aegis::lt::read_config(res[i].algo);
+    cublasLtMatmulHeuristicResult_t chk{};
+    if (aegis::lt::rebuild(lt, want, &back) == CUBLAS_STATUS_SUCCESS &&
+        aegis::lt::config_json(aegis::lt::read_config(back)) == aegis::lt::config_json(want) &&
+        cublasLtMatmulAlgoCheck(lt, op, a, b, c, c, &back, &chk) == CUBLAS_STATUS_SUCCESS &&
+        chk.workspaceSize == res[i].workspaceSize)
+      ++same;
+  }
+  cublasLtMatmulPreferenceDestroy(pref);
+  cublasLtMatrixLayoutDestroy(c); cublasLtMatrixLayoutDestroy(b); cublasLtMatrixLayoutDestroy(a);
+  cublasLtMatmulDescDestroy(op);
+  cublasLtDestroy(lt);
+  const bool ok = n > 0 && same == n;
+  std::printf("%-5s %5dx%5dx%5d  lt config round trip: %d of %d heuristic algorithms rebuilt (attributes, AlgoCheck, workspace)\n",
+              ok ? "ok" : "FAIL", M, N, K, same, n);
+  return ok;
+}
+
+// A stored algorithm this driver cannot use is logged and replaced by the
+// heuristic's first choice (the plan still runs, correctly).
+bool stored_rejected_falls_back(int M, int N, int K) {
+  aegis::detail::LtAlgoConfig bogus;
+  bogus.id = 99999;  // no such cuBLASLt algorithm
+  __half *A, *B, *C;
+  AEGIS_CUDA_CHECK(aegis::budget::gpu_malloc(&A, size_t(M) * K * 2));
+  AEGIS_CUDA_CHECK(aegis::budget::gpu_malloc(&B, size_t(K) * N * 2));
+  AEGIS_CUDA_CHECK(aegis::budget::gpu_malloc(&C, size_t(M) * N * 2));
+  const std::string src =
+      aegis::detail::cublaslt_plan_source(aegis::gemm::row_major_params(A, B, C, M, N, K), nullptr, &bogus);
+  const bool ok = src.rfind("heuristic (stored algo 99999 rejected", 0) == 0;
+  std::printf("%-5s %5dx%5dx%5d  bogus stored algo -> %s\n", ok ? "ok" : "FAIL", M, N, K, src.c_str());
+  aegis::budget::gpu_free(A); aegis::budget::gpu_free(B); aegis::budget::gpu_free(C);
+  return ok;
+}
+
 bool check_floor(int M, int N, int K) {
   bool ok = std::strcmp(aegis::matmul_choice(M, N, K), "cublaslt") == 0;
   std::printf("%-5s %5dx%5dx%5d  dispatch %s (want cublaslt)\n", ok ? "ok" : "FAIL", M, N, K,
@@ -117,8 +179,17 @@ bool check_floor(int M, int N, int K) {
   AEGIS_CUDA_CHECK(aegis::matmul(A, B, C, M, N, K, s));  // builds this stream's plan
   AEGIS_CUDA_CHECK(cudaStreamSynchronize(s));
   const int heuristics = g_heuristic_calls;
-  // The counter must see the plan-building query, or "0 queries" below proves nothing.
-  const bool counted = heuristics - before_plan == 1;
+  // Which algorithm the plan runs: an exact winner shape the algorithm the tune's
+  // cublaslt_best picked (rebuilt, no heuristic query); a nearest-M shape the
+  // heuristic's first choice (exactly 1 query, which also shows the counter works).
+  const aegis::detail::Winner* w = aegis::detail::winner_for(M, N, K);
+  const bool exact = w && w->M == M && w->N == N && w->K == K;
+  const aegis::gemm::GemmParams rp = aegis::gemm::row_major_params(A, B, C, M, N, K);
+  const std::string source = aegis::detail::cublaslt_plan_source(rp, s, exact && w->lt.id >= 0 ? &w->lt : nullptr);
+  const bool counted = exact ? source == "stored" && heuristics == before_plan
+                             : source == "heuristic" && heuristics - before_plan == 1;
+  std::printf("%-5s %5dx%5dx%5d  plan: %s algorithm (%s shape), %d heuristic queries\n", counted ? "ok" : "FAIL", M,
+              N, K, source.c_str(), exact ? "exact winner" : "nearest-M", heuristics - before_plan);
 
   constexpr int kCalls = 50;
   AEGIS_CUDA_CHECK(cudaStreamBeginCapture(s, cudaStreamCaptureModeGlobal));
@@ -231,7 +302,11 @@ int main() {
       return 1;
     }
     ok &= capture_rejects_malloc();
-    // The three sub-80% shapes of 2026-10-17 (winners/sm_121.h, dispatch Cublaslt).
+    ok &= lt_config_round_trip(4096, 4096, 4096);
+    ok &= lt_config_round_trip(16, 896, 4864);
+    ok &= stored_rejected_falls_back(16, 896, 4864);
+    // Sub-80% shapes (winners/sm_121.h, dispatch Cublaslt): the three of the first
+    // floor; the loop below covers every other Cublaslt row (512x4864x896 since tune 7e94c009266f).
     ok &= check_floor(4096, 4096, 4096);
     ok &= check_floor(1, 896, 4864);
     ok &= check_floor(16, 896, 4864);

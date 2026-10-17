@@ -1661,3 +1661,74 @@ The configs are removed (not winners). `tools/ncu_summary.sh` now collects the
 LDGSTS wavefront, LDGSTS instruction and HMMA counters. Ideas left: BK=64 only
 where occupancy is not smem-bound already, or a BK=32 A layout with 128 B
 lines (two k-tiles per row); both untested.
+
+## 2026-10-17 — Stored cuBLASLt choice (schema v4); dispatch runs cublaslt_best's own algorithm
+
+**Why.** The dispatch floor's fallback took the heuristic's first choice. At
+4096³ that is not what cublaslt_best picks (rank 1, `nvjet_sm121_..._tmaAB`),
+and it reached only ~95% of cublaslt_best.
+
+**What is stored.**
+- The algorithm is kept as every `CUBLASLT_ALGO_CONFIG_*` attribute: id, tile,
+  stages, split-K, reduction scheme, CTA swizzle, custom option, inner shape,
+  cluster shape (`src/lt_algo.h`).
+- The harness writes it into cublaslt_best rows (`"lt":{...}`), shared by
+  aegis_tune and bench_gemm.
+- Perf DB **schema v4** adds `measurements.lt_algo` and `winners.lt_algo`.
+  `connect()` backs an older DB up with `VACUUM INTO <db>.bak-v<old>-<date>`
+  before migrating. The live DB went v3 -> v4 with backup
+  `aegis_perf.db.bak-v3-2026-10-17` (integrity ok, 3,101 measurement rows).
+- `emit-header` writes the config as each row's last field.
+- `aegis::matmul`, on an exact winner shape in the tuned form (row-major NN,
+  packed, one batch):
+  - rebuilds it (`cublasLtMatmulAlgoInit` + attributes) and validates it with
+    `cublasLtMatmulAlgoCheck` for the call's descriptors;
+  - if it cannot be rebuilt or is rejected, logs once per plan on stderr and
+    uses the heuristic's first choice;
+  - nearest-M shapes and other layouts use the heuristic, without a log line.
+- Round trip: every heuristic algorithm at 4096³ and 16x896x4864 reads back the
+  same attributes after a rebuild and passes AlgoCheck with the same workspace.
+  The raw 64 bytes differ only in bits 16-31 of `data[4]`, a tag the heuristic
+  sets that no attribute controls; the kernel launched is the same (ncu, below).
+
+**Retune** (all 14 shapes, run 7e94c009266f, display off, watch clean) to
+record the algorithm for every winner. The fresh data changes the routing.
+4096³'s winner is now `128x128x32_2x4_s3` (tied with `256x128x32_4x2_s4`).
+512x4864x896's CI is now 0.785-0.790, below the floor:
+
+| shape | AEGIS kernel | kernel % of cublaslt_best (paired CI) | dispatch | stored algo |
+|---|---|---|---|---|
+| 4096³ | 128x128x32_2x4_s3 | 72.0-72.4% | cuBLASLt | id 67, tile 412, stages 35, custom 31 (rank 1) |
+| 16x896x4864 | 64x64x32_2x2_s4 | 75.9-76.3% | cuBLASLt | id 21, tile 15, stages 12, split-K 3, reduction 2 (rank 0) |
+| 1x896x4864 | 64x64x32_2x2_s4 | 78.1-78.3% | cuBLASLt | id 13, split-K 16, reduction 2, custom 102 (rank 1) |
+| 512x4864x896 | 128x64x32_2x2_s2 | 78.5-79.0% | cuBLASLt | id 21, tile 23, stages 9 (rank 2) |
+
+**Same kernel** (ncu, kernel names; aegis_matmul vs cublaslt_best at its rank):
+- 4096³: `nvjet_sm121_hsh_mma_128x208x64_2_32x104x64_tmaAB_bz_NNNN` in both.
+- 16x896x4864: cutlass 64x64_32x6 + splitKreduce in both.
+- 1x896x4864: the split-K gemv kernel + splitKreduce in both.
+- 512x4864x896: cutlass 128x256_32x3 in both.
+
+**Routed path vs cublaslt_best** (paired-ab, 30 pairs, cold, display off).
+Dispatch % = 100 / ratio:
+
+| shape | kernel % (paired CI) | dispatch % | aegis_matmul / cublaslt_best time | watch |
+|---|---|---|---|---|
+| 4096³ | 72.0-72.4% | 100.1% | 0.9990 [0.9947, 1.0079] tie | clean |
+| 1x896x4864 | 78.1-78.3% | 100.6% | 0.9939 [0.9850, 0.9998] | clean |
+| 512x4864x896 | 78.5-79.0% | 100.4% | 0.9963 [0.9872, 1.0059] tie | clean |
+| 16x896x4864 | 75.9-76.3% | 100.1% | 0.9994 [0.9880, 1.0117] tie (paired_results 18) | clean |
+
+- 1x896x4864's CI lies just below 1.0: the routed path is 0.6% faster. The
+  same kernels run, so this is not a different algorithm.
+- 16x896x4864: four earlier runs (paired_results 12, 14, 16, 17) were all
+  ties, but disturbed by desktop activity (Firefox 4-8% per process with the
+  device at 6-48%; gnome-shell). They are not evidence; the clean run is id 18.
+
+**Reports.**
+- `aegis-perf regress` now prints per shape "kernel <impl>: x% ... ; dispatch
+  <aegis|cublaslt>: y%". The summary line gives the kernel min and the
+  dispatch min separately.
+- The nightly sweep times `aegis_matmul` (the dispatch as a caller sees it),
+  so the dispatch % is measured, never assumed. `aegis_matmul` is never a winner.
+- The tune table's "% LtBest" is now "kernel %Lt", with a "dispatch" column.

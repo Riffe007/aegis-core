@@ -103,8 +103,8 @@ pub fn run_table(jsonl: &str) -> Result<String> {
     let med = |r: &Value| r["median_us"].as_f64().unwrap_or(f64::INFINITY);
     let mut out = String::new();
     let hdr = format!(
-        "{:>5} {:>5} {:>5}  {:<30} {:>9} {:>9}  {:<30} {:>6} {:>15}  {:>9}  {:>15}",
-        "M", "N", "K", "winner", "% cuBLAS", "% LtBest", "runner-up", "gap", "ru/win CI", "warm %", "lt/win CI"
+        "{:>5} {:>5} {:>5}  {:<30} {:>9} {:>9}  {:<30} {:>6} {:>15}  {:>9}  {:>15}  {:<9}",
+        "M", "N", "K", "winner", "% cuBLAS", "kernel %Lt", "runner-up", "gap", "ru/win CI", "warm %", "lt/win CI", "dispatch"
     );
     writeln!(out, "{hdr}")?;
     writeln!(out, "{}", "-".repeat(hdr.len()))?;
@@ -143,6 +143,11 @@ pub fn run_table(jsonl: &str) -> Result<String> {
         };
         let ci_ru = ci(ok.get(1));
         let ci_lt = ci(lt.as_ref());
+        // Where the floor rule would send the shape (on this run's CI; emit-header decides from the DB).
+        let disp = match lt.and_then(|r| pair_ci(&w["impl"], &r["impl"])) {
+            Some(c) => if dispatch(Some(c), None) == Dispatch::Cublaslt { "cublaslt" } else { "aegis" },
+            None => "-",
+        };
         let (ru, gap) = match ok.get(1) {
             // The paired tie test decides when it ran for this pair (same pair as winners).
             Some(r) if pair_ci(&w["impl"], &r["impl"]).is_some() => {
@@ -161,7 +166,7 @@ pub fn run_table(jsonl: &str) -> Result<String> {
         };
         writeln!(
             out,
-            "{m:>5} {n:>5} {k:>5}  {:<30} {pct} {pct_lt}  {ru:<30} {gap} {ci_ru:>15}  {warm_pct}  {ci_lt:>15}",
+            "{m:>5} {n:>5} {k:>5}  {:<30} {pct} {pct_lt}  {ru:<30} {gap} {ci_ru:>15}  {warm_pct}  {ci_lt:>15}  {disp:<9}",
             w["impl"].as_str().unwrap_or("?")
         )?;
     }
@@ -169,7 +174,9 @@ pub fn run_table(jsonl: &str) -> Result<String> {
         out,
         "\n% cuBLAS: cuBLAS median / winner median (100% = parity). gap: how much slower the runner-up's median is than the winner's;\n\
          \"tied\": the runner-up's median is inside the winner's p10-p90 (this run only; the DB winner is picked by the tie-break).\n\
-         % LtBest: the same against cublaslt_best. Ranked on cache_mode=cold rows.\n\
+         kernel %Lt: the winner kernel against cublaslt_best (not the dispatch). Ranked on cache_mode=cold rows.\n\
+         dispatch: where the 80% floor sends the shape by this run's lt/win CI (aegis::matmul's own % is measured\n\
+         separately: bench_gemm --impl aegis_matmul, nightly sweep, paired-ab).\n\
          warm %: cublaslt_best warm median / winner warm median (protocol v2).\n\
          ru/win CI, lt/win CI: 95% bootstrap CI of the paired median ratio runner-up / winner and cublaslt_best / winner\n\
          (30 alternating windows); when present it decides \"tied\" (the CI contains 1.0)."
@@ -209,6 +216,27 @@ pub fn dispatch(lt_ci: Option<(f64, f64)>, pct_lt: Option<f64>) -> Dispatch {
     if below { Dispatch::Cublaslt } else { Dispatch::Aegis }
 }
 
+/// winners.lt_algo (JSON, src/lt_algo.h config_json) as an
+/// aegis::detail::LtAlgoConfig initializer `{id, tile, stages, splitk,
+/// reduction, swizzle, custom, inner_shape, cluster_shape}`; None without an
+/// algo_id.
+pub fn lt_config(json: &str) -> Result<Option<String>> {
+    let v: Value = serde_json::from_str(json).context("winners.lt_algo")?;
+    let Some(id) = v["algo_id"].as_i64() else { return Ok(None) };
+    let f = |k: &str, d: i64| v[k].as_i64().unwrap_or(d);
+    Ok(Some(format!(
+        "{{{id}, {}, {}, {}, {}, {}, {}, {}, {}}}",
+        f("tile_id", 0),
+        f("stages_id", 0),
+        f("splitk", 1),
+        f("reduction", 0),
+        f("swizzle", 0),
+        f("custom", 0),
+        f("inner_shape", 0),
+        f("cluster_shape", 0)
+    )))
+}
+
 struct Entry {
     m: i64,
     n: i64,
@@ -219,6 +247,8 @@ struct Entry {
     pct_lt: Option<f64>,
     lt_ci: Option<(f64, f64)>,
     dispatch: Dispatch,
+    /// cublaslt_best's algorithm at this shape: the LtAlgoConfig initializer.
+    lt: Option<String>,
 }
 
 /// The generated header text (format unchanged from the original Python tuner
@@ -226,7 +256,7 @@ struct Entry {
 pub fn header_text(con: &rusqlite::Connection, arch: i64, generated: &str) -> Result<(String, usize)> {
     let mut stmt = con.prepare(
         "SELECT w.shape_bucket, k.impl, w.pct_of_cublas, w.tied, w.tie_set, w.pick_reason, w.pct_of_cublaslt_best, \
-                w.tie_method, w.ratio_ci_lo, w.ratio_ci_hi, w.lt_ratio_ci_lo, w.lt_ratio_ci_hi \
+                w.tie_method, w.ratio_ci_lo, w.ratio_ci_hi, w.lt_ratio_ci_lo, w.lt_ratio_ci_hi, w.lt_algo \
          FROM winners w \
          JOIN kernels k USING(kernel_id) WHERE w.sm_arch = ? AND w.op = 'gemm' \
          AND w.dtype = 'f16f32f16'",
@@ -245,9 +275,10 @@ pub fn header_text(con: &rusqlite::Connection, arch: i64, generated: &str) -> Re
             r.get::<_, Option<f64>>(8)?,
             r.get::<_, Option<f64>>(9)?,
             (r.get::<_, Option<f64>>(10)?, r.get::<_, Option<f64>>(11)?),
+            r.get::<_, Option<String>>(12)?,
         ))
     })? {
-        let (bucket, impl_, pct, tied, tie_set, reason, pct_lt, method, ci_lo, ci_hi, lt_ci) = row?;
+        let (bucket, impl_, pct, tied, tie_set, reason, pct_lt, method, ci_lo, ci_hi, lt_ci, lt_algo) = row?;
         // Paired tie test: runner-up / winner, 95% CI of the median ratio.
         let ci_note = match (method.as_deref(), ci_lo, ci_hi) {
             (Some("paired" | "paired_swap"), Some(lo), Some(hi)) => format!(" [paired CI {lo:.3}-{hi:.3}]"),
@@ -270,7 +301,8 @@ pub fn header_text(con: &rusqlite::Connection, arch: i64, generated: &str) -> Re
             (Some(lo), Some(hi)) => Some((lo, hi)),
             _ => None,
         };
-        entries.push(Entry { m, n, k, impl_, pct, tie_note, pct_lt, lt_ci, dispatch: dispatch(lt_ci, pct_lt) });
+        let lt = lt_algo.as_deref().map(lt_config).transpose()?.flatten();
+        entries.push(Entry { m, n, k, impl_, pct, tie_note, pct_lt, lt_ci, dispatch: dispatch(lt_ci, pct_lt), lt });
     }
     entries.sort_by_key(|e| (e.n, e.k, e.m)); // stable, like Python's sort
 
@@ -303,9 +335,10 @@ pub fn header_text(con: &rusqlite::Connection, arch: i64, generated: &str) -> Re
             };
             let (lo, hi) = e.lt_ci.unwrap_or((0.0, 0.0));
             lines.push(format!(
-                "    {{{m}, {n}, {k}, \"{impl_}\", aegis::detail::Dispatch::{}, {:.1}, {lo:.4}, {hi:.4}}},{note}",
+                "    {{{m}, {n}, {k}, \"{impl_}\", aegis::detail::Dispatch::{}, {:.1}, {lo:.4}, {hi:.4}, {}}},{note}",
                 e.dispatch.cpp(),
-                e.pct_lt.unwrap_or(0.0)
+                e.pct_lt.unwrap_or(0.0),
+                e.lt.as_deref().unwrap_or("{}")
             ));
         }
         lines.push("};".to_string());
@@ -351,5 +384,12 @@ mod tests {
         assert_eq!(dispatch(None, Some(79.9)), Dispatch::Cublaslt);
         assert_eq!(dispatch(None, Some(80.0)), Dispatch::Aegis);
         assert_eq!(dispatch(None, None), Dispatch::Aegis);
+    }
+
+    #[test]
+    fn lt_algo_becomes_an_initializer() {
+        let j = r#"{"algo_id":21,"tile_id":15,"stages_id":12,"splitk":3,"reduction":2,"swizzle":0,"custom":0,"inner_shape":0,"cluster_shape":0,"workspace":172032}"#;
+        assert_eq!(lt_config(j).unwrap().as_deref(), Some("{21, 15, 12, 3, 2, 0, 0, 0, 0}"));
+        assert_eq!(lt_config("{}").unwrap(), None);
     }
 }

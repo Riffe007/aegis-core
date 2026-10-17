@@ -37,6 +37,25 @@ pub fn header_winners(text: &str) -> Vec<(i64, i64, i64, String)> {
     v
 }
 
+/// Where aegis::matmul sends each header row: "aegis" or "cublaslt" (the
+/// dispatch column; rows without one predate the dispatch floor: "aegis").
+pub fn header_dispatch(text: &str) -> Vec<((i64, i64, i64), String)> {
+    let mut v = Vec::new();
+    for line in text.lines().map(str::trim).filter(|l| l.starts_with('{')) {
+        let body = line.trim_start_matches('{').split('}').next().unwrap_or("");
+        let parts: Vec<&str> = body.split(',').map(str::trim).collect();
+        if parts.len() < 4 {
+            continue;
+        }
+        let (Ok(m), Ok(n), Ok(k)) = (parts[0].parse(), parts[1].parse(), parts[2].parse()) else { continue };
+        let d = if parts.get(4).is_some_and(|p| p.ends_with("Cublaslt")) { "cublaslt" } else { "aegis" };
+        v.push(((m, n, k), d.to_string()));
+    }
+    v
+}
+
+pub use crate::db::DISPATCH_IMPL;
+
 /// Clean v2 cold median of `impl_` at a shape in one run (passing rows only).
 fn median_in(con: &Connection, run: &str, impl_: &str, (m, n, k): (i64, i64, i64)) -> Result<Option<f64>> {
     Ok(con
@@ -74,6 +93,10 @@ pub struct ShapeCheck {
     pub before_is_sweep: bool,
     /// A paired-ab confirming a slowdown: (paired_results id, ratio B/A, CI).
     pub paired: Option<(i64, f64, f64, f64)>,
+    /// Where aegis::matmul sends the shape ("aegis" | "cublaslt"; header dispatch column).
+    pub dispatch: String,
+    /// % of cublaslt_best of the dispatch itself (aegis_matmul) in this run; None: not measured.
+    pub dispatch_pct: Option<f64>,
 }
 
 fn below(p: f64, reference: f64) -> bool {
@@ -160,7 +183,18 @@ pub fn check(con: &Connection, run: &str, winners: &[(i64, i64, i64, String)]) -
             Some((prev, _)) => !con.prepare("SELECT 1 FROM paired WHERE run_id = ?")?.exists([prev])?,
             None => false,
         };
-        out.push(ShapeCheck { shape, impl_: impl_.clone(), pct, before, before2, before_is_sweep, paired });
+        let dispatch_pct = pct_in(con, run, DISPATCH_IMPL, shape)?;
+        out.push(ShapeCheck {
+            shape,
+            impl_: impl_.clone(),
+            pct,
+            before,
+            before2,
+            before_is_sweep,
+            paired,
+            dispatch: "aegis".to_string(),
+            dispatch_pct,
+        });
     }
     Ok(out)
 }
@@ -173,8 +207,10 @@ pub fn text(run: &str, disturbed: Option<bool>, checks: &[ShapeCheck]) -> String
         let now = c.pct.map_or("-".to_string(), |p| format!("{p:.1}%"));
         let was = c.before.as_ref().map_or("no earlier run".to_string(), |(r, p)| format!("{p:.1}% (run {r})"));
         s += &format!(
-            "  {m}x{n}x{k} {}: {now} of cublaslt_best, before {was}{}\n",
+            "  {m}x{n}x{k} kernel {}: {now} of cublaslt_best, before {was}; dispatch {}: {}{}\n",
             c.impl_,
+            c.dispatch,
+            c.dispatch_pct.map_or("not measured".to_string(), |p| format!("{p:.1}%")),
             if c.regressed() {
                 format!("  REGRESSION ({})", c.why())
             } else if c.watch() {
@@ -204,7 +240,7 @@ pub fn text(run: &str, disturbed: Option<bool>, checks: &[ShapeCheck]) -> String
         })
         .collect();
     s += &format!(
-        "run {run}{}: {}/{} shapes measured, min {} of cublaslt_best; {} regression(s) >{:.0}%{}; {} watch{}",
+        "run {run}{}: {}/{} shapes measured, kernel min {} of cublaslt_best, dispatch min {}; {} regression(s) >{:.0}%{}; {} watch{}",
         match disturbed {
             Some(true) => " DISTURBED",
             Some(false) => "",
@@ -216,6 +252,14 @@ pub fn text(run: &str, disturbed: Option<bool>, checks: &[ShapeCheck]) -> String
             let (m, n, k) = c.shape;
             format!("{:.1}% ({m}x{n}x{k})", c.pct.unwrap())
         }),
+        checks
+            .iter()
+            .filter(|c| c.dispatch_pct.is_some())
+            .min_by(|a, b| a.dispatch_pct.unwrap().total_cmp(&b.dispatch_pct.unwrap()))
+            .map_or("not measured".to_string(), |c| {
+                let (m, n, k) = c.shape;
+                format!("{:.1}% ({m}x{n}x{k}, {})", c.dispatch_pct.unwrap(), c.dispatch)
+            }),
         regressed.len(),
         REGRESSION * 100.0,
         if regressed.is_empty() { String::new() } else { format!(": {}", regressed.join(", ")) },
@@ -226,7 +270,9 @@ pub fn text(run: &str, disturbed: Option<bool>, checks: &[ShapeCheck]) -> String
 }
 
 pub fn cmd_regress(db: &Path, run: &str, header: &Path) -> Result<()> {
-    let winners = header_winners(&std::fs::read_to_string(header).with_context(|| format!("read {}", header.display()))?);
+    let header_text = std::fs::read_to_string(header).with_context(|| format!("read {}", header.display()))?;
+    let winners = header_winners(&header_text);
+    let dispatch = header_dispatch(&header_text);
     if winners.is_empty() {
         bail!("{}: no winner rows", header.display());
     }
@@ -236,7 +282,13 @@ pub fn cmd_regress(db: &Path, run: &str, header: &Path) -> Result<()> {
         .optional()?
         .flatten()
         .map(|d| d != 0);
-    println!("{}", text(run, disturbed, &check(&con, run, &winners)?));
+    let mut checks = check(&con, run, &winners)?;
+    for c in &mut checks {
+        if let Some((_, d)) = dispatch.iter().find(|(s, _)| *s == c.shape) {
+            c.dispatch = d.clone();
+        }
+    }
+    println!("{}", text(run, disturbed, &checks));
     Ok(())
 }
 
@@ -264,6 +316,7 @@ mod tests {
             before2: b2.and_then(run),
             before_is_sweep: true,
             paired: None,
+            ..Default::default()
         };
         // A single unpaired drop over 3% is a watch, not a regression.
         assert!(c(96.9, 100.0, Some(100.0)).watch() && !c(96.9, 100.0, Some(100.0)).regressed());

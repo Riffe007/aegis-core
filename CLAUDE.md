@@ -45,6 +45,7 @@ rust/target/release/aegis-perf sweep              # shape sweep -> results/*.jso
 rust/target/release/aegis-perf report             # % of cuBLAS per shape
 rust/target/release/aegis-perf tune               # aegis_tune: every config x shapes/default.txt -> winners
 rust/target/release/aegis-perf emit-header        # winners -> include/aegis/winners/sm_<arch>.h (commit it)
+rust/target/release/aegis-perf init               # create / migrate the perf DB (schema v4; backs up first: <db>.bak-v<old>-<date>)
 rust/target/release/aegis-perf roofline --arch 121  # results/roofline-sm121.svg from measured roofs
 rust/target/release/aegis-perf emit-arch --arch 121  # include/aegis/arch/sm_121.json: measured L2/DRAM latency, DRAM bw, mma peak
 tools/sass_dump.sh                                # SASS + register usage per kernel
@@ -217,7 +218,10 @@ and starts only after all Core components meet it.
      running a kernel that falls below 80%. Implemented as the dispatch floor: a winner whose
      paired CI vs cublaslt_best has its upper bound below 0.80 is emitted with dispatch
      `Cublaslt` (winners header column) and runs a cached cuBLASLt plan
-     (`aegis/matmul.h`).
+     (`aegis/matmul.h`) with the algorithm cublaslt_best picked in the tune
+     (perf DB `lt_algo`, header column; rebuilt by `src/lt_algo.h`). Reports show
+     the AEGIS kernel % and the dispatch % (measured: `aegis_matmul`) as separate
+     columns, in LOG.md too.
 
 4. Maintainability
    - One templated kernel family with CUTLASS-style structure (threadblock / warp /
