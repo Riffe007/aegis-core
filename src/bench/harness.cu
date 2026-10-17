@@ -740,6 +740,17 @@ WatchReport watch_other_utilization(int root, double limit, int window_ms, bool 
   std::vector<NvmlProcSample> buf(64);
   std::vector<NvmlProcInfo> procs(64);
   std::vector<std::pair<int, std::string>> names;  // comm at first sight (a process may exit before the report)
+  // Pids once seen in the run's tree stay ours: NVML still lists a process's
+  // samples and compute context for a moment after it exits, when /proc no
+  // longer has its parent (2026-10-17: a paired-ab bench_gemm child read as a
+  // foreign compute context, name "?").
+  std::vector<int> known_ours;
+  auto is_ours = [&](int pid) {
+    if (std::find(known_ours.begin(), known_ours.end(), pid) != known_ours.end()) return true;
+    if (!in_tree(pid, root)) return false;
+    known_ours.push_back(pid);
+    return true;
+  };
   auto name_of = [&](int pid) {
     for (const auto& [p, n] : names)
       if (p == pid) return n;
@@ -772,7 +783,7 @@ WatchReport watch_other_utilization(int root, double limit, int window_ms, bool 
       else it->second = std::max(it->second, buf[i].smUtil);
     }
     for (const auto& [pid, sm] : now) {
-      const bool ours = in_tree(pid, root);
+      const bool ours = is_ours(pid);
       if (trace)
         std::fprintf(stderr, "idle watch trace: %s pid %d sm %u%% %s\n", name_of(pid).c_str(), pid, sm,
                      ours ? "excluded (run's own tree)" : "counted");
@@ -788,7 +799,7 @@ WatchReport watch_other_utilization(int root, double limit, int window_ms, bool 
     }
     if (r != 0) np = 0;
     for (unsigned i = 0; i < np; ++i)
-      if (!in_tree(int(procs[i].pid), root)) {
+      if (!is_ours(int(procs[i].pid))) {
         p.foreign_compute.push_back(int(procs[i].pid));
         const std::string n = name_of(int(procs[i].pid));
         if (trace)
@@ -805,7 +816,8 @@ WatchReport watch_other_utilization(int root, double limit, int window_ms, bool 
   // device-level utilization D0 and the foreign per-process sum F0. Per-process
   // numbers are on another scale than the device total (the idle desktop: ~1%
   // device, ~5% summed per process), so foreign per-process use is converted to
-  // device level with k = D0 / F0 (k <= 1; 1 when F0 = 0; D0 floored at 0.5%).
+  // device level with k = D0 / F0 (k <= 1; kScaleNoBaseline when F0 = 0; D0
+  // floored at 0.5%).
   {
     double d = 0, f = 0;
     for (int i = 0; i < polls_per_window; ++i) {
@@ -828,36 +840,52 @@ WatchReport watch_other_utilization(int root, double limit, int window_ms, bool 
   // full load reads 59% -> 82% per process over 3 s while the device reads
   // 96%), which would otherwise leave the lag counted as foreign at the start
   // of every run process. Any foreign compute context flags the window too.
+  // Polls right after our GPU work stops are left out of the means (see
+  // our_work_stopped in harness.h); compute contexts count in every poll.
+  SettleFilter settling;
   for (bool stopping = false; !stopping;) {
-    double dev_sum = 0, ours_sum = 0;
-    std::vector<std::pair<int, double>> per;  // foreign pid -> sum over polls
+    std::vector<Poll> ps;
     std::vector<int> compute;
-    int polls = 0;
-    while (polls < polls_per_window && !stopping) {
+    while (int(ps.size()) < polls_per_window && !stopping) {
       stopping = stop(kPollMs);
       Poll p;
       if (!poll(p)) {
         w.ok = false;
         break;
       }
-      ++polls;
-      dev_sum += p.device;
-      ours_sum += p.ours;
-      for (const auto& [pid, sm] : p.foreign) {
+      for (int pid : p.foreign_compute)
+        if (std::find(compute.begin(), compute.end(), pid) == compute.end()) compute.push_back(pid);
+      ps.push_back(std::move(p));
+    }
+    if (!w.ok) break;
+    if (ps.empty()) continue;
+    std::vector<double> ours_of;
+    for (const Poll& p : ps) ours_of.push_back(p.ours);
+    const std::vector<char> keep = settling.mask(ours_of);
+    double dev_sum = 0, ours_sum = 0;
+    std::vector<std::pair<int, double>> per;  // foreign pid -> sum over kept polls
+    int used = 0;
+    for (size_t i = 0; i < ps.size(); ++i) {
+      if (!keep[i]) {
+        ++w.settled_polls;
+        continue;
+      }
+      ++used;
+      dev_sum += ps[i].device;
+      ours_sum += ps[i].ours;
+      for (const auto& [pid, sm] : ps[i].foreign) {
         auto it = std::find_if(per.begin(), per.end(), [&](const auto& q) { return q.first == pid; });
         if (it == per.end()) per.push_back({pid, sm});
         else it->second += sm;
       }
-      for (int pid : p.foreign_compute)
-        if (std::find(compute.begin(), compute.end(), pid) == compute.end()) compute.push_back(pid);
     }
-    if (!w.ok) break;
-    if (polls == 0) continue;
-    const double device = dev_sum / polls, ours = ours_sum / polls;
+    // Every poll settling: no share, only the compute-context check.
+    const int n = std::max(used, 1);
+    const double device = dev_sum / n, ours = ours_sum / n;
     double foreign_pp = 0, top = -1;
     int top_pid = 0;
     for (const auto& [pid, sum] : per) {
-      const double mean = sum / polls;
+      const double mean = sum / n;
       foreign_pp += mean;
       if (mean > top) top = mean, top_pid = pid;
     }

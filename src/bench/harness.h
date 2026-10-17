@@ -296,6 +296,7 @@ struct WatchReport {
   double limit_pct = 0;
   double baseline_device_pct = 0, baseline_foreign_pp = 0, scale = 1;  // D0, F0, k
   int windows = 0, windows_over = 0;
+  int settled_polls = 0;  // polls left out after our GPU work stopped (our_work_stopped)
   double max_other_pct = 0;  // the worst window's foreign share (device level)
   bool foreign_compute = false;     // a foreign compute context was seen
   bool worst_has_compute = false;
@@ -305,11 +306,53 @@ struct WatchReport {
 WatchReport watch_other_utilization(int root, double limit, int window_ms, bool (*stop)(int timeout_ms),
                                     void (*ready)(const WatchReport&));
 
-// The watch's arithmetic (tests/test_idle_rule.cpp). Per-process -> device scale
-// from the baseline: k = D0 / F0, D0 floored at 0.5%, at most 1; 1 when F0 = 0.
+// The watch's arithmetic (tests/test_idle_rule.cu). Per-process -> device scale
+// from the baseline: k = D0 / F0, D0 floored at 0.5%, at most 1. When the
+// baseline sees no foreign process (F0 = 0) there is nothing to scale by, and
+// taking per-process samples at face value (k = 1) let one desktop blip
+// (gnome-shell 2.1% per process, LOG 2026-10-15) mark a whole run: k is then
+// kScaleNoBaseline, GB10's measured idle-desktop ratio (baselines with foreign
+// samples on 2026-10-17: k 0.17-0.50, median 0.26; LOG 2026-10-15: ~1% device
+// for ~5% summed per process). Foreign compute contexts flag a window whatever k is.
+inline constexpr double kScaleNoBaseline = 0.25;
 inline double watch_scale(double d0, double f0) {
-  return f0 > 0 ? std::min(1.0, std::max(d0, 0.5) / f0) : 1.0;
+  return f0 > 0 ? std::min(1.0, std::max(d0, 0.5) / f0) : kScaleNoBaseline;
 }
+// Settling after our GPU work stops: when the run's per-process share drops by
+// kExitDropPct or more between two polls (a process exited or went idle), the
+// device total still shows our work for about a second (83% for 4 polls after
+// a 96% load ended, ours already 0) and foreign per-process samples are stale
+// averages that rise just then (gnome-shell 1 -> 8% while the device read 1%).
+// The next kSettlePolls polls are left out of the window means; foreign
+// compute contexts still count in them.
+inline constexpr double kExitDropPct = 10;
+inline constexpr int kSettlePolls = 8;  // 2 s at 250 ms
+inline bool our_work_stopped(double prev_ours, double ours) { return prev_ours - ours >= kExitDropPct; }
+// The poll just before the drop goes too: the exit falls inside its sampling
+// interval, and that is where a stale foreign sample first jumps (gnome-shell
+// 1 -> 8% at the last poll still showing ours 69%).
+// mask(ours of one window's polls, in order): 1 = keep the poll in the means.
+// State carries across windows; a drop at a window's first poll cannot reach
+// back into the previous window.
+struct SettleFilter {
+  double prev_ours = 0;
+  int settle = 0;
+  std::vector<char> mask(const std::vector<double>& ours) {
+    std::vector<char> keep(ours.size(), 1);
+    for (size_t i = 0; i < ours.size(); ++i) {
+      if (our_work_stopped(prev_ours, ours[i])) {
+        settle = kSettlePolls;
+        if (i > 0) keep[i - 1] = 0;
+      }
+      prev_ours = ours[i];
+      if (settle > 0) {
+        --settle;
+        keep[i] = 0;
+      }
+    }
+    return keep;
+  }
+};
 // A window's foreign share (device level): min(device - ours, k * foreign_pp).
 inline double foreign_share(double device, double ours, double foreign_pp, double k) {
   return std::min(std::max(0.0, device - ours), k * foreign_pp);

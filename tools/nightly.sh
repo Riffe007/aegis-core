@@ -14,7 +14,9 @@
 #    cublas, through aegis-perf sweep --no-winners (idle guard before, idle
 #    watch during; ingested into the perf DB; the winners table, winners
 #    headers and arch files are not touched). aegis-perf regress compares each
-#    shape's % of cublaslt_best with the newest earlier clean measurement.
+#    shape's % of cublaslt_best with the newest earlier clean measurement: a
+#    drop over 3% is a "watch"; a regression only when two consecutive
+#    nightlies or a paired-ab confirm it.
 # 4. Backs up the perf DB to ~/backups/aegis_perf-<date>.db (sqlite .backup),
 #    keeping the 14 newest.
 # 5. One summary line in results/nightly.log; everything else in

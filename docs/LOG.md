@@ -1560,3 +1560,43 @@ winner time; the dispatch floor is the CI upper bound < 0.80):
   - strided batch of 3.
 - Rust: `dispatch_floor_uses_the_ci_upper_bound`. The header parser (regress,
   nightly.sh) takes the new row format.
+
+## 2026-10-17 — Watcher: k without a baseline, exit settling; regress: watch vs regression
+
+**3a. In-run watcher** (`src/bench/harness.{h,cu}`; ctest `idle_rule` extended):
+- *k when the baseline sees no foreign process.* It was 1, so per-process
+  samples counted at face value, and one gnome-shell blip (2.1% per process,
+  Oct 15 nightly) marked a whole run disturbed. Now k = 0.25
+  (`kScaleNoBaseline`), the measured idle-desktop ratio: today's baselines
+  with foreign samples gave k 0.17-0.50, median 0.26. Test: that window gives
+  0.53%, clean. A foreign per-process 40 still gives 10%, disturbed.
+- *Settling after our work stops.* Traced today with a cuBLAS 4096³ load
+  (k = 1, baseline D0 1, F0 1):
+  - at our exit, ours read 0 at once, but the device read 83% for 4 polls;
+  - gnome-shell's per-process value jumped 1 -> 8% at the last poll still
+    showing ours, and decayed over ~5 s while the device read 1%;
+  - two windows were marked disturbed (2.6%, 4.8%).
+
+  Now, when ours drops by 10 points or more between polls, that poll's
+  predecessor and the next 2 s of polls are left out of the window means.
+  Compute contexts still count in every poll. The test replays that trace:
+  windows 1 and 2 over before, all three clean now. A foreign load still
+  there after the 2 s, or during our steady load, stays disturbed.
+- *Our pids are cached.* Once a pid is seen in the run's tree, it stays ours.
+  Today a paired-ab child read as a "foreign compute context" named `?`: NVML
+  still listed it after it exited and was reaped, when `/proc` no longer had
+  its parent.
+- Not covered: mid-run compositor readings with the screen on (gnome-shell
+  4-13% per process during `aegis_tune`). Those need the display off
+  (`tools/screen_off.sh`); the rule leaves them counted.
+
+**3b. `aegis-perf regress`**: a drop over 3% vs the previous clean
+measurement is now a *watch*. It is a *regression* only when two consecutive
+nightlies are both over 3% below the run before them (the previous run must
+be a sweep, not a tune), or when a clean paired-ab started after the previous
+run shows B at least 3% slower with its CI above 1.0. Re-run on this week's
+nightlies:
+- b34425e97d6d (Oct 16): 0 regressions, 1 watch: 16x4864x896 99.4 -> 96.1%.
+  The first version of the rule also flagged 1x896x4864 as "2 consecutive",
+  where the previous run was the tune, hence the sweep requirement.
+- eb5bcee294d4 (Oct 17): 0 regressions, 1 watch: 1x4864x896 98.1 -> 94.0%.

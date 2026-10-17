@@ -55,7 +55,8 @@ tools/sanitize.sh                                 # ctest suite under compute-sa
 tools/ncu_gemm.sh IMPL M N K; tools/ncu_summary.sh artifacts/ncu/*.ncu-rep   # Nsight profile + key metrics
 rust/target/release/aegis-perf paired-ab --a OLD/bench_gemm --b build/bench_gemm --impl X --shape M N K  # A/B across builds
 tools/nightly.sh                                  # nightly (user timer 03:00; --install): 50k fuzz, regression sweep, DB backup -> results/nightly.log
-rust/target/release/aegis-perf regress --run R   # winners-header shapes: % of cublaslt_best in run R vs the newest earlier clean run
+rust/target/release/aegis-perf regress --run R   # winners-header shapes: % of cublaslt_best in run R vs the newest earlier clean run;
+                                                  # >3% drop = watch, regression if 2 consecutive nightlies or a paired-ab confirm
 tools/screen_off.sh CMD                          # run CMD with the local display blanked (in-run idle watch; see Benchmark policy)
 ./build/bench_gemm --impl aegis_matmul ...       # time aegis::matmul itself (dispatch), e.g. paired-ab --impl cublaslt_best --impl-b aegis_matmul
 ```
@@ -277,9 +278,12 @@ only to compare with old rows (`--protocol 1`).
   keep watching while they run: `bench_gemm --idle-watch --root <pid>` ("ours"
   = that process tree) polls NVML every 250 ms. It first takes a 2 s baseline
   before the run's GPU work: device utilization D0 and the per-process sum of
-  foreign processes F0, which give the scale k = D0 / F0 (at most 1). Then,
-  per 2 s window, the foreign share is min(device - ours, k * foreign
-  per-process), all window means. A window is over when that exceeds 2% or
+  foreign processes F0, which give the scale k = D0 / F0 (at most 1; 0.25,
+  GB10's measured idle-desktop ratio, when the baseline sees no foreign
+  process). Then, per 2 s window, the foreign share is min(device - ours, k *
+  foreign per-process), all window means. Polls from the one before a drop of
+  our share by 10 points or more (a run process exited) to 2 s after it are
+  left out of the means; a pid once seen in our tree stays ours. A window is over when that exceeds 2% or
   when any foreign process holds a compute context. Each such window is
   logged, and any one of them marks the run and every row of it
   `disturbed = 1` (`runs.disturbed`, `disturbed_detail`; also on
@@ -290,6 +294,11 @@ only to compare with old rows (`--protocol 1`).
     device total (idle desktop: ~1% device, ~5% summed per process), and they
     lag (a steady full load reads 59 -> 82% per process over 3 s while the
     device reads 96%).
+  - Why the settling: after our process exits, the device total still shows
+    its work for about a second while ours reads 0, and foreign per-process
+    samples (stale averages) jump just then (gnome-shell 1 -> 8% with the
+    device at 1%; LOG 2026-10-17). Foreign compute contexts count in every
+    poll, settling or not.
   - NVML ignores `lastSeenTimeStamp` on GB10, and its sample timestamps are
     not a clock, so none are used.
 - **GPU memory.** First line of defence: the in-process GPU budget (rule 13),

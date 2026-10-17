@@ -162,9 +162,9 @@ int main(int argc, char** argv) {
         if (c == '"' || c == '\\') c = '\'';
     std::printf("{\"ok\":%s,\"source\":\"%s\",\"limit_pct\":%.2f,\"windows\":%d,\"windows_over\":%d,"
                 "\"max_other_pct\":%.2f,\"foreign_compute\":%s,\"baseline_device_pct\":%.2f,\"baseline_foreign_pp\":%.2f,"
-                "\"scale\":%.3f,\"disturbed\":%s,\"worst\":\"%s\",\"error\":\"%s\"}\n",
+                "\"scale\":%.3f,\"settled_polls\":%d,\"disturbed\":%s,\"worst\":\"%s\",\"error\":\"%s\"}\n",
                 w.ok ? "true" : "false", w.source.c_str(), w.limit_pct, w.windows, w.windows_over, w.max_other_pct,
-                w.foreign_compute ? "true" : "false", w.baseline_device_pct, w.baseline_foreign_pp, w.scale,
+                w.foreign_compute ? "true" : "false", w.baseline_device_pct, w.baseline_foreign_pp, w.scale, w.settled_polls,
                 w.ok ? (w.disturbed() ? "true" : "false") : "null", worst.c_str(), error.c_str());
     return 0;
   }
