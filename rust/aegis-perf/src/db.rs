@@ -623,12 +623,22 @@ pub struct Latest {
 /// are eligible, except cuBLAS which is the reference itself. Keeps Python's
 /// dict semantics: first-seen key order, later runs overwrite values.
 pub fn latest_per_kernel_shape(con: &Connection, arch: Option<i64>, sel: &Selection) -> Result<Vec<Latest>> {
+    latest_rows(con, arch, sel, "")
+}
+
+/// Winners rank on tune runs only: a run with paired tie tests timed every
+/// config of its shapes (aegis_tune). A sweep (the nightly one included) times
+/// a subset and has no paired tests; were its rows newer, they would decide
+/// the shapes on the band rule and drop the paired CIs.
+const TUNE_RUNS: &str = " AND m.run_id IN (SELECT DISTINCT run_id FROM paired)";
+
+fn latest_rows(con: &Connection, arch: Option<i64>, sel: &Selection, extra: &str) -> Result<Vec<Latest>> {
     let arch = arch.filter(|&a| a != 0); // Python: `if arch`
     let q = format!(
         "SELECT r.sm_arch, k.op, m.dtype, m.m, m.n, m.k, k.impl, k.kernel_id, m.run_id, \
                 m.median_us, m.tflops, m.p10_us, m.p90_us, k.regs, k.smem_bytes \
          FROM measurements m JOIN runs r USING(run_id) JOIN kernels k USING(kernel_id) \
-         WHERE (k.impl IN ({BASELINES}) OR (m.checked = 1 AND m.pass = 1)) {}{} ORDER BY r.started_at",
+         WHERE (k.impl IN ({BASELINES}) OR (m.checked = 1 AND m.pass = 1)) {}{extra}{} ORDER BY r.started_at",
         sel.sql(),
         if arch.is_some() { " AND r.sm_arch = ?" } else { "" }
     );
@@ -757,7 +767,7 @@ pub fn cmd_winners(db: &Path, arch: Option<i64>) -> Result<()> {
     let con = connect(db)?;
     // Ranked on protocol v2, cold, idle-GPU rows only (CLAUDE.md Benchmark policy).
     let sel = Selection::ranking();
-    let rows = latest_per_kernel_shape(&con, arch, &sel)?;
+    let rows = latest_rows(&con, arch, &sel, TUNE_RUNS)?;
     let paired = load_paired(&con)?;
     let mut groups: Vec<(ShapeKey, Vec<&Latest>)> = Vec::new();
     let mut index = HashMap::new();
@@ -789,7 +799,7 @@ pub fn cmd_winners(db: &Path, arch: Option<i64>) -> Result<()> {
         let warm = Selection { cache: "warm".to_string(), ..sel.clone() };
         let q = format!(
             "SELECT m.median_us FROM measurements m JOIN runs r USING(run_id) \
-             WHERE m.kernel_id = ? AND r.sm_arch = ? AND m.dtype = ? AND m.m = ? AND m.n = ? AND m.k = ? {} \
+             WHERE m.kernel_id = ? AND r.sm_arch = ? AND m.dtype = ? AND m.m = ? AND m.n = ? AND m.k = ? {}{TUNE_RUNS} \
              ORDER BY r.started_at DESC LIMIT 1",
             warm.sql()
         );
@@ -1324,6 +1334,46 @@ mod tests {
         let b: (Option<f64>, i64) = con.query_row("SELECT idle_util_pct, allow_busy FROM runs WHERE run_id = 'b'", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
         assert_eq!(a, (Some(3.5), 1));
         assert_eq!(b, (None, 0), "no reading recorded: NULL, not an invented idle");
+    }
+
+    /// Winners rank on tune runs (paired tie tests) only: a newer sweep that
+    /// timed one config, faster there, changes neither the pick nor its CI.
+    #[test]
+    fn winners_ignore_sweep_runs() {
+        let p = std::env::temp_dir().join(format!("aegis-perf-tuneonly-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        let con = connect(&p).unwrap();
+        con.execute_batch(
+            "INSERT INTO runs (run_id, device_id, sm_arch, started_at) VALUES
+               ('tune', 'dev', 121, '2026-01-01'), ('sweep', 'dev', 121, '2026-01-02');
+             INSERT INTO kernels (kernel_id, op, impl, config_json, regs, smem_bytes) VALUES
+               ('ka', 'gemm', 'a', '{}', 64, 0), ('kb', 'gemm', 'b', '{}', 64, 0),
+               ('kl', 'gemm', 'cublaslt_best', '{}', -1, 0);
+             INSERT INTO measurements (run_id, kernel_id, dtype, m, n, k, median_us, p10_us, p90_us, tflops,
+                                       checked, pass, protocol_version, cache_mode, allow_busy) VALUES
+               ('tune', 'ka', 'f16f32f16', 64, 64, 64, 10.0, 9.9, 10.1, 1, 1, 1, 2, 'cold', 0),
+               ('tune', 'kb', 'f16f32f16', 64, 64, 64, 12.0, 11.9, 12.1, 1, 1, 1, 2, 'cold', 0),
+               ('tune', 'kl', 'f16f32f16', 64, 64, 64, 9.0, 8.9, 9.1, 1, 0, 0, 2, 'cold', 0),
+               ('sweep', 'kb', 'f16f32f16', 64, 64, 64, 8.0, 7.9, 8.1, 1, 1, 1, 2, 'cold', 0),
+               ('sweep', 'kl', 'f16f32f16', 64, 64, 64, 9.0, 8.9, 9.1, 1, 0, 0, 2, 'cold', 0);
+             INSERT INTO paired (run_id, op, dtype, m, n, k, a_impl, b_impl, role, pairs, ratio_median,
+                                 ratio_ci_lo, ratio_ci_hi, tied, protocol_version, cache_mode) VALUES
+               ('tune', 'gemm', 'f16f32f16', 64, 64, 64, 'a', 'b', 'runner_up', 30, 1.2, 1.19, 1.21, 0, 2, 'cold'),
+               ('tune', 'gemm', 'f16f32f16', 64, 64, 64, 'a', 'cublaslt_best', 'cublaslt_best', 30, 0.9, 0.89, 0.91, 0, 2, 'cold');",
+        )
+        .unwrap();
+        drop(con);
+        cmd_winners(&p, Some(121)).unwrap();
+        let con = connect(&p).unwrap();
+        let w: (String, String, Option<f64>) = con
+            .query_row(
+                "SELECT k.impl, w.tie_method, w.lt_ratio_ci_hi FROM winners w JOIN kernels k USING(kernel_id)",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(w, ("a".to_string(), "paired".to_string(), Some(0.91)));
+        std::fs::remove_file(&p).unwrap();
     }
 
     /// A tie where the tie-break dispatches the runner-up (fewer registers):

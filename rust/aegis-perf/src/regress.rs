@@ -12,13 +12,14 @@ use rusqlite::{params, Connection, OptionalExtension};
 /// Relative drop in % of cublaslt_best that counts as a regression.
 pub const REGRESSION: f64 = 0.03;
 
-/// (M, N, K, impl) per row of a winners header (`{M, N, K, "impl"},`).
+/// (M, N, K, impl) per row of a winners header (`{M, N, K, "impl", dispatch, ...},`; the
+/// tuned impl, also on a row dispatched to cuBLASLt by the dispatch floor).
 pub fn header_winners(text: &str) -> Vec<(i64, i64, i64, String)> {
     let mut v = Vec::new();
     for line in text.lines().map(str::trim).filter(|l| l.starts_with('{')) {
         let body = line.trim_start_matches('{').split('}').next().unwrap_or("");
         let parts: Vec<&str> = body.split(',').map(str::trim).collect();
-        if parts.len() != 4 {
+        if parts.len() < 4 {
             continue;
         }
         let (Ok(m), Ok(n), Ok(k)) = (parts[0].parse(), parts[1].parse(), parts[2].parse()) else { continue };
@@ -159,7 +160,7 @@ mod tests {
 
     #[test]
     fn parses_header_rows() {
-        let h = "inline constexpr aegis::detail::Winner kWinners_sm121[] = {\n    {256, 256, 256, \"mma_pipe_64x64x32_2x2_s4\"},  // 98.2%\n    {1, 896, 4864, \"x\"},\n};";
+        let h = "inline constexpr aegis::detail::Winner kWinners_sm121[] = {\n    {256, 256, 256, \"mma_pipe_64x64x32_2x2_s4\"},  // 98.2%\n    {1, 896, 4864, \"x\", aegis::detail::Dispatch::Cublaslt, 74.9, 0.7489, 0.7504},\n};";
         assert_eq!(
             header_winners(h),
             vec![(256, 256, 256, "mma_pipe_64x64x32_2x2_s4".to_string()), (1, 896, 4864, "x".to_string())]

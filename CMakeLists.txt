@@ -33,7 +33,7 @@ target_include_directories(aegis_kernels PUBLIC include)
 set_target_properties(aegis_kernels PROPERTIES CUDA_SEPARABLE_COMPILATION OFF
                                                POSITION_INDEPENDENT_CODE ON)
 
-# aegis::matmul: tuned-winner dispatch over the kernels, cuBLAS fallback.
+# aegis::matmul: tuned-winner dispatch over the kernels; cuBLASLt below the dispatch floor, cuBLAS fallback.
 add_library(aegis STATIC src/matmul.cu src/manifest.cpp)
 set_target_properties(aegis PROPERTIES POSITION_INDEPENDENT_CODE ON)
 # matmul.cu pulls winners in with __has_include, which dependency scanning
@@ -41,7 +41,7 @@ set_target_properties(aegis PROPERTIES POSITION_INDEPENDENT_CODE ON)
 # triggers a rebuild.
 file(GLOB AEGIS_WINNER_HEADERS CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/include/aegis/winners/*.h)
 set_source_files_properties(src/matmul.cu PROPERTIES OBJECT_DEPENDS "${AEGIS_WINNER_HEADERS}")
-target_link_libraries(aegis PUBLIC aegis_kernels CUDA::cudart CUDA::cublas)
+target_link_libraries(aegis PUBLIC aegis_kernels CUDA::cudart CUDA::cublas CUDA::cublasLt)
 
 # The timing protocol (src/bench/harness.h), shared by bench_gemm and aegis_tune.
 add_library(aegis_bench_harness STATIC src/bench/harness.cu src/bench/reference.cu)
@@ -50,7 +50,7 @@ target_link_libraries(aegis_bench_harness PUBLIC aegis_kernels CUDA::cudart CUDA
                                            PRIVATE ${CMAKE_DL_LIBS})
 
 add_executable(bench_gemm bench/bench_gemm.cu)
-target_link_libraries(bench_gemm PRIVATE aegis_bench_harness)
+target_link_libraries(bench_gemm PRIVATE aegis_bench_harness aegis)
 
 # In-process autotuner over the registry (rows in bench_gemm's schema).
 add_executable(aegis_tune tools/aegis_tune.cu)
@@ -99,7 +99,7 @@ endforeach()
 add_subdirectory(microbench)
 
 add_executable(test_matmul tests/test_matmul.cu)
-target_link_libraries(test_matmul PRIVATE aegis)
+target_link_libraries(test_matmul PRIVATE aegis aegis_bench_harness)
 
 # Correctness: every impl on shapes that are NOT multiples of any tile size.
 enable_testing()

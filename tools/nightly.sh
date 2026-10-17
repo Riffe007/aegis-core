@@ -108,7 +108,7 @@ else
 fi
 
 # 3. Regression sweep: the dispatched impls of the committed header + baselines.
-mapfile -t impls < <(sed -n 's/^ *{[0-9]*, *[0-9]*, *[0-9]*, *"\([^"]*\)"}.*/\1/p' "$HEADER" | sort -u)
+mapfile -t impls < <(sed -n 's/^ *{[0-9]*, *[0-9]*, *[0-9]*, *"\([^"]*\)"[,}].*/\1/p' "$HEADER" | sort -u)
 echo "== aegis-perf sweep --shapes shapes/default.txt --no-winners --impls cublas cublaslt_best ${impls[*]}"
 sweep_out="$("$PERF" sweep --shapes shapes/default.txt --no-winners --impls cublas cublaslt_best "${impls[@]}" 2>&1)"
 sweep_rc=$?

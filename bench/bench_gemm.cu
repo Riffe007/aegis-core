@@ -4,6 +4,7 @@
 //              [--protocol 2] [--cache cold|warm] [--check [none]] [--seed 42]
 //   bench_gemm --impl cublaslt_best ...  fastest passing cuBLASLt heuristic algorithm (of 8);
 //              [--lt-rank R]           only the algorithm at heuristic rank R (no selection)
+//   bench_gemm --impl aegis_matmul ...  aegis::matmul (the dispatch, as a library caller sees it)
 //   bench_gemm --list                  registered impls as JSON lines
 //   bench_gemm --idle-check [--allow-busy]   the idle guard alone (aegis-perf sweep and
 //                                      paired-ab, microbench/run_all.sh run it once
@@ -32,9 +33,24 @@
 #include <unistd.h>
 
 #include "aegis/gemm.h"
+#include "aegis/matmul.h"
 #include "bench/harness.h"
 
 namespace {
+
+// --impl aegis_matmul: the aegis::matmul dispatch itself (tuned kernel, the
+// dispatch floor's cuBLASLt plan, or cuBLAS), timed like any impl; for
+// paired-ab against cublaslt_best. Not in the registry, so never tuned.
+cudaError_t matmul_launch(const __half* A, const __half* B, __half* C, int M, int N, int K, cudaStream_t s) {
+  return aegis::matmul(A, B, C, M, N, K, s);
+}
+cudaError_t matmul_attrs(cudaFuncAttributes* a) {
+  *a = cudaFuncAttributes{};
+  return cudaSuccess;
+}
+cudaError_t matmul_run(const aegis::gemm::GemmParams& p, cudaStream_t s) { return aegis::matmul(p, s); }
+constexpr aegis::gemm::KernelEntry kMatmulEntry{"aegis_matmul", R"({"dispatch":"aegis::matmul"})", matmul_launch,
+                                                matmul_attrs, matmul_run};
 
 struct Args {
   std::string impl = "tiled";
@@ -153,7 +169,8 @@ int main(int argc, char** argv) {
     return 0;
   }
   // Resolved once, before timing, so lookup cost never lands in a timed rep.
-  const aegis::gemm::KernelEntry* entry = aegis::gemm::find(a.impl);
+  const aegis::gemm::KernelEntry* entry =
+      a.impl == kMatmulEntry.name ? &kMatmulEntry : aegis::gemm::find(a.impl);
   const bool lt_best = a.impl == aegis::bench::kLtBestImpl;
   if (!entry && a.impl != "cublas" && !lt_best) {
     std::fprintf(stderr, "unknown impl '%s'\n", a.impl.c_str());

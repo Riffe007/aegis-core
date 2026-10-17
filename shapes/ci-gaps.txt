@@ -1,0 +1,4 @@
+# Winners without a paired cublaslt_best CI for the pick (tune 41cc8ffb03fd); 2026-10-17 dispatch floor.
+4096 4096 4096
+512 896 896
+512 896 4864

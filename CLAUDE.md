@@ -56,6 +56,8 @@ tools/ncu_gemm.sh IMPL M N K; tools/ncu_summary.sh artifacts/ncu/*.ncu-rep   # N
 rust/target/release/aegis-perf paired-ab --a OLD/bench_gemm --b build/bench_gemm --impl X --shape M N K  # A/B across builds
 tools/nightly.sh                                  # nightly (user timer 03:00; --install): 50k fuzz, regression sweep, DB backup -> results/nightly.log
 rust/target/release/aegis-perf regress --run R   # winners-header shapes: % of cublaslt_best in run R vs the newest earlier clean run
+tools/screen_off.sh CMD                          # run CMD with the local display blanked (in-run idle watch; see Benchmark policy)
+./build/bench_gemm --impl aegis_matmul ...       # time aegis::matmul itself (dispatch), e.g. paired-ab --impl cublaslt_best --impl-b aegis_matmul
 ```
 
 Once per clone: `git config core.hooksPath .githooks` (pre-commit builds and runs
@@ -147,7 +149,9 @@ docs/               LOG.md (dated run log), analysis/ (consolidated analyses, e.
    within 2x), then fewer registers, then less smem. The `winners` table
    records `tied`, `tie_set`, `pick_reason`, `tie_method` and the CIs
    (`ratio_ci_lo/hi`, `lt_ratio_ci_lo/hi` vs cublaslt_best); `emit-header` writes
-   them as comments. Never hand-edit a winner.
+   them as comments. Never hand-edit a winner. Winners rank on tune runs only
+   (runs with paired tie tests); sweep rows, the nightly's included, time a
+   subset of configs and never decide a winner.
 12. **Never pass `--num-cuda-barriers` to compute-sanitizer.** GB10 memory is
    unified: the sanitizer's tracking allocations come out of host RAM. On
    2026-10-14 synccheck runs with a raised barrier limit drove the machine into
@@ -209,7 +213,10 @@ and starts only after all Core components meet it.
    - Shapes >= 1024 in every dimension: >= 90% of cublaslt_best.
    - Decode (M <= 16): >= 100% of cublaslt_best (a tie or a win).
    - No shape in the sweep below 80%; aegis::matmul dispatches to cuBLASLt instead of
-     running a kernel that falls below 80%.
+     running a kernel that falls below 80%. Implemented as the dispatch floor: a winner whose
+     paired CI vs cublaslt_best has its upper bound below 0.80 is emitted with dispatch
+     `Cublaslt` (winners header column) and runs a cached cuBLASLt plan
+     (`aegis/matmul.h`).
 
 4. Maintainability
    - One templated kernel family with CUTLASS-style structure (threadblock / warp /
@@ -252,6 +259,9 @@ only to compare with old rows (`--protocol 1`).
 - **Benchmark over SSH, remote desktop off.** A remote-desktop session
   (gnome-remote-desktop) encodes video on the GPU and shares L2 and DRAM with
   the benchmark; disconnect it before a sweep, tune or microbench run.
+  At the local desktop, run measurements under `tools/screen_off.sh`: with
+  the screen on, the compositor's per-process GPU samples rise with our
+  bursty work and the in-run watch marks the run disturbed (LOG 2026-10-17).
 - **Idle guard (blocking).** `aegis-perf sweep`, `tune` and `paired-ab` (and
   `aegis_tune`, `microbench/run_all.sh`) sample GPU utilization for 2 s first
   and abort above 2% mean (or when no source can tell) unless `--allow-busy`

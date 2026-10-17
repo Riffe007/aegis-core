@@ -1484,3 +1484,79 @@ start of every run process; a sweep starts a new process per measurement).
 - Live: the desktop was fully idle when I checked (no per-process samples at
   all), so the ~5%-summed case could not be reproduced live. Two 8 s
   watches read 0.0%, clean.
+
+## 2026-10-17 — Dispatch floor: sub-80% shapes run cuBLASLt
+
+`aegis-perf-v0.3.0` tagged at 9157a34 and pushed (Custos pins to it).
+
+**Two problems found first.**
+- *Winners were being decided by nightly sweeps.* The nightly sweeps
+  (`--no-winners`, 4 configs, no paired tests) are newer than the tune, so the
+  next winners recompute ranked 11 of 14 shapes on their rows: band rule, no
+  CIs, and different picks (2048³ would have become `128x64_s2` on a band
+  tie). Winners now rank on tune runs only, i.e. runs with paired tie tests
+  (`db.rs` `TUNE_RUNS`; test `winners_ignore_sweep_runs`).
+- *Three winners had no cuBLASLt CI* (4096³, 512x896x896 and 512x896x4864,
+  from tune 41cc8ffb03fd, before the dispatched config was paired too).
+  Retuned those shapes (`shapes/ci-gaps.txt`).
+  - The first retune (run 60959720261a) was marked disturbed. While the screen
+    was on, gnome-shell/Xorg per-process samples rose with our bursty work,
+    4-13% each during `aegis_tune`, and 25% summed per process right after
+    our exit while the device read 2%.
+  - A steady cuBLAS load leaves them at 1%. With the display off
+    (`xset dpms force off`) the same traced `aegis_tune` read 0-1%, with 0 of
+    8 windows over.
+  - New `tools/screen_off.sh CMD` blanks the display for one command and
+    restores it (user's choice today). The clean retune is run 9fd0eab14f18.
+
+**Winners and paired CIs vs cublaslt_best** (`lt_ratio_ci`, cublaslt_best time /
+winner time; the dispatch floor is the CI upper bound < 0.80):
+
+| shape | winner | CI | dispatch |
+|---|---|---|---|
+| 4096³ | 256x128x32_4x2_s4 | 0.7015-0.7083 | **cublaslt** |
+| 16x896x4864 | 64x64x32_2x2_s4 | 0.7278-0.7296 | **cublaslt** |
+| 1x896x4864 | 64x64x32_2x2_s4 | 0.7489-0.7504 | **cublaslt** |
+| 512x4864x896 | 128x64x32_2x2_s2 | 0.7924-0.8002 | aegis (upper bound 0.8002 is just above) |
+| others | | 0.84-0.99 | aegis |
+
+**The cuBLASLt path** (`src/matmul.cu`):
+- *Plan cache.* The cache is thread-local. A plan is keyed by everything that
+  decides an algorithm's validity: sizes, layouts, ld, batch and strides,
+  device, per-operand alignment, and the stream.
+- *Algorithm.* The heuristic's rank 0, with the same 32 MiB workspace limit
+  as cublaslt_best. The workspace is allocated once per plan.
+- *A no-workspace variant was rejected on measurements.*
+  - With workspace 0, the heuristic returns a different variant of the same
+    algorithm (id 13, customOption 89 vs 100), 31% slower at 1x896x4864.
+  - At 16x896x4864 the best workspace-free algorithm takes 53.5 us vs 39.2 us
+    for cublaslt_best's split-K (172 KB workspace), about 73%, no better than
+    our kernel.
+- `bench_gemm --impl aegis_matmul` times `aegis::matmul` itself.
+
+**Routed path vs cublaslt_best** (paired-ab, 30 pairs, cold, display off, watch clean):
+
+| shape | aegis_matmul / cublaslt_best time | |
+|---|---|---|
+| 1x896x4864 | 1.0031 [0.9974, 1.0154] | tie |
+| 16x896x4864 | 0.9967 [0.9919, 1.0051] | tie |
+| 4096³ | 1.0540 [1.0442, 1.0625] | 94.9%: rank 0 (1489 us single run) is not the rank cublaslt_best picks (rank 1, 1408 us). Picking it needs the tune's Lt choice stored, which the schema does not keep. |
+
+**Tests** (`matmul_dispatch`, `tests/test_matmul.cu`):
+- The three shapes plus nearest-M 8x896x4864 report `cublaslt` and match
+  cuBLAS.
+- After the plan-building call, which makes exactly 1 heuristic query
+  (counted with the cuBLASLt logger callback):
+  - 50 calls capture into one `cudaStreamCaptureModeGlobal` graph, of
+    kernel nodes only, with 0 heuristic queries. In that mode any cudaMalloc
+    or synchronizing call fails the capture; a control checks that a
+    cudaMalloc there is rejected.
+  - Free memory is no witness: `cudaMemGetInfo` is system-wide on unified
+    memory and moved 251 MB under the hook's parallel ctest.
+- General parameters vs the FP64 CPU reference, max |err|/tol 0.23-0.30, plus
+  NaN propagation:
+  - col/row layouts with padded ld, alpha -0.5, beta 0.75;
+  - nearest-M with B misaligned by 2 B;
+  - strided batch of 3.
+- Rust: `dispatch_floor_uses_the_ci_upper_bound`. The header parser (regress,
+  nightly.sh) takes the new row format.

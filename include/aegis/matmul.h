@@ -12,6 +12,17 @@
 //      (ties go to the larger M);
 //   3. else cuBLAS (also if the winner's impl is no longer registered or has
 //      no general entry).
+// Dispatch floor (Production bar 3): a winner whose paired CI of
+// winner / cublaslt_best lies entirely below 0.80 (upper bound < 0.80; without
+// a paired CI, the unpaired median ratio) is emitted with dispatch Cublaslt,
+// and its shapes (exact or nearest-M) run cuBLASLt instead of the kernel:
+// the heuristic's first algorithm (workspace limit 32 MiB, as cublaslt_best)
+// per (shape, layouts, ld, batch, strides, pointer alignment, stream), picked
+// on the first such call on a host thread and cached with its descriptors and
+// workspace (split-K algorithms need one; it is allocated then, once per
+// plan, so make that first call outside stream capture). Later calls only
+// launch: no heuristic query, no allocation, no host synchronization. A plan,
+// and so its workspace, belongs to one stream.
 // Winners are tuned on row-major NN; other layouts run the same config.
 // Asynchronous on `stream`, like the per-impl launchers. Never exits the
 // process: returns cudaSuccess or the error (a launch-configuration error, or
@@ -26,10 +37,15 @@
 namespace aegis {
 
 namespace detail {
+enum class Dispatch { Aegis, Cublaslt };
 struct Winner {
   int M, N, K;
-  const char* impl;  // aegis::gemm registry name
+  const char* impl;  // aegis::gemm registry name (the tuned config, also when not dispatched)
+  Dispatch dispatch = Dispatch::Aegis;
+  double pct_of_cublaslt = 0;      // winner median vs cublaslt_best (unpaired), %
+  double lt_ci_lo = 0, lt_ci_hi = 0;  // paired CI of cublaslt_best / winner time; 0 = none
 };
+inline constexpr double kDispatchFloor = 0.80;  // Production bar 3
 }  // namespace detail
 
 cudaError_t matmul(const __half* A, const __half* B, __half* C, int M, int N, int K,
@@ -41,8 +57,8 @@ cudaError_t matmul(const gemm::GemmParams& p, cudaStream_t stream = nullptr);
 // Text of the last matmul() failure on this host thread ("" if none yet).
 const char* matmul_last_error();
 
-// The impl matmul() would run for this shape on the current device, or
-// "cublas". For logging and tests.
+// The impl matmul() would run for this shape on the current device:
+// a registry name, "cublaslt" (dispatch floor) or "cublas". For logging and tests.
 const char* matmul_choice(int M, int N, int K);
 
 }  // namespace aegis
