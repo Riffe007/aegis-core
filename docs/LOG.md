@@ -2028,3 +2028,38 @@ that gap is a stage-2 item: multi-kernel CUDA Graphs or a persistent decode kern
 **The 4864 shapes** run at 87-92% of the floor. What's left: each CTA's pipeline prologue and
 tail, plus the split-K reduction pass on the K-heavy shape. The next lever: split-K and grid
 sized from the SM count at run time, rather than per-config constants (aegis-hw, first item).
+
+## 2026-10-17 — Paused here
+
+**Phase C is complete** (tag `aegis-perf-v0.5.0`, commit 9f3f41c):
+- deterministic split-K;
+- the decode GEMV family;
+- all six decode shapes at >= 100% of cublaslt_best and dispatched to AEGIS;
+- ctest 453/453 and the sm_87 gate pass;
+- memcheck and racecheck are clean on the decode kernels.
+
+**Next session starts aegis-hw**, the hardware-aware runtime layer that `aegis::matmul` and every
+tool go through. The scope was confirmed by the user on 2026-10-17, including sustained mode
+and the CPU pool. CLAUDE.md's out-of-scope list ("adaptive runtime") is updated when the work
+starts. Order:
+0. **SM-count-driven split-K and grid sizing (first item).** Split count and grid come from the
+   device's SM count and occupancy at run time, not from per-config constants. This is the next
+   lever on the 4864 decode shapes (87-92% of the floor).
+1. **Discovery API.** C++ with a C ABI, v1.3:
+   - GPU: cudaDeviceProp plus NVML or Tegra sysfs;
+   - CPU: clusters, core types and cpufreq ranges, plus HWCAP / HWCAP2 ISA features;
+   - memory size and thermal zones.
+   Exposed as a struct and as JSON. Tegra paths are tested against recorded sysfs fixtures.
+2. **Profiles.** `arch/<sm>.json` when present. On an unknown device: conservative defaults, a
+   one-time warning, and dispatch limited to kernels whose requirements are met.
+3. **`aegis-perf calibrate`.** Microbenchmarks plus a tune, then `arch/<sm>.json` and
+   `winners/<sm>.h`, under the GPU lock, the idle guard and the budget.
+4. **Kernel requirement declarations in the registry** (min arch, TMA, smem, regs), and
+   capability-filtered dispatch. A simulated sm_87 profile must never select TMA kernels.
+5. **Telemetry thread** (opt-in, <= 1% overhead, measured):
+   - throttle state on every measurement row (schema bump);
+   - "sustained" mode, sized from a recorded time-to-throttle profile;
+   - reporting only: Core never changes clocks or power limits.
+6. **CPU thread pool**: physical performance cores, pinned, for the stage-2 CPU GEMV path.
+
+Commit after each step with ctest, sanitizers and the sm_87 gate passing.
