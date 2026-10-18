@@ -140,6 +140,14 @@ __device__ __forceinline__ void pipe_loop(__half* smem, const __half* A, const _
   cp_async_wait<0>();
 }
 
+// Dynamic smem: the ring (or the FP32 16 x BN tile aliasing it, if larger) + 16 B
+// for the split-K ticket flag at the end.
+template <class T, int STAGES>
+constexpr size_t smem_bytes() {
+  const size_t ring = T::STAGE_BYTES * STAGES, tile = size_t(16) * T::BN * sizeof(float);
+  return (ring > tile ? ring : tile) + 16;
+}
+
 template <class T, int STAGES>
 __global__ void __launch_bounds__(T::THREADS, 1) gemv_tc_kernel(KParams p, TcArgs g, bool vec) {
   extern __shared__ __align__(16) unsigned char smem_raw[];
@@ -183,26 +191,50 @@ __global__ void __launch_bounds__(T::THREADS, 1) gemv_tc_kernel(KParams p, TcArg
     }
   const long long tile = ((long long)b * g.mtiles + blockIdx.y) * g.ntiles + blockIdx.x;
   const splitk::Out o{p.C + b * p.sc, p.ldc, m0, n0, min(16, p.M - m0), min(T::BN, p.N - n0), p.alpha, p.beta};
-  splitk::finish_tile<16, T::BN, T::THREADS>(red, g.sk, tile, s, o);
+  splitk::finish_tile<16, T::BN, T::THREADS>(red, g.sk, tile, s, o,
+                                             reinterpret_cast<int*>(smem_raw + smem_bytes<T, STAGES>() - 16));
 }
 
+// The kernel with its dynamic smem limit raised (once per instantiation; the
+// status is returned on every call).
 template <class T, int STAGES>
-constexpr size_t smem_bytes() {
-  const size_t ring = T::STAGE_BYTES * STAGES, tile = size_t(16) * T::BN * sizeof(float);
-  return ring > tile ? ring : tile;
+cudaError_t configure() {
+  static const cudaError_t e = cudaFuncSetAttribute(gemv_tc_kernel<T, STAGES>,
+                                                    cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                                    int(smem_bytes<T, STAGES>()));
+  return e;
+}
+
+// The split plan of one call; S == 0: auto (one wave of resident CTAs, splits
+// of at least 2 * BK rows).
+template <class T, int STAGES>
+splitk::Plan plan_for(const GemmParams& p, int S) {
+  const long long tiles = (long long)p.batch * ceil_div(p.M, 16) * ceil_div(p.N, T::BN);
+  if (S == 0) {
+    static const int bps = [] {
+      int n = 0;
+      if (configure<T, STAGES>() != cudaSuccess ||
+          cudaOccupancyMaxActiveBlocksPerMultiprocessor(&n, gemv_tc_kernel<T, STAGES>, T::THREADS,
+                                                        smem_bytes<T, STAGES>()) != cudaSuccess) {
+        cudaGetLastError();
+        n = 1;
+      }
+      return n < 1 ? 1 : n;
+    }();
+    S = splitk::auto_splits(bps, tiles, p.K, 2 * T::BK);
+  }
+  return splitk::plan(p.K, S, tiles, 16, T::BN);
 }
 
 template <class T, int STAGES>
 cudaError_t launch_layout(const GemmParams& p, int S, cudaStream_t stream) {
   constexpr size_t smem = smem_bytes<T, STAGES>();
-  static const cudaError_t configured =
-      cudaFuncSetAttribute(gemv_tc_kernel<T, STAGES>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(smem));
-  if (configured != cudaSuccess) return configured;
+  if (const cudaError_t e = configure<T, STAGES>(); e != cudaSuccess) return e;
   TcArgs g;
   g.mtiles = ceil_div(p.M, 16);
   g.ntiles = ceil_div(p.N, T::BN);
   const long long tiles = (long long)p.batch * g.mtiles * g.ntiles;
-  const splitk::Plan pl = splitk::plan(p.K, S, tiles, 16, T::BN);
+  const splitk::Plan pl = plan_for<T, STAGES>(p, S);
   if (const cudaError_t e = splitk::acquire(stream, pl, tiles, 16, T::BN, &g.sk); e != cudaSuccess) return e;
   const dim3 grid(g.ntiles, g.mtiles, unsigned(p.batch) * unsigned(pl.S));
   if (!grid_ok(grid) || (long long)p.batch * pl.S > 65535) return cudaErrorInvalidValue;
@@ -219,6 +251,16 @@ cudaError_t run(const GemmParams& p, cudaStream_t stream) {
   if (p.layout_a == R) return launch_layout<DecTile<BN, BK, WN, R, Cm>, STAGES>(p, S, stream);
   if (p.layout_b == R) return launch_layout<DecTile<BN, BK, WN, Cm, R>, STAGES>(p, S, stream);
   return launch_layout<DecTile<BN, BK, WN, Cm, Cm>, STAGES>(p, S, stream);
+}
+
+// The effective split count of one call (gemv_split_count).
+template <int BN, int BK, int WN, int STAGES, int S>
+int splits(const GemmParams& p) {
+  constexpr Layout R = Layout::RowMajor, Cm = Layout::ColMajor;
+  if (p.layout_a == R && p.layout_b == R) return plan_for<DecTile<BN, BK, WN, R, R>, STAGES>(p, S).S;
+  if (p.layout_a == R) return plan_for<DecTile<BN, BK, WN, R, Cm>, STAGES>(p, S).S;
+  if (p.layout_b == R) return plan_for<DecTile<BN, BK, WN, Cm, R>, STAGES>(p, S).S;
+  return plan_for<DecTile<BN, BK, WN, Cm, Cm>, STAGES>(p, S).S;
 }
 
 template <int BN, int BK, int WN, int STAGES, int S>
@@ -241,7 +283,7 @@ constexpr size_t kN = std::size(GEMV_TC_CONFIGS);
 
 std::string name_of(const GemvTcConfig& c) {
   return "gemv_tc_16x" + std::to_string(c.BN) + "x" + std::to_string(c.BK) + "_1x" + std::to_string(c.WARPS_N) +
-         "_s" + std::to_string(c.STAGES) + "_k" + std::to_string(c.S);
+         "_s" + std::to_string(c.STAGES) + "_k" + (c.S == 0 ? std::string("auto") : std::to_string(c.S));
 }
 
 std::string config_of(const GemvTcConfig& c) {
@@ -249,6 +291,8 @@ std::string config_of(const GemvTcConfig& c) {
          ",\"WARPS_N\":" + std::to_string(c.WARPS_N) + ",\"STAGES\":" + std::to_string(c.STAGES) +
          ",\"S\":" + std::to_string(c.S) + ",\"path\":\"tensor_core\"}";
 }
+
+using SplitsFn = int (*)(const GemmParams&);
 
 template <size_t... I>
 std::span<const KernelEntry> make_entries(std::index_sequence<I...>) {
@@ -259,6 +303,12 @@ std::span<const KernelEntry> make_entries(std::index_sequence<I...>) {
                                                                &run<AEGIS_TC_ARGS(I)>, 16}...};
   return entries;
 }
+
+template <size_t... I>
+SplitsFn splits_fn(size_t i, std::index_sequence<I...>) {
+  static constexpr SplitsFn fns[] = {&splits<AEGIS_TC_ARGS(I)>...};
+  return fns[i];
+}
 #undef AEGIS_TC_ARGS
 
 }  // namespace
@@ -266,11 +316,7 @@ std::span<const KernelEntry> make_entries(std::index_sequence<I...>) {
 std::span<const KernelEntry> gemv_tc_entries() { return make_entries(std::make_index_sequence<kN>{}); }
 
 namespace detail {
-int gemv_tc_splits(size_t i, const GemmParams& p) {
-  const GemvTcConfig& c = GEMV_TC_CONFIGS[i];
-  const long long tiles = (long long)p.batch * ceil_div(p.M, 16) * ceil_div(p.N, c.BN);
-  return splitk::plan(p.K, c.S, tiles, 16, c.BN).S;
-}
+int gemv_tc_splits(size_t i, const GemmParams& p) { return splits_fn(i, std::make_index_sequence<kN>{})(p); }
 }  // namespace detail
 
 }  // namespace aegis::gemm

@@ -202,34 +202,42 @@ const char* mma_tma_path(const GemmParams& p);
 // 4: 8 B) B loads, warps split the CTA's K slice, each thread keeps
 // MT x VEC FP32 accumulators (MT = the smallest of 1, 2, 4, 8, 16 >= M, picked
 // per call), A's slice staged in smem as FP32.
-// Name: gemv_<BN>x<THREADS>_v<VEC>_k<S>.
+// Name: gemv_<BN>x<THREADS>_v<VEC>_k<S|auto>.
 //
 // Tensor-core path (src/gemm/gemv_tc.cu): m16n8k16 with A padded to 16 rows,
 // WARPS_N warps across BN, B streamed by a STAGES-deep cp.async ring.
-// Name: gemv_tc_16x<BN>x<BK>_1x<WARPS_N>_s<STAGES>_k<S>.
+// Name: gemv_tc_16x<BN>x<BK>_1x<WARPS_N>_s<STAGES>_k<S|auto>.
 //
-// S is the requested split count; the effective count is
+// S is the requested split count (0: auto, as many as fill one wave of
+// resident CTAs; splitk::auto_splits); the effective count is
 // ceil(K / round_up(ceil(K / S), 32)), lowered so the partials fit in
 // kSplitKMaxWorkspace (S = 1 needs no workspace). gemv_split_count reports it.
 // ---------------------------------------------------------------------------
-struct GemvConfig { int BN, THREADS, VEC, S; };
+struct GemvConfig { int BN, THREADS, VEC, S; };  // S = 0: auto
 inline constexpr GemvConfig GEMV_CONFIGS[] = {
-    {64, 128, 8, 4},  {64, 128, 8, 7},  {64, 128, 8, 8},  {64, 128, 8, 12}, {64, 128, 8, 16},
-    {128, 128, 8, 1}, {128, 128, 8, 2}, {128, 128, 8, 3}, {128, 128, 8, 5}, {128, 128, 8, 8},
-    {128, 256, 8, 1}, {128, 256, 8, 2}, {128, 256, 8, 4}, {128, 256, 8, 6},
-    {256, 256, 8, 1}, {256, 256, 8, 2}, {256, 256, 8, 4},
-    {64, 128, 4, 4},  {64, 128, 4, 8},  {64, 128, 4, 16},
-    {128, 256, 4, 2}, {128, 256, 4, 4}, {128, 256, 4, 8},
+    {64, 64, 8, 0},   {64, 64, 8, 16},
+    {64, 128, 8, 0},  {64, 128, 8, 4},  {64, 128, 8, 7},  {64, 128, 8, 8}, {64, 128, 8, 16},
+    {128, 128, 8, 0}, {128, 128, 8, 1}, {128, 128, 8, 3},
+    {128, 256, 8, 0}, {128, 256, 8, 2}, {128, 256, 8, 4},
+    {256, 256, 8, 0}, {256, 256, 8, 1},
+    {64, 128, 4, 0},  {64, 128, 4, 8},  {64, 128, 4, 16},
+    {128, 256, 4, 0}, {128, 256, 4, 4},
 };
 std::span<const KernelEntry> gemv_entries();
 
-struct GemvTcConfig { int BN, BK, WARPS_N, STAGES, S; };
+struct GemvTcConfig { int BN, BK, WARPS_N, STAGES, S; };  // S = 0: auto
+// Smem per CTA (ring): 64x64 s4 42 KiB (2 per SM), 64x32 s6 32 KiB (3), 128x32 s4
+// 38 KiB (2), 128x64 s4 73 KiB and 256x32 s4 69 KiB (1).
 inline constexpr GemvTcConfig GEMV_TC_CONFIGS[] = {
-    {64, 64, 4, 4, 4},   {64, 64, 4, 4, 8},   {64, 64, 4, 4, 16},
-    {128, 64, 4, 4, 1},  {128, 64, 4, 4, 2},  {128, 64, 4, 4, 4},  {128, 64, 4, 4, 8},
-    {128, 32, 4, 4, 2},  {128, 32, 4, 4, 7},
-    {256, 32, 8, 4, 1},  {256, 32, 8, 4, 3},
-    {64, 64, 2, 3, 8},   {64, 64, 2, 3, 12},
+    {64, 64, 4, 4, 0},  {64, 64, 4, 4, 1},  {64, 64, 4, 4, 2},  {64, 64, 4, 4, 7}, {64, 64, 4, 4, 10},
+    {64, 32, 4, 6, 0},  {64, 32, 4, 6, 2},  {64, 32, 4, 6, 3},  {64, 32, 4, 6, 4}, {64, 32, 4, 6, 7},
+    {64, 32, 4, 8, 2},  {64, 32, 4, 8, 3},
+    {32, 64, 2, 4, 4},  {32, 64, 2, 6, 3},
+    {128, 32, 4, 6, 2}, {128, 32, 4, 6, 4},
+    {64, 64, 2, 4, 0},  {64, 64, 2, 4, 7},
+    {128, 32, 4, 4, 0}, {128, 32, 4, 4, 1}, {128, 32, 4, 4, 2},
+    {128, 64, 4, 4, 0}, {128, 64, 4, 4, 1},
+    {256, 32, 8, 4, 0}, {256, 32, 8, 4, 1},
 };
 std::span<const KernelEntry> gemv_tc_entries();
 

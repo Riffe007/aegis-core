@@ -24,7 +24,7 @@ if [[ "$IMPL" == cublaslt_best ]]; then
   [[ -n "${LT_RANK:-}" ]] && EXTRA=(--lt-rank "$LT_RANK")
   FILTER=(-k 'regex:^(?!.*spin_kernel).*$')
 else
-  FILTER=(-k 'regex:gemm_.*_kernel' --launch-skip 1 --launch-count 1)
+  FILTER=(-k 'regex:(gemm_.*_kernel|gemv_.*kernel)' --launch-skip 1 --launch-count 1)
 fi
 "$NCU" --set full "${FILTER[@]}" -f -o "$REP" \
   "$ROOT/build/bench_gemm" --impl "$IMPL" --m "$M" --n "$N" --k "$K" --protocol 1 --reps 1 --warmup 0 "${EXTRA[@]}" >/dev/null

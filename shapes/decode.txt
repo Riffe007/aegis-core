@@ -1,4 +1,5 @@
-# Decode shapes (M = 1, 16) of the Qwen2.5-0.5B projections; subset of default.txt.
+# Decode shapes (M <= 16): Qwen2.5-0.5B projections, hidden 896, MLP 4864.
+# Floor per shape: bytes(B) / read_bw_gbps (include/aegis/arch/sm_121.json).
 1 896 896
 1 4864 896
 1 896 4864

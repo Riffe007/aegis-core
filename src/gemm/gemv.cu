@@ -8,11 +8,15 @@
 // load of B (16 B for VEC 8, 8 B for VEC 4; a warp reads 512 / 256 contiguous
 // bytes of a row, or LPR-lane pieces of several rows), converted to FP32, then
 // MT x VEC FFMAs against A's column k read from smem (FP32, [k][MT], one
-// float4 per four rows: a broadcast within a row group). U = 4 k steps are
-// loaded before any is used, so 4 B loads per thread are in flight.
+// float4 per four rows: a broadcast within a row group). B loads are
+// double-buffered in registers: the next kU = 4 steps (2 for MT 16 x VEC 8)
+// load while the current kU compute (up to 2 kU loads per thread in flight),
+// and a chunk's first loads go out before A is staged, so B latency
+// overlaps A's load and the barrier.
 //
 // A: the slice of A's MT rows is staged once in smem as FP32, in chunks of
-// KCH rows (A_SMEM bytes); decode slices fit in one chunk. Any layout and
+// KCH rows (kASmem bytes); decode slices fit in one chunk. Dynamic smem is
+// sized to the call (GemvSmem), so small MT does not cap occupancy. Any layout and
 // alignment (element loads: A is at most 16 x K, read from L2).
 // B: row-major with VEC-aligned base, ld and batch stride: vector loads; a
 // partial last column group loads only its valid halves. Otherwise (column-
@@ -36,8 +40,11 @@
 namespace aegis::gemm {
 namespace {
 
-constexpr int kASmem = 28 << 10;  // A chunk (FP32); + the MT x BN tile (<= 16 KiB) stays within 48 KiB static smem
-constexpr int kU = 4;             // k steps in flight per thread
+constexpr int kASmem = 28 << 10;  // A chunk (FP32) budget; + the MT x BN tile (<= 16 KiB) stays within 48 KiB
+// k steps per register buffer (two buffers): 4, or 2 when the MT x VEC accumulators
+// already take 128 registers (MT 16, VEC 8), so the kernel stays under 255 without spills.
+template <int MT, int VEC>
+constexpr int k_steps() { return MT * VEC >= 128 ? 2 : 4; }
 
 template <int VEC>
 struct BVec;
@@ -60,20 +67,40 @@ __device__ __forceinline__ void to_float(const typename BVec<VEC>::T& v, float (
 struct GemvArgs {
   splitk::Args sk;
   int mtiles, ntiles;
+  int region;         // floats of the A chunk / scratch region (GemvSmem::region)
   bool a_row, b_row;  // layouts (element path of B, and A staging)
+};
+
+// Smem plan of one instantiation: [A chunk / row-group scratch][MT x BN tile], FP32.
+template <int MT, int VEC, int BN, int THREADS>
+struct GemvSmem {
+  static constexpr int LPR = BN / VEC, RG = THREADS / LPR;
+  static constexpr int KCH = kASmem / (MT * 4);  // A rows per chunk
+  // Row-group reduction: MP rows of the tile per pass, THREADS * VEC floats each.
+  static constexpr int MP_FIT = kASmem / (THREADS * VEC * 4);
+  static constexpr int MP = MP_FIT >= MT ? MT : (MP_FIT >= 8 ? 8 : MP_FIT >= 4 ? 4 : MP_FIT >= 2 ? 2 : 1);
+  static constexpr int SCRATCH = RG == 1 ? 0 : MP * THREADS * VEC;
+  static_assert(THREADS % LPR == 0 && LPR <= 32 && 32 % LPR == 0, "a row group is a power-of-two part of a warp");
+  static_assert(MT % MP == 0 && MP_FIT >= 1, "reduction scratch fits the A budget");
+  // Floats of the first region for slices of kc rows (16 B multiple, so the tile stays float4 aligned).
+  static int region(int kc) {
+    const int a = (kc < KCH ? kc : KCH) * MT;
+    const int r = a > SCRATCH ? a : SCRATCH;
+    return (r + 3) / 4 * 4;
+  }
+  // + 16 B: the split-K ticket flag after the tile.
+  static size_t bytes(int kc) { return size_t(region(kc) + MT * BN) * sizeof(float) + 16; }
 };
 
 template <int MT, int VEC, int BN, int THREADS, bool BVEC>
 __global__ void __launch_bounds__(THREADS, 1) gemv_kernel(KParams p, GemvArgs g) {
-  constexpr int LPR = BN / VEC, RG = THREADS / LPR;
-  constexpr int KCH = kASmem / (MT * 4);
-  // Row-group reduction: MP rows of A per pass, THREADS * VEC floats each.
-  constexpr int MP_FIT = kASmem / (THREADS * VEC * 4);
-  constexpr int MP = MP_FIT >= MT ? MT : (MP_FIT >= 8 ? 8 : MP_FIT >= 4 ? 4 : MP_FIT >= 2 ? 2 : 1);
-  static_assert(THREADS % LPR == 0 && LPR <= 32 && 32 % LPR == 0, "a row group is a power-of-two part of a warp");
-  static_assert(MT % MP == 0 && MP_FIT >= 1, "reduction scratch fits the A chunk");
-  __shared__ __align__(16) float As[kASmem / 4];
-  __shared__ __align__(16) float red[MT * BN];
+  using SM = GemvSmem<MT, VEC, BN, THREADS>;
+  constexpr int LPR = SM::LPR, RG = SM::RG, KCH = SM::KCH, MP = SM::MP;
+  using V = typename BVec<VEC>::T;
+  constexpr int kU = k_steps<MT, VEC>();
+  extern __shared__ __align__(16) float smem[];
+  float* As = smem;  // A chunk, then the row-group scratch
+  float* red = smem + g.region;
 
   const int S = g.sk.S;
   const int z = blockIdx.z, b = z / S, s = z % S;
@@ -87,6 +114,26 @@ __global__ void __launch_bounds__(THREADS, 1) gemv_kernel(KParams p, GemvArgs g)
   const int kb = s * g.sk.kc, ke = min(p.K, kb + g.sk.kc);
   const long long b_sk = g.b_row ? p.ldb : 1, b_sj = g.b_row ? 1 : p.ldb;  // element path strides
 
+  // B(k, n .. n + VEC - 1) as halves; zeros past N. Nothing outside the matrix is read.
+  auto load_b = [&](long long kg) -> V {
+    union { V v; __half h[VEC]; } u;
+    u.v = V{};
+    if (ncols <= 0) return u.v;
+    if constexpr (BVEC) {
+      const __half* src = B + kg * p.ldb + n;
+      if (ncols == VEC) return __ldg(reinterpret_cast<const V*>(src));
+#pragma unroll
+      for (int j = 0; j < VEC; ++j)
+        if (j < ncols) u.h[j] = src[j];
+    } else {  // element (k, n + j) at kg * sk + (n + j) * sj
+      const __half* src = B + kg * b_sk + n * b_sj;
+#pragma unroll
+      for (int j = 0; j < VEC; ++j)
+        if (j < ncols) u.h[j] = src[j * b_sj];
+    }
+    return u.v;
+  };
+
   float acc[MT][VEC];
 #pragma unroll
   for (int m = 0; m < MT; ++m)
@@ -95,47 +142,40 @@ __global__ void __launch_bounds__(THREADS, 1) gemv_kernel(KParams p, GemvArgs g)
 
   for (int c0 = kb; c0 < ke; c0 += KCH) {
     const int rows = min(KCH, ke - c0);
+    // The chunk's first kU B loads go out before A is staged: B latency overlaps
+    // A's load and the barrier.
+    V cur[kU];
+#pragma unroll
+    for (int u = 0; u < kU; ++u) {
+      const int kk = grp + u * RG;
+      cur[u] = kk < rows ? load_b(c0 + kk) : V{};
+    }
     if (c0 != kb) __syncthreads();  // the previous chunk is consumed
-    for (int i = threadIdx.x; i < rows * MT; i += THREADS) {
-      const int k = i / MT, m = i % MT;
-      float v = 0.f;
-      if (m < mrows) {
-        const long long r = m0 + m, c = c0 + k;
-        v = __half2float(A[g.a_row ? r * p.lda + c : r + c * p.lda]);
+    if (g.a_row) {  // k fastest: coalesced along A's rows
+      for (int i = threadIdx.x; i < rows * MT; i += THREADS) {
+        const int m = i / rows, k = i % rows;
+        As[k * MT + m] = m < mrows ? __half2float(A[(long long)(m0 + m) * p.lda + c0 + k]) : 0.f;
       }
-      As[i] = v;
+    } else {  // m fastest: coalesced along A's columns
+      for (int i = threadIdx.x; i < rows * MT; i += THREADS) {
+        const int k = i / MT, m = i % MT;
+        As[i] = m < mrows ? __half2float(A[(long long)(c0 + k) * p.lda + m0 + m]) : 0.f;
+      }
     }
     __syncthreads();
     for (int k = grp; k < rows; k += RG * kU) {
-      float bf[kU][VEC];
+      V nxt[kU];  // the next kU steps load while these compute
 #pragma unroll
       for (int u = 0; u < kU; ++u) {
-        const int kk = k + u * RG;
-#pragma unroll
-        for (int j = 0; j < VEC; ++j) bf[u][j] = 0.f;
-        if (kk < rows && ncols > 0) {
-          const long long kg = c0 + kk;
-          if constexpr (BVEC) {
-            const __half* src = B + kg * p.ldb + n;
-            if (ncols == VEC) {
-              to_float<VEC>(*reinterpret_cast<const typename BVec<VEC>::T*>(src), bf[u]);
-            } else {
-#pragma unroll
-              for (int j = 0; j < VEC; ++j)
-                if (j < ncols) bf[u][j] = __half2float(src[j]);
-            }
-          } else {  // element (k, n + j) at kg * sk + (n + j) * sj
-            const __half* src = B + kg * b_sk + n * b_sj;
-#pragma unroll
-            for (int j = 0; j < VEC; ++j)
-              if (j < ncols) bf[u][j] = __half2float(src[j * b_sj]);
-          }
-        }
+        const int kk = k + RG * kU + u * RG;
+        nxt[u] = kk < rows ? load_b(c0 + kk) : V{};
       }
 #pragma unroll
       for (int u = 0; u < kU; ++u) {
         const int kk = k + u * RG;
         if (kk >= rows) break;
+        float bf[VEC];
+        to_float<VEC>(cur[u], bf);
         const float* a = As + kk * MT;
         float av[MT];
         if constexpr (MT >= 4) {
@@ -151,8 +191,10 @@ __global__ void __launch_bounds__(THREADS, 1) gemv_kernel(KParams p, GemvArgs g)
 #pragma unroll
         for (int m = 0; m < MT; ++m)
 #pragma unroll
-          for (int j = 0; j < VEC; ++j) acc[m][j] = fmaf(av[m], bf[u][j], acc[m][j]);
+          for (int j = 0; j < VEC; ++j) acc[m][j] = fmaf(av[m], bf[j], acc[m][j]);
       }
+#pragma unroll
+      for (int u = 0; u < kU; ++u) cur[u] = nxt[u];
     }
   }
 
@@ -181,7 +223,7 @@ __global__ void __launch_bounds__(THREADS, 1) gemv_kernel(KParams p, GemvArgs g)
   }
   const long long tile = ((long long)b * g.mtiles + blockIdx.y) * g.ntiles + blockIdx.x;
   const splitk::Out o{p.C + b * p.sc, p.ldc, m0, n0, mrows, min(BN, p.N - n0), p.alpha, p.beta};
-  splitk::finish_tile<MT, BN, THREADS>(red, g.sk, tile, s, o);
+  splitk::finish_tile<MT, BN, THREADS>(red, g.sk, tile, s, o, reinterpret_cast<int*>(red + MT * BN));
 }
 
 bool b_vec_ok(const GemmParams& p, int vec) {
@@ -192,9 +234,28 @@ bool b_vec_ok(const GemmParams& p, int vec) {
 
 int pick_mt(int M) { return M <= 1 ? 1 : M <= 2 ? 2 : M <= 4 ? 4 : M <= 8 ? 8 : 16; }
 
-template <int BN, int THREADS>
-splitk::Plan split_plan(const GemmParams& p, int S, int MT) {
+// Resident CTAs per SM of a kernel at `smem` bytes (>= 1).
+template <class Kern>
+int blocks_per_sm(Kern k, int threads, size_t smem) {
+  int n = 0;
+  if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&n, k, threads, smem) != cudaSuccess) {
+    cudaGetLastError();
+    return 1;
+  }
+  return n < 1 ? 1 : n;
+}
+
+// The split plan of one call; S == 0: auto (splitk::auto_splits at the
+// largest smem this instantiation uses, so a wave never overfills).
+template <int MT, int VEC, int BN, int THREADS>
+splitk::Plan plan_for(const GemmParams& p, int S) {
   const long long tiles = (long long)p.batch * ceil_div(p.M, MT) * ceil_div(p.N, BN);
+  if (S == 0) {
+    using SM = GemvSmem<MT, VEC, BN, THREADS>;
+    static const int bps_vec = blocks_per_sm(gemv_kernel<MT, VEC, BN, THREADS, true>, THREADS, SM::bytes(SM::KCH));
+    static const int bps_elem = blocks_per_sm(gemv_kernel<MT, VEC, BN, THREADS, false>, THREADS, SM::bytes(SM::KCH));
+    S = splitk::auto_splits(b_vec_ok(p, VEC) ? bps_vec : bps_elem, tiles, p.K, 64);
+  }
   return splitk::plan(p.K, S, tiles, MT, BN);
 }
 
@@ -205,15 +266,18 @@ cudaError_t launch_mt(const GemmParams& p, int S, cudaStream_t stream) {
   g.ntiles = ceil_div(p.N, BN);
   g.a_row = p.layout_a == Layout::RowMajor;
   g.b_row = p.layout_b == Layout::RowMajor;
-  const splitk::Plan pl = split_plan<BN, THREADS>(p, S, MT);
+  const splitk::Plan pl = plan_for<MT, VEC, BN, THREADS>(p, S);
   const long long tiles = (long long)p.batch * g.mtiles * g.ntiles;
   if (const cudaError_t e = splitk::acquire(stream, pl, tiles, MT, BN, &g.sk); e != cudaSuccess) return e;
   const dim3 grid(g.ntiles, g.mtiles, unsigned(p.batch) * unsigned(pl.S));
   if (!grid_ok(grid) || (long long)p.batch * pl.S > 65535) return cudaErrorInvalidValue;
+  using SM = GemvSmem<MT, VEC, BN, THREADS>;
+  g.region = SM::region(pl.kc);
+  const size_t smem = SM::bytes(pl.kc);  // <= 44 KiB + 16 B: no opt-in
   if (b_vec_ok(p, VEC))
-    gemv_kernel<MT, VEC, BN, THREADS, true><<<grid, THREADS, 0, stream>>>(to_kparams(p), g);
+    gemv_kernel<MT, VEC, BN, THREADS, true><<<grid, THREADS, smem, stream>>>(to_kparams(p), g);
   else
-    gemv_kernel<MT, VEC, BN, THREADS, false><<<grid, THREADS, 0, stream>>>(to_kparams(p), g);
+    gemv_kernel<MT, VEC, BN, THREADS, false><<<grid, THREADS, smem, stream>>>(to_kparams(p), g);
   return cudaGetLastError();
 }
 
@@ -227,6 +291,18 @@ cudaError_t run(const GemmParams& p, cudaStream_t stream) {
     case 4: return launch_mt<4, VEC, BN, THREADS>(p, S, stream);
     case 8: return launch_mt<8, VEC, BN, THREADS>(p, S, stream);
     default: return launch_mt<16, VEC, BN, THREADS>(p, S, stream);
+  }
+}
+
+// The effective split count of one call (gemv_split_count).
+template <int BN, int THREADS, int VEC, int S>
+int splits(const GemmParams& p) {
+  switch (pick_mt(p.M)) {
+    case 1: return plan_for<1, VEC, BN, THREADS>(p, S).S;
+    case 2: return plan_for<2, VEC, BN, THREADS>(p, S).S;
+    case 4: return plan_for<4, VEC, BN, THREADS>(p, S).S;
+    case 8: return plan_for<8, VEC, BN, THREADS>(p, S).S;
+    default: return plan_for<16, VEC, BN, THREADS>(p, S).S;
   }
 }
 
@@ -246,13 +322,15 @@ constexpr size_t kN = std::size(GEMV_CONFIGS);
 
 std::string name_of(const GemvConfig& c) {
   return "gemv_" + std::to_string(c.BN) + "x" + std::to_string(c.THREADS) + "_v" + std::to_string(c.VEC) + "_k" +
-         std::to_string(c.S);
+         (c.S == 0 ? std::string("auto") : std::to_string(c.S));
 }
 
 std::string config_of(const GemvConfig& c) {
   return "{\"BN\":" + std::to_string(c.BN) + ",\"THREADS\":" + std::to_string(c.THREADS) +
          ",\"VEC\":" + std::to_string(c.VEC) + ",\"S\":" + std::to_string(c.S) + ",\"path\":\"cuda_core\"}";
 }
+
+using SplitsFn = int (*)(const GemmParams&);
 
 template <size_t... I>
 std::span<const KernelEntry> make_entries(std::index_sequence<I...>) {
@@ -263,6 +341,12 @@ std::span<const KernelEntry> make_entries(std::index_sequence<I...>) {
                                                                &run<AEGIS_GEMV_ARGS(I)>, 16}...};
   return entries;
 }
+
+template <size_t... I>
+SplitsFn splits_fn(size_t i, std::index_sequence<I...>) {
+  static constexpr SplitsFn fns[] = {&splits<AEGIS_GEMV_ARGS(I)>...};
+  return fns[i];
+}
 #undef AEGIS_GEMV_ARGS
 
 }  // namespace
@@ -271,12 +355,7 @@ std::span<const KernelEntry> gemv_entries() { return make_entries(std::make_inde
 
 namespace detail {
 // For gemv_split_count (registry.cu): the effective split count of config i.
-int gemv_splits(size_t i, const GemmParams& p) {
-  const GemvConfig& c = GEMV_CONFIGS[i];
-  const int MT = pick_mt(p.M);
-  const long long tiles = (long long)p.batch * ceil_div(p.M, MT) * ceil_div(p.N, c.BN);
-  return splitk::plan(p.K, c.S, tiles, MT, c.BN).S;
-}
+int gemv_splits(size_t i, const GemmParams& p) { return splits_fn(i, std::make_index_sequence<kN>{})(p); }
 }  // namespace detail
 
 }  // namespace aegis::gemm

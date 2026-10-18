@@ -27,6 +27,8 @@
 // partials propagate through the sum.
 #include <cuda_fp16.h>
 
+#include <atomic>
+
 #include "aegis/common.cuh"
 #include "aegis/gemm.h"
 #include "workspace.h"
@@ -55,6 +57,32 @@ inline Plan plan(int K, int S_req, long long tiles, int TM, int TN) {
   pl.S = S;
   if (S == 1) pl.kc = K;
   return pl;
+}
+
+// The device's SM count (cached per device; 0 if it cannot be queried).
+inline int sm_count() {
+  static std::atomic<int> cache[64];  // zero-initialized
+  int dev = 0;
+  if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return 0;
+  if (cache[dev] == 0) {
+    int n = 0;
+    if (cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess) return 0;
+    cache[dev] = n;
+  }
+  return cache[dev];
+}
+
+// S = 0 in a config ("auto"): as many splits as fill one wave of resident
+// CTAs (blocks_per_sm x SMs, from the occupancy API at the launch's smem),
+// at least 1, and no split shorter than min_rows of K. Deterministic per
+// (shape, device): the same problem always gets the same S.
+inline int auto_splits(int blocks_per_sm, long long tiles, int K, int min_rows) {
+  const long long cap = (long long)blocks_per_sm * sm_count();
+  long long S = tiles > 0 ? cap / tiles : 1;
+  const long long by_k = K / (min_rows > 0 ? min_rows : 1);
+  if (S > by_k) S = by_k;
+  if (S < 1) S = 1;
+  return int(S > 4096 ? 4096 : S);
 }
 
 struct Args {
@@ -105,11 +133,15 @@ __device__ __forceinline__ void store_one(const Out& o, int r, int c, float v) {
   *q = __float2half(x);
 }
 
-// The CTA's TM x TN FP32 tile is in smem `red` (row-major, pitch TN; written
-// by all threads before the call, no barrier needed before it). `tile`: the
-// tile's index over all batches; `split`: this CTA's split.
+// The CTA's TM x TN FP32 tile is in smem `red` (row-major, pitch TN, 16 B
+// aligned; written by all threads before the call, no barrier needed before
+// it). `tile`: the tile's index over all batches; `split`: this CTA's split.
+// `flag`: one int of the caller's dynamic smem. No static smem here: static
+// smem sits before the dynamic region and would shift it off 32 B sectors
+// (16 B of it doubled the L2 sectors of every 16 B cp.async; LOG 2026-10-17).
 template <int TM, int TN, int THREADS>
-__device__ __forceinline__ void finish_tile(const float* red, const Args& a, long long tile, int split, const Out& o) {
+__device__ __forceinline__ void finish_tile(const float* red, const Args& a, long long tile, int split, const Out& o,
+                                            int* flag) {
   __syncthreads();
   constexpr int ELEMS = TM * TN;
   if (a.S == 1) {
@@ -119,22 +151,45 @@ __device__ __forceinline__ void finish_tile(const float* red, const Args& a, lon
     }
     return;
   }
-  float* slot0 = a.partials + tile * a.S * ELEMS;
-  float* mine = slot0 + (long long)split * ELEMS;
-  for (int i = threadIdx.x; i < ELEMS; i += THREADS) __stcg(mine + i, red[i]);
+  // Whole TM x TN slots (invalid entries too), as float4: TN % 4 == 0.
+  static_assert(TN % 4 == 0, "float4 partial slots");
+  constexpr int VECS = ELEMS / 4;
+  float4* slot0 = reinterpret_cast<float4*>(a.partials + tile * a.S * ELEMS);
+  float4* mine = slot0 + (long long)split * VECS;
+  const float4* red4 = reinterpret_cast<const float4*>(red);
+  for (int i = threadIdx.x; i < VECS; i += THREADS) __stcg(mine + i, red4[i]);
   __threadfence();  // the partial is visible device-wide before the ticket
   __syncthreads();
-  __shared__ int last;
-  if (threadIdx.x == 0) last = atomicAdd(a.counters + tile, 1u) == unsigned(a.S - 1);
+  if (threadIdx.x == 0) *flag = atomicAdd(a.counters + tile, 1u) == unsigned(a.S - 1);
   __syncthreads();
-  if (!last) return;
+  if (!*flag) return;
   __threadfence();  // acquire: the other S - 1 partials are visible
-  for (int i = threadIdx.x; i < ELEMS; i += THREADS) {
-    const int r = i / TN, c = i % TN;
+  // Sum slots 0..S-1 in that order (v = p0, v += p1, ...): the loads of up to
+  // kBatch slots are issued together (independent), the adds stay in order.
+  constexpr int kBatch = 8;
+  for (int i = threadIdx.x; i < VECS; i += THREADS) {
+    const int r = (i * 4) / TN, c = (i * 4) % TN;
     if (r >= o.rows || c >= o.cols) continue;
-    float v = __ldcg(slot0 + i);
-    for (int s = 1; s < a.S; ++s) v += __ldcg(slot0 + (long long)s * ELEMS + i);
-    store_one(o, r, c, v);
+    float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+    for (int s0 = 0; s0 < a.S; s0 += kBatch) {
+      float4 q[kBatch];
+#pragma unroll
+      for (int u = 0; u < kBatch; ++u)
+        if (s0 + u < a.S) q[u] = __ldcg(slot0 + (long long)(s0 + u) * VECS + i);
+#pragma unroll
+      for (int u = 0; u < kBatch; ++u) {
+        if (s0 + u >= a.S) break;
+        if (s0 + u == 0) {
+          v = q[0];
+        } else {
+          v.x += q[u].x; v.y += q[u].y; v.z += q[u].z; v.w += q[u].w;
+        }
+      }
+    }
+    const float vs[4] = {v.x, v.y, v.z, v.w};
+#pragma unroll
+    for (int e = 0; e < 4; ++e)
+      if (c + e < o.cols) store_one(o, r, c + e, vs[e]);
   }
   if (threadIdx.x == 0) a.counters[tile] = 0;  // the next launch starts from 0
 }

@@ -1894,3 +1894,50 @@ their winners are unchanged.
   289 cuBLASLt, 82 with NaN/Inf, 908 misaligned).
 
 Performance: unmeasured (step 2).
+
+## 2026-10-17 — Phase C step 2: GEMV tuning; % of the read-bandwidth floor
+
+**Floor** per decode shape = bytes(B) / read_bw, with read_bw = 257.841 GB/s
+(`include/aegis/arch/sm_121.json`, probe dram_bandwidth read_v4, run 941ff9215564):
+- N, K = 896, 896: 1,605,632 B, floor 6.227 µs.
+- 4864 x 896 (both orientations): 8,716,288 B, floor 33.805 µs.
+
+**What changed since step 1** (each found with ncu on the first decode tune, run 1017ef0efd04):
+1. **Split-K reduction tail.** The last CTA summed S partials with one dependent L2 load per element per
+   split (16 elements x 8 splits per thread, ~20 µs at S = 8 for a 16x128 tile). The tensor-core
+   path's best config was therefore S = 1, 7 CTAs on 48 SMs. Now: float4 slots, up to 8 slot loads in
+   flight, adds still in split order 0..S-1 (bitwise identical to before).
+2. **GEMV latency.** The CUDA-core kernel staged A and synchronized before its first B load. It now
+   issues B loads before staging A, double-buffers them in registers, and sizes dynamic smem to the
+   call (it was a 28 KiB static buffer, capping occupancy at 3 CTAs/SM for M = 1).
+3. **16 B of static smem misaligned every cp.async.** `finish_tile`'s `__shared__ int` placed the
+   dynamic region at +16 B. Every pair of 16 B cp.async chunks then straddled a 32 B sector:
+   - L2 theoretical sectors per LDGSTS: B 32 (ideal 16), A 24 (ncu source counters);
+   - L2 hit traffic 5.5x tier 4's on the same shape.
+   The flag now lives in the caller's dynamic smem; no static smem in either kernel.
+   gemv_tc at 16x4864x896 went from ~47 to ~37.6 µs (exploratory bench, same build).
+4. **Wave sizing.** The configs with a 74 KiB ring (1 CTA/SM) and small splits ran 5+ waves of pipeline
+   prologue. Added rings for 2-3 CTAs/SM and `_kauto` (S = 0: fill one wave of resident CTAs, occupancy
+   API x SM count, cached; deterministic per shape and device). Added K-heavy configs (S 3-4, 6-8 stages).
+- 106 decode impls (20 CUDA-core, 25 tensor-core configs; 94 kernels), 0 spill, 0 stack.
+
+**Tune** (run ab902928eaaa, shapes/decode.txt, all families, display off, watch clean; run
+d13561cb3d16 just before it was disturbed by Firefox and is excluded). GB/s = bytes(B) / median:
+
+| shape | winner | ours µs | cublaslt_best µs | floor µs | ours GB/s | ours % of floor | lt % of floor | kernel % of cublaslt_best (paired CI) |
+|---|---|---|---|---|---|---|---|---|
+| 1x896x896 | gemv_tc_16x64x64_1x4_s4_k1 | 9.64 | 9.80 | 6.227 | 166.6 | 64.6% | 63.5% | 100.2-101.6% |
+| 1x4864x896 | gemv_tc_16x64x64_1x4_s4_k1 | 35.45 | 35.76 | 33.805 | 245.9 | 95.4% | 94.5% | 100.4-102.9% |
+| 1x896x4864 | gemv_tc_16x64x32_1x4_s8_k3 | 36.34 | 38.26 | 33.805 | 239.9 | 93.0% | 88.4% | 105.3-106.9% |
+| 16x896x896 | gemv_tc_16x64x64_1x4_s4_k1 | 9.40 | 10.40 | 6.227 | 170.8 | 66.2% | 59.9% | 109.8-111.6% |
+| 16x4864x896 | gemv_tc_16x128x64_1x4_s4_k1 | 36.66 | 37.17 | 33.805 | 237.8 | 92.2% | 90.9% | 100.3-101.8% |
+| 16x896x4864 | gemv_tc_16x128x32_1x4_s6_k4 | 39.87 | 39.67 | 33.805 | 218.6 | 84.8% | 85.2% | 98.3-99.4% |
+
+- The tensor-core path wins every decode shape, including M = 1 (A padded to 16). The best CUDA-core
+  config is 1-14% behind on M = 1 and 23-40% on M = 16.
+- 16x896x4864 is still ~1% short of cublaslt_best (step 4).
+- The 896x896 shapes sit at ~65% of the floor for cuBLASLt too: per-launch fixed cost (launch, ramp,
+  tail) of a ~6 µs transfer in back-to-back graph replay.
+- Pre-existing, not from this work: tier 4's `mma_pipe_64x64x32_2x2_s2` (layouts RC) has 12 B spill /
+  16 B stack on sm_121; it is in the 17:19 SASS dump from the TMA step too.
+- Winners in the DB come from this run; the header is regenerated in step 4.
