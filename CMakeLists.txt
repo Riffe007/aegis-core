@@ -303,6 +303,12 @@ add_executable(test_hw_profile tests/test_hw_profile.cu)
 target_link_libraries(test_hw_profile PRIVATE aegis aegis_bench_harness)
 target_include_directories(test_hw_profile PRIVATE src)
 add_test(NAME hw_profile COMMAND test_hw_profile)
+# Capability-aware dispatch (aegis-hw step 4): declared requirements, a simulated sm_87
+# (no TMA, no kernel over its smem limit, every shape still valid), a 48 KiB-smem device.
+add_executable(test_hw_dispatch tests/test_hw_dispatch.cu)
+target_link_libraries(test_hw_dispatch PRIVATE aegis aegis_bench_harness)
+target_include_directories(test_hw_dispatch PRIVATE src)
+add_test(NAME hw_dispatch COMMAND test_hw_dispatch)
 add_test(NAME hw_profile_row_label COMMAND bench_gemm --impl cublas --m 64 --n 64 --k 64 --reps 2)
 set_tests_properties(hw_profile_row_label PROPERTIES ENVIRONMENT AEGIS_PROFILE_EMBEDDED=0
   PASS_REGULAR_EXPRESSION "\"profile\":\"unmeasured\"")

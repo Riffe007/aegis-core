@@ -21,6 +21,7 @@
 #include <cuda_runtime.h>
 
 #include <span>
+#include <string>
 #include <string_view>
 
 namespace aegis::gemm {
@@ -93,6 +94,18 @@ using AttrsFn = cudaError_t (*)(cudaFuncAttributes* attrs);
 // General entry (layouts, ld, alpha/beta, batch). Validates p; asynchronous.
 using RunFn = cudaError_t (*)(const GemmParams& p, cudaStream_t stream);
 
+// What a device must provide to run a kernel (aegis-hw step 4). Declared by each
+// family from its config (constexpr); regs is filled by registry() from the
+// compiled binary (cudaFuncGetAttributes: the SASS this build carries, so a
+// simulated device of another arch sees this build's count).
+struct KernelReq {
+  int min_arch = 0;       // major * 10 + minor (mma.sync m16n8k16 / cp.async: 80; TMA: 90)
+  bool tma = false;       // cp.async.bulk.tensor (and the build compiled the TMA tier)
+  size_t smem_bytes = 0;  // most smem per block over every launch (static + dynamic, any layout / M)
+  int threads = 0;        // threads per block
+  int regs = -1;          // registers per thread (-1: unknown)
+};
+
 struct KernelEntry {
   const char* name;    // impl name: bench_gemm --impl, aegis_tune, perf DB
   const char* config;  // JSON; states every template parameter
@@ -100,7 +113,22 @@ struct KernelEntry {
   AttrsFn attrs;       // sharedSizeBytes includes dynamic smem per block (row-major NN kernel)
   RunFn run;           // nullptr: legacy row-major-only impl (tier 1); launch() is then the only entry
   int tune_max_m = 0;  // > 0: aegis_tune times it only on shapes with M <= this (decode families); any M runs
+  KernelReq req{};
 };
+
+// The device capabilities requirements are checked against (from hw::DeviceLimits;
+// tests pass simulated ones).
+struct DeviceCaps {
+  int arch = 0;
+  bool tma_built = false;          // this build compiled the TMA tier (AEGIS_TMA)
+  size_t smem_per_block_optin = 0;
+  int regs_per_block = 0;
+  int max_threads_per_block = 0;
+};
+// The current device's capabilities (hw::current(): a simulated profile included).
+DeviceCaps current_caps();
+// Whether `e` can run on `caps`; `why` (optional) gets the first unmet requirement.
+bool supported(const KernelEntry& e, const DeviceCaps& caps, std::string* why = nullptr);
 
 // Every launchable impl, tiers 0 and up, in tier order. Defined in registry.cu.
 std::span<const KernelEntry> registry();

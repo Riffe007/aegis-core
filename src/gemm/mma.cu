@@ -18,6 +18,7 @@
 // partial last k-tile); otherwise the scalar, element-wise bounds-checked
 // loader. Operand smem layouts per mma_common.cuh.
 // PTX ISA citations for every instruction used: see mma_common.cuh.
+#include <algorithm>
 #include <array>
 #include <string>
 #include <utility>
@@ -128,6 +129,16 @@ cudaError_t attrs(cudaFuncAttributes* a) {
   return e;
 }
 
+// Requirements (KernelReq): mma.sync m16n8k16 f16 and ldmatrix need sm_80 here; the
+// stage buffer of the largest layout instantiation.
+template <int BM, int BN, int BK, int WM, int WN>
+constexpr KernelReq req() {
+  constexpr Layout R = Layout::RowMajor, Cm = Layout::ColMajor;
+  constexpr size_t smem = std::max({Tile<BM, BN, BK, WM, WN, R, R>::STAGE_BYTES, Tile<BM, BN, BK, WM, WN, R, Cm>::STAGE_BYTES,
+                                    Tile<BM, BN, BK, WM, WN, Cm, R>::STAGE_BYTES, Tile<BM, BN, BK, WM, WN, Cm, Cm>::STAGE_BYTES});
+  return KernelReq{80, false, smem, Tile<BM, BN, BK, WM, WN>::THREADS};
+}
+
 constexpr size_t kN = std::size(MMA_CONFIGS);
 #define AEGIS_MMA_ARGS(I) \
   MMA_CONFIGS[I].BM, MMA_CONFIGS[I].BN, MMA_CONFIGS[I].BK, MMA_CONFIGS[I].WARPS_M, MMA_CONFIGS[I].WARPS_N
@@ -150,7 +161,7 @@ std::span<const KernelEntry> make_entries(std::index_sequence<I...>) {
   static const std::array<std::string, kN> configs{config_of(MMA_CONFIGS[I])...};
   static const std::array<KernelEntry, kN> entries{KernelEntry{
       names[I].c_str(), configs[I].c_str(), &launch<AEGIS_MMA_ARGS(I)>, &attrs<AEGIS_MMA_ARGS(I)>,
-      &run<AEGIS_MMA_ARGS(I)>}...};
+      &run<AEGIS_MMA_ARGS(I)>, 0, req<AEGIS_MMA_ARGS(I)>()}...};
   return entries;
 }
 #undef AEGIS_MMA_ARGS

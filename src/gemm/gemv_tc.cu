@@ -16,6 +16,7 @@
 // drained ring), then splitk::finish_tile (C directly for S = 1, else the
 // partial and the ordered sum in the tile's last CTA).
 // PTX ISA citations for ldmatrix, mma and cp.async: see mma_common.cuh.
+#include <algorithm>
 #include <array>
 #include <string>
 #include <utility>
@@ -270,6 +271,16 @@ cudaError_t attrs(cudaFuncAttributes* a) {
   return e;
 }
 
+// Requirements (KernelReq): sm_80 (mma.sync m16n8k16, ldmatrix, cp.async); the ring (or
+// tile) of the largest layout instantiation, flag included (smem_bytes).
+template <int BN, int BK, int WN, int STAGES, int S>
+constexpr KernelReq req() {
+  constexpr Layout R = Layout::RowMajor, Cm = Layout::ColMajor;
+  constexpr size_t smem = std::max({smem_bytes<DecTile<BN, BK, WN, R, R>, STAGES>(), smem_bytes<DecTile<BN, BK, WN, R, Cm>, STAGES>(),
+                                    smem_bytes<DecTile<BN, BK, WN, Cm, R>, STAGES>(), smem_bytes<DecTile<BN, BK, WN, Cm, Cm>, STAGES>()});
+  return KernelReq{80, false, smem, DecTile<BN, BK, WN, R, R>::THREADS};
+}
+
 constexpr size_t kN = std::size(GEMV_TC_CONFIGS);
 #define AEGIS_TC_ARGS(I)                                                                              \
   GEMV_TC_CONFIGS[I].BN, GEMV_TC_CONFIGS[I].BK, GEMV_TC_CONFIGS[I].WARPS_N, GEMV_TC_CONFIGS[I].STAGES, \
@@ -294,7 +305,7 @@ std::span<const KernelEntry> make_entries(std::index_sequence<I...>) {
   static const std::array<std::string, kN> configs{config_of(GEMV_TC_CONFIGS[I])...};
   static const std::array<KernelEntry, kN> entries{KernelEntry{names[I].c_str(), configs[I].c_str(),
                                                                &launch<AEGIS_TC_ARGS(I)>, &attrs<AEGIS_TC_ARGS(I)>,
-                                                               &run<AEGIS_TC_ARGS(I)>, 16}...};
+                                                               &run<AEGIS_TC_ARGS(I)>, 16, req<AEGIS_TC_ARGS(I)>()}...};
   return entries;
 }
 

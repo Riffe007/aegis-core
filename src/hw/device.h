@@ -32,6 +32,7 @@ struct DeviceLimits {
   int regs_per_sm = 0;                // regsPerMultiprocessor
   int regs_per_block = 0;             // regsPerBlock
   int max_threads_per_sm = 0;         // maxThreadsPerMultiProcessor
+  int max_threads_per_block = 0;      // maxThreadsPerBlock
   int max_blocks_per_sm = 0;          // maxBlocksPerMultiProcessor
   size_t l2_bytes = 0;                // l2CacheSize
   size_t global_mem_bytes = 0;        // totalGlobalMem

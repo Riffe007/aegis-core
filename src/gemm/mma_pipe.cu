@@ -24,6 +24,7 @@
 //     element-wise bounds-checked loader.
 // Smem layout per operand layout (XOR-swizzled) and compute: mma_common.cuh.
 // PTX ISA citations for every instruction used: see mma_common.cuh.
+#include <algorithm>
 #include <array>
 #include <string>
 #include <utility>
@@ -52,6 +53,16 @@ cudaError_t attrs(cudaFuncAttributes* a) {
   return e;
 }
 
+// Requirements (KernelReq): sm_80 (mma.sync m16n8k16, cp.async); STAGES stage buffers of
+// the largest layout instantiation.
+template <int BM, int BN, int BK, int WM, int WN, int STAGES>
+constexpr KernelReq req() {
+  constexpr Layout R = Layout::RowMajor, Cm = Layout::ColMajor;
+  constexpr size_t stage = std::max({Tile<BM, BN, BK, WM, WN, R, R>::STAGE_BYTES, Tile<BM, BN, BK, WM, WN, R, Cm>::STAGE_BYTES,
+                                     Tile<BM, BN, BK, WM, WN, Cm, R>::STAGE_BYTES, Tile<BM, BN, BK, WM, WN, Cm, Cm>::STAGE_BYTES});
+  return KernelReq{80, false, stage * STAGES, Tile<BM, BN, BK, WM, WN>::THREADS};
+}
+
 constexpr size_t kN = std::size(MMA_PIPE_CONFIGS);
 #define AEGIS_PIPE_ARGS(I)                                                               \
   MMA_PIPE_CONFIGS[I].BM, MMA_PIPE_CONFIGS[I].BN, MMA_PIPE_CONFIGS[I].BK,                \
@@ -76,7 +87,7 @@ std::span<const KernelEntry> make_entries(std::index_sequence<I...>) {
   static const std::array<std::string, kN> configs{config_of(MMA_PIPE_CONFIGS[I])...};
   static const std::array<KernelEntry, kN> entries{KernelEntry{
       names[I].c_str(), configs[I].c_str(), &launch<AEGIS_PIPE_ARGS(I)>, &attrs<AEGIS_PIPE_ARGS(I)>,
-      &run<AEGIS_PIPE_ARGS(I)>}...};
+      &run<AEGIS_PIPE_ARGS(I)>, 0, req<AEGIS_PIPE_ARGS(I)>()}...};
   return entries;
 }
 #undef AEGIS_PIPE_ARGS

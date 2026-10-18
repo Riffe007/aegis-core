@@ -62,6 +62,23 @@ inline constexpr double kDispatchFloor = 0.80;  // Production bar 3
 // For tests. The winner aegis::matmul would use for this shape (exact or
 // nearest M), or nullptr.
 const Winner* winner_for(int M, int N, int K);
+
+// Capability-aware selection (aegis-hw step 4). Of `table`'s rows for (N, K),
+// only those this device can run take part (gemm::supported on the row's kernel;
+// a Cublaslt row always can); among them the nearest M (exact, then the
+// smallest |log2 M ratio|, then the larger M). Every row of (N, K) filtered
+// out: cuBLASLt, with the nearest such row as the stored-algorithm hint. No
+// row for (N, K): cuBLAS. No allocation unless `why` is given.
+struct Choice {
+  enum class Kind { Aegis, Cublaslt, Cublas } kind = Kind::Cublas;
+  const Winner* winner = nullptr;             // the row chosen (or the hint); nullptr for cuBLAS
+  const gemm::KernelEntry* kernel = nullptr;  // Kind::Aegis
+  int filtered = 0;                           // rows of (N, K) skipped for unmet requirements
+};
+Choice choose(std::span<const Winner> table, int M, int N, int K, const gemm::DeviceCaps& caps,
+              std::string* why = nullptr);  // why: "impl: reason; ..." per skipped row
+// The winners table of the current device's arch (hw::current; empty if none).
+std::span<const Winner> winners_table();
 // Which algorithm this thread's cuBLASLt plan for (p, stream, stored) runs:
 // "stored", "heuristic", or "heuristic (stored algo N rejected: ...)"; builds
 // the plan if needed ("" and matmul_last_error() on failure). aegis::matmul

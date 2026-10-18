@@ -2254,3 +2254,43 @@ HEVC, VP8, VP9, AV1. NVENC: H264, HEVC, AV1.
 - **Hardening:** memcheck `test_hw_profile`, `test_matmul` (API errors off; see step 1), and
   bench_gemm through aegis_matmul and a decode kernel, measured and unmeasured. 0 errors
   (`artifacts/sanitizer/hw-step3/`).
+
+## 2026-10-18 — aegis-hw step 4: capability-aware dispatch
+
+- **Declarations:** `gemm::KernelReq` on every registry entry, declared by each family from its
+  config:
+  - min arch: 80 for mma / mma_pipe / gemv_tc; 90 plus TMA for mma_tma; 0 for the CUDA-core
+    tiers;
+  - the most smem per block over every launch: all layouts; for gemv, every row tile MT; for
+    mma_tma, the larger of the TMA ring and its tier-4 fallback;
+  - threads per block.
+  `registry()` adds registers per thread and static smem from the compiled binary
+  (cudaFuncGetAttributes).
+- **`gemm::supported(entry, caps)`:** checks arch, TMA (sm_90 and a TMA build), smem against the
+  opt-in limit, threads, and registers per block. `gemm::current_caps()` takes the caps from
+  `hw::current()`, a simulated profile included.
+- **Dispatch:** `detail::choose(table, M, N, K, caps)`.
+  - Of the winner rows for (N, K), only those whose kernel the device supports take part (a
+    Cublaslt row always does); then the nearest M, as before.
+  - All rows filtered out: cuBLASLt, with the nearest row's tuned algorithm as a stored-algorithm
+    hint (a rejected one falls back to the heuristic, as on the dispatch floor).
+  - No row: cuBLAS (unchanged).
+  - `aegis::matmul` and `matmul_choice` use it. A per-row cache of the registry lookup keeps the
+    call path allocation-free after the first call per row. The host-side dispatch cost of the
+    change is unmeasured: graph-replay timing excludes it.
+- **ctest `hw_dispatch`:**
+  - All 55 kernels declare their requirements; 9 are TMA.
+  - Simulated sm_87 (163 KiB opt-in smem, 64 K registers, 1024 threads per block: CUDA
+    Programming Guide CC 8.7, a labelled test input; no TMA): the 9 TMA kernels are rejected,
+    and none of this build's kernels is over 163 KiB. Over the sm_121 winners (28 shapes:
+    every header shape plus a nearest-M shape each), 22 go to supported AEGIS kernels and 6 to
+    cuBLASLt. 2048^3 and its nearest-M shape fall back to cuBLASLt (the winner is TMA). None is
+    TMA or over the smem limit.
+  - Fictional 48 KiB-smem device of this arch: 19 kernels unsupported. All 6 decode shapes
+    change choice (the M <= 16 rows need up to 63 KiB): 4 go to the 512-row mma_pipe winners
+    (nearest usable M) and 2 to cuBLASLt. aegis::matmul under that profile matches FP64 on all 6.
+  - The real device: no winner row filtered.
+- **On a real sm_87 build** there is no `winners/sm_87.h` yet, so every shape goes to cuBLAS
+  until the Nano is tuned.
+- **Hardening:** memcheck `test_hw_dispatch`, `test_matmul`, `aegis_fuzz` (100 decode cases with
+  gemv_ and matmul; 100 cases of matmul, dims <= 512), 0 errors (`artifacts/sanitizer/hw-step4/`).

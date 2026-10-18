@@ -29,6 +29,7 @@
 // columns load nothing and invalid k steps compute nothing (smem past the
 // staged chunk is never read), so NaN outside the logical matrices cannot
 // reach a product.
+#include <algorithm>
 #include <array>
 #include <string>
 #include <utility>
@@ -93,6 +94,11 @@ struct GemvSmem {
   }
   // + 16 B: the split-K ticket flag after the tile.
   static size_t bytes(int kc) { return size_t(region(kc) + MT * BN) * sizeof(float) + 16; }
+  // bytes() at a full A chunk (the most any call of this instantiation uses).
+  static constexpr size_t bytes_max() {
+    constexpr int a = KCH * MT, r = a > SCRATCH ? a : SCRATCH;
+    return size_t((r + 3) / 4 * 4 + MT * BN) * sizeof(float) + 16;
+  }
 };
 
 template <int MT, int VEC, int BN, int THREADS, bool BVEC>
@@ -325,6 +331,16 @@ cudaError_t attrs(cudaFuncAttributes* a) {
   return cudaFuncGetAttributes(a, gemv_kernel<1, VEC, BN, THREADS, true>);
 }
 
+// Requirements (KernelReq): CUDA cores only (no arch floor beyond the toolkit's); the
+// largest smem over the row tiles MT a call can pick, at a full A chunk.
+template <int BN, int THREADS, int VEC, int S>
+constexpr KernelReq req() {
+  constexpr size_t smem = std::max({GemvSmem<1, VEC, BN, THREADS>::bytes_max(), GemvSmem<2, VEC, BN, THREADS>::bytes_max(),
+                                    GemvSmem<4, VEC, BN, THREADS>::bytes_max(), GemvSmem<8, VEC, BN, THREADS>::bytes_max(),
+                                    GemvSmem<16, VEC, BN, THREADS>::bytes_max()});
+  return KernelReq{0, false, smem, THREADS};
+}
+
 constexpr size_t kN = std::size(GEMV_CONFIGS);
 #define AEGIS_GEMV_ARGS(I) GEMV_CONFIGS[I].BN, GEMV_CONFIGS[I].THREADS, GEMV_CONFIGS[I].VEC, GEMV_CONFIGS[I].S
 
@@ -346,7 +362,7 @@ std::span<const KernelEntry> make_entries(std::index_sequence<I...>) {
   static const std::array<std::string, kN> configs{config_of(GEMV_CONFIGS[I])...};
   static const std::array<KernelEntry, kN> entries{KernelEntry{names[I].c_str(), configs[I].c_str(),
                                                                &launch<AEGIS_GEMV_ARGS(I)>, &attrs<AEGIS_GEMV_ARGS(I)>,
-                                                               &run<AEGIS_GEMV_ARGS(I)>, 16}...};
+                                                               &run<AEGIS_GEMV_ARGS(I)>, 16, req<AEGIS_GEMV_ARGS(I)>()}...};
   return entries;
 }
 

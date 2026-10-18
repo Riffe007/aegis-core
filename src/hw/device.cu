@@ -35,6 +35,7 @@ cudaError_t query(int dev, DeviceLimits* out) {
   d.regs_per_sm = p.regsPerMultiprocessor;
   d.regs_per_block = p.regsPerBlock;
   d.max_threads_per_sm = p.maxThreadsPerMultiProcessor;
+  d.max_threads_per_block = p.maxThreadsPerBlock;
   d.max_blocks_per_sm = p.maxBlocksPerMultiProcessor;
   d.l2_bytes = size_t(p.l2CacheSize);
   d.global_mem_bytes = p.totalGlobalMem;

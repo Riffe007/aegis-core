@@ -1,6 +1,8 @@
 // aegis::matmul dispatch. See include/aegis/matmul.h for the selection rules.
 #include <algorithm>
 #include <cmath>
+#include <mutex>
+#include <unordered_map>
 #include <cstdio>
 #include <span>
 #include <string>
@@ -53,24 +55,9 @@ int current_arch() {
   return d ? d->arch : 0;
 }
 
-const detail::Winner* select_winner(int M, int N, int K) {
-  const detail::Winner* best = nullptr;
-  double best_dist = INFINITY;
-  for (const detail::Winner& w : winners_for(current_arch())) {
-    if (w.N != N || w.K != K) continue;
-    if (w.M == M) { best = &w; break; }
-    const double d = std::abs(std::log2(double(w.M)) - std::log2(double(M)));
-    if (d < best_dist || (d == best_dist && w.M > best->M)) { best = &w; best_dist = d; }
-  }
-  return best;
-}
-
-bool to_cublaslt(const detail::Winner* w) { return w && w->dispatch == detail::Dispatch::Cublaslt; }
-
-// The registered kernel to run, or nullptr (cuBLASLt by the dispatch floor, or cuBLAS).
-const gemm::KernelEntry* select(int M, int N, int K) {
-  const detail::Winner* w = select_winner(M, N, K);
-  return w && !to_cublaslt(w) ? gemm::find(w->impl) : nullptr;
+// The current device's choice (capabilities of hw::current, a simulation included).
+detail::Choice choice_for(int M, int N, int K) {
+  return detail::choose(winners_for(current_arch()), M, N, K, gemm::current_caps());
 }
 
 cudaError_t cublas_fail(const char* what, cublasStatus_t s) {
@@ -342,11 +329,12 @@ cudaError_t matmul(const gemm::GemmParams& p, cudaStream_t stream) {
   if (gemm::is_empty(p)) return cudaSuccess;
   hw::current_profile();  // cached; the first call on an unmeasured device prints the warning
   if (p.alpha == 0.f) return scale_c(p, stream);  // BLAS: A*B does not contribute
-  const detail::Winner* w = select_winner(p.M, p.N, p.K);
-  if (to_cublaslt(w)) return cublaslt_gemm(p, stream, stored_for(w, p));  // dispatch floor
-  if (const gemm::KernelEntry* e = w ? gemm::find(w->impl) : nullptr; e && e->run) {
-    const cudaError_t err = e->run(p, stream);
-    return err == cudaSuccess ? err : fail(err, std::string("launch ") + e->name);
+  const detail::Choice c = choice_for(p.M, p.N, p.K);
+  using Kind = detail::Choice::Kind;
+  if (c.kind == Kind::Cublaslt) return cublaslt_gemm(p, stream, stored_for(c.winner, p));  // floor or filtered
+  if (c.kind == Kind::Aegis && c.kernel->run) {
+    const cudaError_t err = c.kernel->run(p, stream);
+    return err == cudaSuccess ? err : fail(err, std::string("launch ") + c.kernel->name);
   }
   return cublas_gemm_general(p, stream);
 }
@@ -359,16 +347,68 @@ cudaError_t matmul(const __half* A, const __half* B, __half* C, int M, int N, in
 const char* matmul_last_error() { return last_error.c_str(); }
 
 const char* matmul_choice(int M, int N, int K) {
-  if (to_cublaslt(select_winner(M, N, K))) return "cublaslt";
-  const gemm::KernelEntry* e = select(M, N, K);
-  return e ? e->name : "cublas";
+  const detail::Choice c = choice_for(M, N, K);
+  using Kind = detail::Choice::Kind;
+  if (c.kind == Kind::Cublaslt) return "cublaslt";
+  return c.kind == Kind::Aegis && c.kernel->run ? c.kernel->name : "cublas";
 }
 
 }  // namespace aegis
 
 namespace aegis::detail {
 
-const Winner* winner_for(int M, int N, int K) { return select_winner(M, N, K); }
+namespace {
+// gemm::find for a winner row, once per row (the tables are static; find scans the registry).
+const gemm::KernelEntry* find_cached(const Winner& w) {
+  static std::mutex mu;
+  static std::unordered_map<const Winner*, const gemm::KernelEntry*> cache;
+  std::lock_guard<std::mutex> lock(mu);
+  const auto it = cache.find(&w);
+  if (it != cache.end()) return it->second;
+  return cache[&w] = gemm::find(w.impl);
+}
+}  // namespace
+
+Choice choose(std::span<const Winner> table, int M, int N, int K, const gemm::DeviceCaps& caps, std::string* why) {
+  Choice c;
+  const Winner* best = nullptr;     // nearest usable row
+  const Winner* hint = nullptr;     // nearest row of (N, K), usable or not
+  const gemm::KernelEntry* best_kernel = nullptr;
+  double best_dist = INFINITY, hint_dist = INFINITY;
+  auto nearer = [M](const Winner& w, const Winner* cur, double cur_dist, double* dist) {
+    *dist = w.M == M ? -1.0 : std::abs(std::log2(double(w.M)) - std::log2(double(M)));
+    return !cur || *dist < cur_dist || (*dist == cur_dist && w.M > cur->M);
+  };
+  for (const Winner& w : table) {
+    if (w.N != N || w.K != K) continue;
+    double d;
+    if (nearer(w, hint, hint_dist, &d)) hint = &w, hint_dist = d;
+    const gemm::KernelEntry* e = nullptr;
+    if (w.dispatch != Dispatch::Cublaslt) {
+      e = find_cached(w);
+      std::string reason;
+      if (!e || !gemm::supported(*e, caps, why ? &reason : nullptr)) {
+        ++c.filtered;
+        if (why) *why += std::string(why->empty() ? "" : "; ") + w.impl + ": " + (e ? reason : "not in this build");
+        continue;
+      }
+    }
+    if (nearer(w, best, best_dist, &d)) best = &w, best_dist = d, best_kernel = e;
+  }
+  if (best) {
+    c.winner = best;
+    c.kind = best->dispatch == Dispatch::Cublaslt ? Choice::Kind::Cublaslt : Choice::Kind::Aegis;
+    c.kernel = best_kernel;
+  } else if (hint) {
+    c.winner = hint;  // every row filtered out: cuBLASLt, the row's tuned algorithm as the hint
+    c.kind = Choice::Kind::Cublaslt;
+  }
+  return c;
+}
+
+std::span<const Winner> winners_table() { return winners_for(current_arch()); }
+
+const Winner* winner_for(int M, int N, int K) { return choice_for(M, N, K).winner; }
 
 std::string cublaslt_plan_source(const gemm::GemmParams& p, cudaStream_t stream, const LtAlgoConfig* stored) {
   cublasLtHandle_t lt = nullptr;

@@ -414,6 +414,15 @@ only to compare with old rows (`--protocol 1`).
     not once per process.
   - Tests size against simulated profiles with `hw::ScopedSimulation`
     (ctest `hw_sizing`: 24 / 48 / 96 SMs).
+- **Capability-aware dispatch (aegis-hw step 4).**
+  - Every registry entry declares a `KernelReq`: min arch, TMA, the most smem per
+    block over all of its launches, and threads (constexpr in each family). Registers
+    come from the binary.
+  - `aegis::matmul` keeps only the winner rows whose kernel the device supports
+    (`gemm::supported` against `gemm::current_caps()`), then takes the nearest M.
+    Every row filtered out: cuBLASLt, with the row's tuned algorithm as the hint.
+    No row: cuBLAS.
+  - `detail::choose(table, M, N, K, caps)` is the testable core (ctest `hw_dispatch`).
 - **Device profiles (aegis-hw step 3, `src/hw/profile.h`).**
   - `include/aegis/arch/sm_<arch>.json` is compiled into the library (CMake) and used
     only when its sm_arch, sm_count, device name and l2_bytes all match the detected

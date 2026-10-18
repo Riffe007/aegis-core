@@ -55,6 +55,7 @@
 // libcuda link) are built on the host and cached per host thread, keyed by
 // everything they encode (pointer, sizes, ld, batch stride, box, swizzle);
 // a call looks its two maps up and encodes only on a miss.
+#include <algorithm>
 #include <array>
 #include <cstring>
 #include <string>
@@ -358,6 +359,19 @@ cudaError_t attrs(cudaFuncAttributes* a) {
   return e;
 }
 
+// Requirements (KernelReq): sm_90 and TMA; the TMA ring (stages + one mbarrier each) or the
+// tier-4 fallback on the same tile (2 stages), whichever is larger, over every layout.
+template <int BM, int BN, int BK, int WM, int WN, int STAGES>
+constexpr KernelReq req() {
+  constexpr Layout R = Layout::RowMajor, Cm = Layout::ColMajor;
+  constexpr size_t tma = std::max({TmaTile<BM, BN, BK, WM, WN, R, R>::STAGE_BYTES, TmaTile<BM, BN, BK, WM, WN, R, Cm>::STAGE_BYTES,
+                                   TmaTile<BM, BN, BK, WM, WN, Cm, R>::STAGE_BYTES, TmaTile<BM, BN, BK, WM, WN, Cm, Cm>::STAGE_BYTES}) *
+                             STAGES + 8 * STAGES;
+  constexpr size_t pipe = std::max({Tile<BM, BN, BK, WM, WN, R, R>::STAGE_BYTES, Tile<BM, BN, BK, WM, WN, R, Cm>::STAGE_BYTES,
+                                    Tile<BM, BN, BK, WM, WN, Cm, R>::STAGE_BYTES, Tile<BM, BN, BK, WM, WN, Cm, Cm>::STAGE_BYTES}) * 2;
+  return KernelReq{90, true, std::max(tma, pipe), TmaTile<BM, BN, BK, WM, WN, R, R>::THREADS};
+}
+
 constexpr size_t kN = std::size(MMA_TMA_CONFIGS);
 #define AEGIS_TMA_ARGS(I)                                                                      \
   MMA_TMA_CONFIGS[I].BM, MMA_TMA_CONFIGS[I].BN, MMA_TMA_CONFIGS[I].BK, MMA_TMA_CONFIGS[I].WARPS_M, \
@@ -380,7 +394,7 @@ std::span<const KernelEntry> make_entries(std::index_sequence<I...>) {
   static const std::array<std::string, kN> configs{config_of(MMA_TMA_CONFIGS[I])...};
   static const std::array<KernelEntry, kN> entries{KernelEntry{
       names[I].c_str(), configs[I].c_str(), &launch<AEGIS_TMA_ARGS(I)>, &attrs<AEGIS_TMA_ARGS(I)>,
-      &run<AEGIS_TMA_ARGS(I)>}...};
+      &run<AEGIS_TMA_ARGS(I)>, 0, req<AEGIS_TMA_ARGS(I)>()}...};
   return entries;
 }
 #undef AEGIS_TMA_ARGS

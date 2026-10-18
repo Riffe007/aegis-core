@@ -240,7 +240,10 @@ std::span<const KernelEntry> make_entries(std::index_sequence<I...>) {
       &attrs<REGBLOCK_CONFIGS[I].BM, REGBLOCK_CONFIGS[I].BN, REGBLOCK_CONFIGS[I].BK,
              REGBLOCK_CONFIGS[I].TM, REGBLOCK_CONFIGS[I].TN>,
       &run<REGBLOCK_CONFIGS[I].BM, REGBLOCK_CONFIGS[I].BN, REGBLOCK_CONFIGS[I].BK,
-           REGBLOCK_CONFIGS[I].TM, REGBLOCK_CONFIGS[I].TN>}...};
+           REGBLOCK_CONFIGS[I].TM, REGBLOCK_CONFIGS[I].TN>,
+      0,
+      // CUDA cores, static smem only (registry() reads its size from the binary).
+      KernelReq{0, false, 0, (REGBLOCK_CONFIGS[I].BN / REGBLOCK_CONFIGS[I].TN) * (REGBLOCK_CONFIGS[I].BM / REGBLOCK_CONFIGS[I].TM)}}...};
   return entries;
 }
 
