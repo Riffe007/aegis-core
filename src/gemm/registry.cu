@@ -36,9 +36,25 @@ std::span<const KernelEntry> registry() {
 #ifdef AEGIS_TMA  // every target architecture is sm_90+ (CMakeLists.txt)
     for (const KernelEntry& e : mma_tma_entries()) v.push_back(e);
 #endif
+    for (auto fam : {gemv_entries(), gemv_tc_entries()}) v.insert(v.end(), fam.begin(), fam.end());
     return v;
   }();
   return all;
+}
+
+namespace detail {
+int gemv_splits(size_t i, const GemmParams& p);     // gemv.cu
+int gemv_tc_splits(size_t i, const GemmParams& p);  // gemv_tc.cu
+}  // namespace detail
+
+int gemv_split_count(const char* impl, const GemmParams& p) {
+  const std::string_view name = impl;
+  const std::span<const KernelEntry> cc = gemv_entries(), tc = gemv_tc_entries();
+  for (size_t i = 0; i < cc.size(); ++i)
+    if (name == cc[i].name) return detail::gemv_splits(i, p);
+  for (size_t i = 0; i < tc.size(); ++i)
+    if (name == tc[i].name) return detail::gemv_tc_splits(i, p);
+  return 0;
 }
 
 const KernelEntry* find(std::string_view name) {

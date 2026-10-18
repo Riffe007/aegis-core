@@ -2,7 +2,7 @@
 //
 //   aegis_fuzz [--cases 2000] [--seed 1] [--case I] [--impls naive,regblock_,mma_,mma_pipe_,matmul]
 //              [--max-dim 4096] [--calibrate] [--verbose] [--corrupt] [--poison] [--cpu-ref-only]
-//              [--explain]
+//              [--explain] [--decode]
 //
 // Case i draws everything from mt19937_64(seed * 1000003 + i), so a failure
 // is reproduced alone with --seed S --case I. Per case:
@@ -11,6 +11,8 @@
 //   shape    each of M, N, K in 1..max-dim: 30% a prime, 25% 1..64, 20% a
 //            multiple of 8, else log-uniform; M*N*K*batch capped at 2^32
 //            (naive: 2^27)
+//            --decode: M in 1..16 (85%) or 17..40, K drawn the same way up to
+//            16384 (GEMV and split-K: slices, odd split counts, K tails)
 //   layouts  A, B each row- or column-major
 //   ld       minimal, or padded by 1..17 elements (50%)
 //   pointers offset by 1..7 elements (20% per operand): misaligned paths
@@ -69,6 +71,8 @@ using aegis::gemm::GemmParams;
 using aegis::gemm::KernelEntry;
 using aegis::gemm::Layout;
 
+constexpr int kDecodeMaxK = 16384;
+
 struct Args {
   long long cases = 2000;
   unsigned long long seed = 1;
@@ -76,6 +80,7 @@ struct Args {
   std::vector<std::string> impls = {"naive", "regblock_", "mma_", "mma_pipe_", "matmul"};
   int max_dim = 4096;
   bool calibrate = false, verbose = false, corrupt = false, poison = false, cpu_ref_only = false, explain = false;
+  bool decode = false;  // --decode: M 1..16 (85%) or 17..40, K up to kDecodeMaxK
 };
 
 std::vector<std::string> split(const std::string& s) {
@@ -110,6 +115,7 @@ Args parse(int argc, char** argv) {
     else if (k == "--poison") a.poison = true;
     else if (k == "--cpu-ref-only") a.cpu_ref_only = true;
     else if (k == "--explain") a.explain = true;
+    else if (k == "--decode") a.decode = true;
     else { std::fprintf(stderr, "unknown arg %s\n", k.c_str()); std::exit(2); }
   }
   if (a.explain && (a.cpu_ref_only || a.only_case < 0)) {
@@ -170,7 +176,7 @@ struct Case {
 // The case depends only on (seed, case, targets, max_dim, calibrate): never on
 // the reference mode, so --cpu-ref-only and --explain reproduce a case exactly.
 Case make_case(std::mt19937_64& rng, const std::vector<Target>& targets, int max_dim,
-               const std::vector<int>& primes, bool calibrate) {
+               const std::vector<int>& primes, bool calibrate, bool decode, const std::vector<int>& kprimes) {
   std::uniform_real_distribution<double> u(0, 1);
   Case c;
   c.target = targets[std::uniform_int_distribution<size_t>(0, targets.size() - 1)(rng)];
@@ -178,9 +184,15 @@ Case make_case(std::mt19937_64& rng, const std::vector<Target>& targets, int max
   p.batch = u(rng) < 0.15 ? std::uniform_int_distribution<int>(2, 4)(rng) : 1;
   const double cap = c.target.name == "naive" ? std::ldexp(1.0, 27) : std::ldexp(1.0, 32);
   for (;;) {
-    p.M = draw_dim(rng, max_dim, primes);
-    p.N = draw_dim(rng, max_dim, primes);
-    p.K = draw_dim(rng, max_dim, primes);
+    if (decode) {  // GEMV and split-K paths: small M, long K (odd split slices, K tails)
+      p.M = u(rng) < 0.85 ? std::uniform_int_distribution<int>(1, 16)(rng) : std::uniform_int_distribution<int>(17, 40)(rng);
+      p.N = draw_dim(rng, max_dim, primes);
+      p.K = draw_dim(rng, kDecodeMaxK, kprimes);
+    } else {
+      p.M = draw_dim(rng, max_dim, primes);
+      p.N = draw_dim(rng, max_dim, primes);
+      p.K = draw_dim(rng, max_dim, primes);
+    }
     if (double(p.M) * p.N * p.K * p.batch <= cap) break;
   }
   p.layout_a = u(rng) < 0.5 ? Layout::RowMajor : Layout::ColMajor;
@@ -348,6 +360,7 @@ int main(int argc, char** argv) {
     targets.push_back({"matmul", nullptr});
   if (targets.empty()) { std::fprintf(stderr, "no targets\n"); return 2; }
   const std::vector<int> primes = primes_upto(a.max_dim);
+  const std::vector<int> kprimes = a.decode ? primes_upto(kDecodeMaxK) : std::vector<int>{};
   aegis::bench::LtReference lt;
   cudaStream_t stream;
   AEGIS_CUDA_CHECK(cudaStreamCreate(&stream));
@@ -362,7 +375,7 @@ int main(int argc, char** argv) {
   const long long last = a.only_case >= 0 ? a.only_case + 1 : a.cases;
   for (long long ci = first; ci < last; ++ci) {
     std::mt19937_64 rng(a.seed * 1000003ull + (unsigned long long)ci);
-    Case c = make_case(rng, targets, a.max_dim, primes, a.calibrate);
+    Case c = make_case(rng, targets, a.max_dim, primes, a.calibrate, a.decode, kprimes);
     if (a.cpu_ref_only && !c.target.entry) {
       ++skipped;
       continue;

@@ -47,7 +47,7 @@ struct Args {
   std::string shapes;
   unsigned long long seed = 0;
   bool seed_given = false;
-  std::vector<std::string> prefixes = {"regblock_", "mma_", "mma_pipe_"};
+  std::vector<std::string> prefixes = {"regblock_", "mma_", "mma_pipe_", "gemv_"};
   int reps = 20, cublas_reps = 50, warmup = 3;
   unsigned data_seed = 42;
   int protocol = 2;
@@ -192,6 +192,7 @@ int main(int argc, char** argv) {
 
     for (size_t oi = 0; oi < order.size(); ++oi) {
       const Cand cand = order[oi];
+      if (cand.e && cand.e->tune_max_m > 0 && s.M > cand.e->tune_max_m) continue;  // decode families: M <= 16 only
       if (cand.lt) {  // checks and times each heuristic algorithm, keeps the fastest passing one
         lt = h.cublaslt_best(p, options(false, aegis::bench::CacheMode::Cold));
         if (lt.best < 0) { fail(aegis::bench::kLtBestImpl, -1); continue; }

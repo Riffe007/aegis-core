@@ -1832,3 +1832,65 @@ TMA is 2.8% faster than the old winner at 2048³ and 4.0-4.4% faster at
 
 Other shapes were not tuned with `mma_tma` (step scope: 2048³ and 4096³);
 their winners are unchanged.
+
+## 2026-10-17 — Phase C step 1: deterministic split-K; the decode GEMV family (code, correctness)
+
+**Split-K infrastructure** (`src/gemm/splitk.cuh`, shared with stream-K later):
+- Partition: requested S, effective S = ceil(K / kc) with kc = round_up(ceil(K / S), 32).
+  No split is empty, and every split start stays 16 B aligned. S is lowered when
+  the FP32 partials would exceed 64 MiB per call (`kSplitKMaxWorkspace`).
+  `gemv_split_count()` reports the S an impl uses for a problem.
+- Reduction in the kernel, with an ordered ticket: each CTA writes its FP32
+  tile to its partial slot, fences, and takes a ticket (atomicAdd on the tile's
+  counter, a semaphore, not data). The CTA that draws S-1 sums slots 0..S-1 in
+  that order, applies alpha/beta, and resets the counter to 0. No atomic
+  accumulation, so the sum order is independent of arrival order.
+- Workspace: `src/gemm/workspace.{h,cu}`, a per-(host thread, device, stream,
+  use, size class) cache.
+  - Allocated and zeroed on the first request; never resized or freed.
+  - A first request while the stream is capturing returns
+    cudaErrorStreamCaptureUnsupported before touching anything.
+  - The cuBLASLt fallback's plan workspace now comes from the same cache
+    (use `CublasLt`), replacing its own cudaMalloc.
+- Bug found by the new test: counters first shared a buffer with partials. A
+  buffer serves every shape of its size class on a stream, so another shape's
+  partials could sit where this shape's counters are, and the tile's last CTA
+  never fired (stale C at column 4096 of 1x4864x896 with BN 64, tile 64). Now
+  counters and partials are separate uses.
+
+**Decode GEMV family** (`include/aegis/gemm.h`: GEMV_CONFIGS, GEMV_TC_CONFIGS; 36 impls):
+- `gemv_<BN>x<THREADS>_v<VEC>_k<S>` (CUDA-core):
+  - lanes span N with 16 B (VEC 8) or 8 B (VEC 4) B loads;
+  - row groups split the K slice, 4 k steps in flight per thread;
+  - MT x VEC FP32 accumulators, MT = 1/2/4/8/16 picked per call;
+  - A's slice staged in smem as FP32;
+  - row groups reduced in fixed order through smem.
+  Column-major or misaligned B: element loads.
+- `gemv_tc_16x<BN>x<BK>_1x<WN>_s<ST>_k<S>` (tensor-core):
+  - m16n8k16 with A padded to 16 rows (padded smem rows, conflict-free ldmatrix);
+  - B through tier 4's cp.async plan and XOR swizzle in a STAGES ring;
+  - misaligned inputs: synchronous element loads.
+- Both families: any M (tiles of 16 rows), all layouts, alpha/beta, batch.
+  `KernelEntry::tune_max_m = 16` keeps aegis_tune from timing them above M = 16.
+  `gemv_` is in aegis_tune's default prefixes.
+- Registers: CUDA-core 48-227, tensor-core 56-164; 0 spill, 0 stack. Two
+  instantiations spilled 4-8 B until `__launch_bounds__(THREADS, 1)` and a
+  stride-pair element path.
+
+**Correctness.**
+- ctest: 383/383, including sm87_gate, per-impl checks on the 5 standard shapes
+  (180 new), `splitk_determinism` and `fuzz_decode`.
+- `splitk_determinism`:
+  - every gemv / gemv_tc impl x 8 shapes (decode shapes, plus 13x1000x4099 CR,
+    5x333x2053 RC, 9x136x7777 CC, 37x260x1031) x 10 runs: bitwise identical;
+    248 split cases, 74 with odd S;
+  - strict global-mode capture of 50 calls per (split impl, decode shape), plus
+    aegis::matmul: no allocation inside, replay bitwise equal to the direct call;
+  - a first call inside capture returns cudaErrorStreamCaptureUnsupported and
+    the capture stays valid.
+- `fuzz_decode` (aegis_fuzz `--decode`: M 1..16, some 17..40, K up to 16384,
+  primes, all layouts, ld padding, misaligned pointers, alpha/beta, batch,
+  NaN/Inf, poisoned memory): 2,000 cases, 0 failures (1,711 FP64 reference,
+  289 cuBLASLt, 82 with NaN/Inf, 908 misaligned).
+
+Performance: unmeasured (step 2).

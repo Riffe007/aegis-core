@@ -19,10 +19,13 @@
 // the heuristic's first algorithm (workspace limit 32 MiB, as cublaslt_best)
 // per (shape, layouts, ld, batch, strides, pointer alignment, stream), picked
 // on the first such call on a host thread and cached with its descriptors and
-// workspace (split-K algorithms need one; it is allocated then, once per
-// plan, so make that first call outside stream capture). Later calls only
-// launch: no heuristic query, no allocation, no host synchronization. A plan,
-// and so its workspace, belongs to one stream.
+// workspace (split-K algorithms need one; it comes from the per-stream
+// workspace cache, src/gemm/workspace.h, allocated on the first call that needs
+// its size class on the stream, so make that first call outside stream
+// capture). Later calls only launch: no heuristic query, no allocation, no
+// host synchronization. A plan, and so its workspace, belongs to one stream.
+// The decode GEMV family (gemv_*, gemv_tc_*: deterministic split-K) takes its
+// partials and counters from the same cache, with the same first-call rule.
 // Winners are tuned on row-major NN; other layouts run the same config.
 // Asynchronous on `stream`, like the per-impl launchers. Never exits the
 // process: returns cudaSuccess or the error (a launch-configuration error, or

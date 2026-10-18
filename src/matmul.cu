@@ -11,6 +11,7 @@
 
 #include "aegis/gemm.h"
 #include "aegis/matmul.h"
+#include "gemm/workspace.h"
 #include "lt_algo.h"
 
 // One generated table per arch; a missing file just means no tuned winners.
@@ -129,7 +130,7 @@ struct LtPlan {
   cublasLtMatmulDesc_t op = nullptr;
   cublasLtMatrixLayout_t a = nullptr, b = nullptr, c = nullptr;  // cuBLASLt's A (our B), B (our A), C
   cublasLtMatmulAlgo_t algo{};
-  void* workspace = nullptr;  // the algorithm's own (split-K partials): this plan, so this stream, only
+  void* workspace = nullptr;  // from this stream's workspace cache (split-K partials of the algorithm)
   size_t workspace_bytes = 0;
   std::string source;  // "stored", "heuristic", or "heuristic (stored ... rejected: ...)"
 };
@@ -180,11 +181,16 @@ cudaError_t make_lt_plan(cublasLtHandle_t lt, const gemm::GemmParams& p, LtPlan&
       (s = layout(&plan.b, ra ? p.K : p.M, ra ? p.M : p.K, p.lda, p.stride_a)) != CUBLAS_STATUS_SUCCESS ||
       (s = layout(&plan.c, p.N, p.M, p.ldc, p.stride_c)) != CUBLAS_STATUS_SUCCESS)
     return cublaslt_fail("cublasLtMatrixLayoutCreate", s);
+  // The per-stream workspace cache (src/gemm/workspace.h), shared by every plan
+  // on this stream; allocated on the first call that needs the size class.
   auto use_workspace = [&](size_t bytes) -> cudaError_t {
     if (bytes == 0) return cudaSuccess;
-    if (const cudaError_t e = cudaMalloc(&plan.workspace, bytes); e != cudaSuccess) {
+    if (const cudaError_t e =
+            gemm::detail::stream_workspace(k.stream, bytes, &plan.workspace, gemm::detail::WorkspaceUse::CublasLt);
+        e != cudaSuccess) {
       plan.workspace = nullptr;
-      return fail(e, "cuBLASLt fallback: workspace allocation (" + std::to_string(bytes) + " B)");
+      return fail(e, "cuBLASLt fallback: workspace (" + std::to_string(bytes) +
+                         " B; make the first call for this shape outside stream capture)");
     }
     plan.workspace_bytes = bytes;
     return cudaSuccess;
@@ -237,8 +243,7 @@ void destroy(LtPlan& plan) {
   if (plan.c) cublasLtMatrixLayoutDestroy(plan.c);
   if (plan.b) cublasLtMatrixLayoutDestroy(plan.b);
   if (plan.a) cublasLtMatrixLayoutDestroy(plan.a);
-  if (plan.op) cublasLtMatmulDescDestroy(plan.op);
-  if (plan.workspace) cudaFree(plan.workspace);
+  if (plan.op) cublasLtMatmulDescDestroy(plan.op);  // the workspace belongs to the stream cache
 }
 
 // This thread's plan for (p, stream, stored), built on first use.

@@ -99,6 +99,7 @@ struct KernelEntry {
   LaunchFn launch;
   AttrsFn attrs;       // sharedSizeBytes includes dynamic smem per block (row-major NN kernel)
   RunFn run;           // nullptr: legacy row-major-only impl (tier 1); launch() is then the only entry
+  int tune_max_m = 0;  // > 0: aegis_tune times it only on shapes with M <= this (decode families); any M runs
 };
 
 // Every launchable impl, tiers 0 and up, in tier order. Defined in registry.cu.
@@ -187,5 +188,55 @@ inline constexpr MmaPipeConfig MMA_TMA_CONFIGS[] = {
 std::span<const KernelEntry> mma_tma_entries();
 // Which path an mma_tma impl takes for p: "tma" or "cp.async (mma_pipe)".
 const char* mma_tma_path(const GemmParams& p);
+
+// ---------------------------------------------------------------------------
+// Decode GEMV family (M <= 16; B = weights [K, N], memory-bound on B), with
+// deterministic split-K (src/gemm/splitk.cuh): S CTAs per output tile each
+// take a K slice, write FP32 partials to the per-stream workspace
+// (src/gemm/workspace.h), and the last of them sums the S partials in split
+// order 0..S-1 (an ordered ticket, no atomic accumulation) and applies
+// alpha/beta. Bitwise identical across runs for a given (impl, shape).
+// Any M runs (tiles of up to 16 rows); tune_max_m = 16.
+//
+// CUDA-core path (src/gemm/gemv.cu): lanes span N with VEC-half (8: 16 B,
+// 4: 8 B) B loads, warps split the CTA's K slice, each thread keeps
+// MT x VEC FP32 accumulators (MT = the smallest of 1, 2, 4, 8, 16 >= M, picked
+// per call), A's slice staged in smem as FP32.
+// Name: gemv_<BN>x<THREADS>_v<VEC>_k<S>.
+//
+// Tensor-core path (src/gemm/gemv_tc.cu): m16n8k16 with A padded to 16 rows,
+// WARPS_N warps across BN, B streamed by a STAGES-deep cp.async ring.
+// Name: gemv_tc_16x<BN>x<BK>_1x<WARPS_N>_s<STAGES>_k<S>.
+//
+// S is the requested split count; the effective count is
+// ceil(K / round_up(ceil(K / S), 32)), lowered so the partials fit in
+// kSplitKMaxWorkspace (S = 1 needs no workspace). gemv_split_count reports it.
+// ---------------------------------------------------------------------------
+struct GemvConfig { int BN, THREADS, VEC, S; };
+inline constexpr GemvConfig GEMV_CONFIGS[] = {
+    {64, 128, 8, 4},  {64, 128, 8, 7},  {64, 128, 8, 8},  {64, 128, 8, 12}, {64, 128, 8, 16},
+    {128, 128, 8, 1}, {128, 128, 8, 2}, {128, 128, 8, 3}, {128, 128, 8, 5}, {128, 128, 8, 8},
+    {128, 256, 8, 1}, {128, 256, 8, 2}, {128, 256, 8, 4}, {128, 256, 8, 6},
+    {256, 256, 8, 1}, {256, 256, 8, 2}, {256, 256, 8, 4},
+    {64, 128, 4, 4},  {64, 128, 4, 8},  {64, 128, 4, 16},
+    {128, 256, 4, 2}, {128, 256, 4, 4}, {128, 256, 4, 8},
+};
+std::span<const KernelEntry> gemv_entries();
+
+struct GemvTcConfig { int BN, BK, WARPS_N, STAGES, S; };
+inline constexpr GemvTcConfig GEMV_TC_CONFIGS[] = {
+    {64, 64, 4, 4, 4},   {64, 64, 4, 4, 8},   {64, 64, 4, 4, 16},
+    {128, 64, 4, 4, 1},  {128, 64, 4, 4, 2},  {128, 64, 4, 4, 4},  {128, 64, 4, 4, 8},
+    {128, 32, 4, 4, 2},  {128, 32, 4, 4, 7},
+    {256, 32, 8, 4, 1},  {256, 32, 8, 4, 3},
+    {64, 64, 2, 3, 8},   {64, 64, 2, 3, 12},
+};
+std::span<const KernelEntry> gemv_tc_entries();
+
+// Partials beyond this lower S (bytes; split-K workspace, per call).
+inline constexpr long long kSplitKMaxWorkspace = 64ll << 20;
+// The split count a gemv / gemv_tc impl uses for p (1: no split), or 0 if
+// `impl` is not one of them.
+int gemv_split_count(const char* impl, const GemmParams& p);
 
 }  // namespace aegis::gemm

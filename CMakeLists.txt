@@ -43,6 +43,9 @@ add_library(aegis_kernels STATIC
   src/gemm/mma.cu
   src/gemm/mma_pipe.cu
   src/gemm/mma_tma.cu
+  src/gemm/gemv.cu
+  src/gemm/gemv_tc.cu
+  src/gemm/workspace.cu
   src/gemm/registry.cu
 )
 target_include_directories(aegis_kernels PUBLIC include)
@@ -134,6 +137,17 @@ set(AEGIS_IMPLS
   mma_pipe_64x64x32_2x2_s2 mma_pipe_64x64x32_2x2_s3 mma_pipe_64x64x32_2x2_s4
   mma_pipe_128x256x32_2x4_s2 mma_pipe_128x256x32_2x4_s3 mma_pipe_128x256x32_2x4_s4
   mma_pipe_256x128x32_4x2_s2 mma_pipe_256x128x32_4x2_s3 mma_pipe_256x128x32_4x2_s4
+  gemv_64x128_v8_k4 gemv_64x128_v8_k7 gemv_64x128_v8_k8 gemv_64x128_v8_k12 gemv_64x128_v8_k16
+  gemv_128x128_v8_k1 gemv_128x128_v8_k2 gemv_128x128_v8_k3 gemv_128x128_v8_k5 gemv_128x128_v8_k8
+  gemv_128x256_v8_k1 gemv_128x256_v8_k2 gemv_128x256_v8_k4 gemv_128x256_v8_k6
+  gemv_256x256_v8_k1 gemv_256x256_v8_k2 gemv_256x256_v8_k4
+  gemv_64x128_v4_k4 gemv_64x128_v4_k8 gemv_64x128_v4_k16
+  gemv_128x256_v4_k2 gemv_128x256_v4_k4 gemv_128x256_v4_k8
+  gemv_tc_16x64x64_1x4_s4_k4 gemv_tc_16x64x64_1x4_s4_k8 gemv_tc_16x64x64_1x4_s4_k16
+  gemv_tc_16x128x64_1x4_s4_k1 gemv_tc_16x128x64_1x4_s4_k2 gemv_tc_16x128x64_1x4_s4_k4 gemv_tc_16x128x64_1x4_s4_k8
+  gemv_tc_16x128x32_1x4_s4_k2 gemv_tc_16x128x32_1x4_s4_k7
+  gemv_tc_16x256x32_1x8_s4_k1 gemv_tc_16x256x32_1x8_s4_k3
+  gemv_tc_16x64x64_1x2_s3_k8 gemv_tc_16x64x64_1x2_s3_k12
 )
 if(AEGIS_TMA)
   list(APPEND AEGIS_IMPLS
@@ -176,7 +190,7 @@ option(AEGIS_SM87_GATE "Also compile every kernel for sm_87 (compile only) and t
 if(AEGIS_SM87_GATE)
   set(AEGIS_SM87_SOURCES
     src/gemm/naive.cu src/gemm/tiled.cu src/gemm/regblock.cu src/gemm/mma.cu src/gemm/mma_pipe.cu src/gemm/mma_tma.cu
-    src/gemm/registry.cu src/matmul.cu src/bench/harness.cu
+    src/gemm/gemv.cu src/gemm/gemv_tc.cu src/gemm/workspace.cu src/gemm/registry.cu src/matmul.cu src/bench/harness.cu
     microbench/ptr_chase.cu microbench/mma_latency.cu microbench/mma_throughput.cu
     microbench/ldmatrix.cu microbench/smem_banks.cu microbench/cp_async.cu microbench/dram_bw.cu
     microbench/launch_overhead.cu
@@ -241,6 +255,15 @@ if(AEGIS_TMA)
   target_link_libraries(test_tma PRIVATE aegis_bench_harness)
   add_test(NAME tma_paths COMMAND test_tma)
 endif()
+
+# Split-K (gemv, gemv_tc): bitwise determinism over 10 runs, strict-mode graph
+# capture (no allocation after the first call), effective split counts.
+add_executable(test_splitk tests/test_splitk.cu)
+target_link_libraries(test_splitk PRIVATE aegis aegis_bench_harness)
+add_test(NAME splitk_determinism COMMAND test_splitk)
+# Decode fuzz: the GEMV family and aegis::matmul, M 1..40 (mostly <= 16), K up
+# to 16384, every layout, boundaries, alpha/beta, poisoned memory.
+add_test(NAME fuzz_decode COMMAND aegis_fuzz --cases 2000 --seed 41 --poison --decode --impls gemv_,matmul)
 
 # GPU lock (CLAUDE.md rule 15): every test except the compile-only sm87_gate
 # touches the GPU, is labelled "gpu" and requires the gpu_lock_guard fixture,
