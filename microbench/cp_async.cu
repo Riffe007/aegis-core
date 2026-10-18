@@ -5,6 +5,7 @@
 // per tile (256 threads x 4 x 16 B). Working sets: 512 MiB (DRAM) and 1/2 L2
 // (L2-resident after the first pass). Bytes moved / event time = GB/s.
 // Timed loops: 4 LDGSTS per tile (cp.async); 4 LDG.128 + 4 STS.128 (ld_st).
+#include <algorithm>
 #include <cstdint>
 
 #include "common.cuh"
@@ -76,7 +77,12 @@ int main() {
   mb::prove("mb_copy_ld_st", {{"LDG", kVecs}, {"STS", kVecs}});
 
   const int sms = dev.prop.multiProcessorCount;
-  const int blocks = sms * 3;  // 32 KiB smem per block
+  // A full wave of resident blocks (32 KiB static smem each): from the occupancy
+  // API on this device, the smaller of the two kernels' counts.
+  int occ_async = 0, occ_ldst = 0;
+  MB_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ_async, mb_copy_cp_async, kThreads, 0));
+  MB_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ_ldst, mb_copy_ld_st, kThreads, 0));
+  const int blocks = sms * std::max(1, std::min(occ_async, occ_ldst));
   uint32_t* sink;
   MB_CHECK(aegis::budget::gpu_malloc(&sink, size_t(blocks) * kThreads * sizeof(uint32_t)));
 

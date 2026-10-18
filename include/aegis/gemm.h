@@ -202,52 +202,53 @@ const char* mma_tma_path(const GemmParams& p);
 // 4: 8 B) B loads, warps split the CTA's K slice, each thread keeps
 // MT x VEC FP32 accumulators (MT = the smallest of 1, 2, 4, 8, 16 >= M, picked
 // per call), A's slice staged in smem as FP32.
-// Name: gemv_<BN>x<THREADS>_v<VEC>_k<S|auto>.
+// Name: gemv_<BN>x<THREADS>_v<VEC>_k<S|sm>.
 //
 // Tensor-core path (src/gemm/gemv_tc.cu): m16n8k16 with A padded to 16 rows,
 // WARPS_N warps across BN, B streamed by a STAGES-deep cp.async ring.
-// Name: gemv_tc_16x<BN>x<BK>_1x<WARPS_N>_s<STAGES>_k<S|auto>.
+// Name: gemv_tc_16x<BN>x<BK>_1x<WARPS_N>_s<STAGES>_k<S|sm>.
 //
-// S is the requested split count (0: auto, as many as fill one wave of
-// resident CTAs; splitk::auto_splits); the effective count is
+// S is the requested split count. 0 ("_ksm", every tuned config): sized at launch
+// from the detected SM count (splitk::sm_load_splits: the S minimizing the busiest
+// SM's K rows, splits at least 2 * STAGES * BK rows on the tensor-core path, 64
+// on the CUDA-core path). Winners are per arch, but one arch spans devices with
+// different SM counts (sm_87: Orin Nano, AGX Orin), so no table fixes S; a
+// fixed S > 0 remains for experiments. The effective count is
 // ceil(K / round_up(ceil(K / S), 32)), lowered so the partials fit in
-// kSplitKMaxWorkspace (S = 1 needs no workspace). gemv_split_count reports it.
+// kSplitKMaxWorkspace (S = 1 needs no workspace). gemv_launch_plan reports it
+// and the grid.
 // ---------------------------------------------------------------------------
-struct GemvConfig { int BN, THREADS, VEC, S; };  // S = 0: auto
+struct GemvConfig { int BN, THREADS, VEC, S; };  // S = 0: from the SM count
 inline constexpr GemvConfig GEMV_CONFIGS[] = {
-    {64, 64, 8, 0},   {64, 64, 8, 16},
-    {64, 128, 8, 0},  {64, 128, 8, 4},  {64, 128, 8, 7},  {64, 128, 8, 8}, {64, 128, 8, 16},
-    {128, 128, 8, 0}, {128, 128, 8, 1}, {128, 128, 8, 3},
-    {128, 256, 8, 0}, {128, 256, 8, 2}, {128, 256, 8, 4},
-    {256, 256, 8, 0}, {256, 256, 8, 1},
-    {64, 128, 4, 0},  {64, 128, 4, 8},  {64, 128, 4, 16},
-    {128, 256, 4, 0}, {128, 256, 4, 4},
+    {64, 64, 8, 0},  {64, 128, 8, 0}, {128, 128, 8, 0}, {128, 256, 8, 0},
+    {256, 256, 8, 0}, {64, 128, 4, 0}, {128, 256, 4, 0},
 };
 std::span<const KernelEntry> gemv_entries();
 
-struct GemvTcConfig { int BN, BK, WARPS_N, STAGES, S; };  // S = 0: auto
-// Smem per CTA (ring): 64x64 s4 42 KiB (2 per SM), s5 52 KiB, s6 63 KiB (1); 64x32 s6
-// 32 KiB (3), s8 43 KiB (2); 32x64 s4 25 KiB; 128x32 s4 38 KiB (2), s6 57 KiB (1);
-// 128x64 s4 73 KiB and 256x32 s4 69 KiB (1).
+struct GemvTcConfig { int BN, BK, WARPS_N, STAGES, S; };  // S = 0: from the SM count
+// Smem per CTA (ring): 64x64 s4 42 KiB, s5 52 KiB, s6 63 KiB; 64x32 s6 32 KiB, s8
+// 43 KiB; 32x64 s4 25 KiB; 128x32 s4 38 KiB, s6 57 KiB; 128x64 s4 73 KiB; 256x32 s4
+// 69 KiB. CTAs per SM follow from the device's smem per SM (occupancy API).
 inline constexpr GemvTcConfig GEMV_TC_CONFIGS[] = {
-    {64, 64, 4, 4, 0},  {64, 64, 4, 4, 1},  {64, 64, 4, 4, 2},  {64, 64, 4, 4, 7}, {64, 64, 4, 4, 10},
-    {64, 64, 4, 6, 2},  {64, 64, 4, 6, 3},  {64, 64, 4, 5, 3},
-    {128, 64, 4, 4, 2}, {128, 64, 4, 4, 3},
-    {64, 32, 4, 6, 0},  {64, 32, 4, 6, 2},  {64, 32, 4, 6, 3},  {64, 32, 4, 6, 4}, {64, 32, 4, 6, 7},
-    {64, 32, 4, 8, 2},  {64, 32, 4, 8, 3},
-    {32, 64, 2, 4, 4},  {32, 64, 2, 6, 3},
-    {128, 32, 4, 6, 2}, {128, 32, 4, 6, 4},
-    {64, 64, 2, 4, 0},  {64, 64, 2, 4, 7},
-    {128, 32, 4, 4, 0}, {128, 32, 4, 4, 1}, {128, 32, 4, 4, 2},
-    {128, 64, 4, 4, 0}, {128, 64, 4, 4, 1},
-    {256, 32, 8, 4, 0}, {256, 32, 8, 4, 1},
+    {64, 64, 4, 4, 0},  {64, 64, 4, 5, 0},  {64, 64, 4, 6, 0},  {128, 64, 4, 4, 0},
+    {64, 32, 4, 6, 0},  {64, 32, 4, 8, 0},  {32, 64, 2, 4, 0},  {32, 64, 2, 6, 0},
+    {128, 32, 4, 4, 0}, {128, 32, 4, 6, 0}, {64, 64, 2, 4, 0},  {256, 32, 8, 4, 0},
 };
 std::span<const KernelEntry> gemv_tc_entries();
 
 // Partials beyond this lower S (bytes; split-K workspace, per call).
 inline constexpr long long kSplitKMaxWorkspace = 64ll << 20;
-// The split count a gemv / gemv_tc impl uses for p (1: no split), or 0 if
-// `impl` is not one of them.
+
+// The launch a gemv / gemv_tc impl makes for p on the current device (or the
+// thread's simulated profile): effective splits (1: no split) and grid.
+struct DecodeLaunch {
+  int splits = 0;
+  unsigned grid_x = 0, grid_y = 0, grid_z = 0;  // N tiles, M tiles, batch x splits
+};
+// False if `impl` is not a gemv / gemv_tc impl.
+bool gemv_launch_plan(const char* impl, const GemmParams& p, DecodeLaunch* out);
+// The effective split count (gemv_launch_plan's splits), or 0 if `impl` is not
+// a gemv / gemv_tc impl.
 int gemv_split_count(const char* impl, const GemmParams& p);
 
 }  // namespace aegis::gemm

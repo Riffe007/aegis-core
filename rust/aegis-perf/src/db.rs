@@ -790,16 +790,29 @@ fn neighbors(a: &ShapeKey, b: &ShapeKey) -> bool {
     (a.4 == b.4 && a.5 == b.5) || (within2(a.3, b.3) && within2(a.4, b.4) && within2(a.5, b.5))
 }
 
+/// Impls a winner may be: the registry of the build that will run them
+/// (`bench_gemm --list`). A config removed from the registry (e.g. the fixed-S
+/// decode configs, retired for SM-count sizing on 2026-10-18) keeps its rows,
+/// but they never decide a winner the build could not launch.
+pub type Registry = std::collections::HashSet<String>;
+
+pub fn registry_of(bench: &Path) -> Result<Registry> {
+    Ok(crate::sweep::default_impls(bench)?.into_iter().collect())
+}
+
 /// Winner per (arch, op, dtype, shape). Clear win: the fastest median. Tie
 /// (paired tie test CI of runner-up / fastest contains 1.0; without one,
 /// the runner-up median inside the fastest one's p10-p90): of the two, the one
 /// that wins or ties on the most neighboring shapes, then fewer registers,
 /// then less smem, then lower median, then name.
-pub fn cmd_winners(db: &Path, arch: Option<i64>) -> Result<()> {
+pub fn cmd_winners(db: &Path, arch: Option<i64>, registry: Option<&Registry>) -> Result<()> {
     let con = connect(db)?;
     // Ranked on protocol v2, cold, idle-GPU rows only (CLAUDE.md Benchmark policy).
     let sel = Selection::ranking();
-    let rows = latest_rows(&con, arch, &sel, TUNE_RUNS)?;
+    let rows: Vec<Latest> = latest_rows(&con, arch, &sel, TUNE_RUNS)?
+        .into_iter()
+        .filter(|r| registry.map_or(true, |reg| is_baseline(&r.impl_) || r.impl_ == DISPATCH_IMPL || reg.contains(&r.impl_)))
+        .collect();
     let paired = load_paired(&con)?;
     let mut groups: Vec<(ShapeKey, Vec<&Latest>)> = Vec::new();
     let mut index = HashMap::new();
@@ -1409,7 +1422,7 @@ mod tests {
         )
         .unwrap();
         drop(con);
-        cmd_winners(&p, Some(121)).unwrap();
+        cmd_winners(&p, Some(121), None).unwrap();
         let con = connect(&p).unwrap();
         let w: (String, String, Option<f64>) = con
             .query_row(
@@ -1419,6 +1432,42 @@ mod tests {
             )
             .unwrap();
         assert_eq!(w, ("a".to_string(), "paired".to_string(), Some(0.91)));
+        std::fs::remove_file(&p).unwrap();
+    }
+
+    /// A config retired from the registry never wins, however fast its old rows:
+    /// with registry {b}, b wins although a's (older run) median is lower.
+    #[test]
+    fn winners_only_from_the_registry() {
+        let p = std::env::temp_dir().join(format!("aegis-perf-registry-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        let con = connect(&p).unwrap();
+        con.execute_batch(
+            "INSERT INTO runs (run_id, device_id, sm_arch, started_at) VALUES
+               ('old', 'dev', 121, '2026-01-01'), ('new', 'dev', 121, '2026-01-02');
+             INSERT INTO kernels (kernel_id, op, impl, config_json, regs, smem_bytes) VALUES
+               ('ka', 'gemm', 'a', '{}', 64, 0), ('kb', 'gemm', 'b', '{}', 64, 0);
+             INSERT INTO measurements (run_id, kernel_id, dtype, m, n, k, median_us, p10_us, p90_us, tflops,
+                                       checked, pass, protocol_version, cache_mode, allow_busy) VALUES
+               ('old', 'ka', 'f16f32f16', 64, 64, 64, 8.0, 7.9, 8.1, 1, 1, 1, 2, 'cold', 0),
+               ('new', 'kb', 'f16f32f16', 64, 64, 64, 10.0, 9.9, 10.1, 1, 1, 1, 2, 'cold', 0);
+             INSERT INTO paired (run_id, op, dtype, m, n, k, a_impl, b_impl, role, pairs, ratio_median,
+                                 ratio_ci_lo, ratio_ci_hi, tied, protocol_version, cache_mode) VALUES
+               ('old', 'gemm', 'f16f32f16', 64, 64, 64, 'a', 'cublaslt_best', 'cublaslt_best', 30, 1.0, 0.99, 1.01, 1, 2, 'cold'),
+               ('new', 'gemm', 'f16f32f16', 64, 64, 64, 'b', 'cublaslt_best', 'cublaslt_best', 30, 1.0, 0.99, 1.01, 1, 2, 'cold');",
+        )
+        .unwrap();
+        drop(con);
+        let pick = |reg: Option<&Registry>| {
+            cmd_winners(&p, Some(121), reg).unwrap();
+            connect(&p)
+                .unwrap()
+                .query_row("SELECT k.impl FROM winners w JOIN kernels k USING(kernel_id)", [], |r| r.get::<_, String>(0))
+                .unwrap()
+        };
+        assert_eq!(pick(None), "a", "without a registry every impl in the DB competes");
+        let reg: Registry = ["b".to_string()].into_iter().collect();
+        assert_eq!(pick(Some(&reg)), "b", "a is not registered: it cannot win");
         std::fs::remove_file(&p).unwrap();
     }
 
@@ -1468,10 +1517,10 @@ mod tests {
             .unwrap()
         };
         seed(false);
-        cmd_winners(&p, Some(121)).unwrap();
+        cmd_winners(&p, Some(121), None).unwrap();
         assert_eq!(winner(), ("pick".to_string(), None, None), "fastest config's CI must not be borrowed");
         seed(true);
-        cmd_winners(&p, Some(121)).unwrap();
+        cmd_winners(&p, Some(121), None).unwrap();
         assert_eq!(winner(), ("pick".to_string(), Some(0.87), Some(0.89)));
         std::fs::remove_file(&p).unwrap();
     }

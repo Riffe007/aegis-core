@@ -74,7 +74,7 @@ pub fn cmd_tune(a: &TuneArgs) -> Result<()> {
 
     let run_id = db::cmd_ingest(a.db, &out_path, Some(&manifest), None, None)?;
     db::mark_disturbed(&db::connect(a.db)?, &run_id, &report)?;
-    db::cmd_winners(a.db, None)?;
+    db::cmd_winners(a.db, None, Some(&db::registry_of(&a.build.join("bench_gemm"))?))?;
     println!("\nresults: {}", out_path.display());
     println!("tune wall time (aegis_tune, measured by aegis-perf): {wall:.1} s\n");
     print!("{}", run_table(&String::from_utf8_lossy(&out.stdout))?);

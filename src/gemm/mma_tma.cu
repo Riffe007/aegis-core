@@ -294,14 +294,9 @@ cudaError_t operand_map(const MapKey& k, CUtensorMap* out) {
 // TMA can take this problem: device sm_90+, 16 B base pointers, ld and batch
 // strides multiples of 8 elements (16 B), sizes within the encoder's range.
 bool tma_ok(const GemmParams& p) {
-  static const bool device_ok = [] {
-    int dev = 0, major = 0;
-    if (cudaGetDevice(&dev) != cudaSuccess || cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess) {
-      cudaGetLastError();
-      return false;
-    }
-    return major >= 9 && encode_fn() != nullptr;
-  }();
+  // Per device: the one the launch runs on (hw::physical), not the first one seen.
+  const hw::DeviceLimits* d = hw::physical();
+  const bool device_ok = d && d->arch >= 90 && encode_fn() != nullptr;
   constexpr long long kMaxDim = (1ll << 32) - 1;
   // A batch-shared operand (stride 0) has no TMA batch dimension: tier 4 takes it.
   const bool strides_ok = p.batch <= 1 || (p.stride_a > 0 && p.stride_b > 0);
@@ -313,8 +308,8 @@ constexpr cudaError_t kNoMap = cudaErrorNotSupported;
 template <class T, int STAGES>
 cudaError_t launch_tma(const GemmParams& gp, cudaStream_t stream) {
   constexpr size_t smem = T::STAGE_BYTES * STAGES + 8 * STAGES;
-  static const cudaError_t configured = cudaFuncSetAttribute(
-      gemm_mma_tma_kernel<T, STAGES>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(smem));
+  static hw::PerDevice once;
+  const cudaError_t configured = hw::configure_smem(once, gemm_mma_tma_kernel<T, STAGES>, smem);
   if (configured != cudaSuccess) return configured;
   const dim3 grid(ceil_div(gp.N, T::BN), ceil_div(gp.M, T::BM), gp.batch);
   if (!grid_ok(grid)) return cudaErrorInvalidValue;

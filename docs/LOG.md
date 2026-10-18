@@ -2063,3 +2063,107 @@ starts. Order:
 6. **CPU thread pool**: physical performance cores, pinned, for the stage-2 CPU GEMV path.
 
 Commit after each step with ctest, sanitizers and the sm_87 gate passing.
+
+## 2026-10-18 — aegis-hw step 1: launch sizing from the detected device
+
+Start-of-day check:
+- The close-out is complete: aegis-perf-v0.5.0 is tagged and pushed, and all six decode shapes
+  dispatch to AEGIS. phase-c-wip never existed; the work was committed on main.
+- The 2026-10-18 03:00 nightly was **skipped**. Its kernel-log guard saw NVRM
+  `refcntRequestReference_IMPL` lines at 19:44:19-28 the evening before. They came from the two
+  ncu profiles written at 19:44:25 and 19:44:32, the same message that has followed ncu sessions
+  since 2026-10-14 (1,072 lines). They are not GPU faults, but the nightly cannot tell them apart.
+  No fuzz, sweep or regression check ran that night.
+
+**What was hard-coded** (file:line on main 6b9a3cc):
+- **Split-K S:** fixed per decode config, tuned on 48 SMs (`include/aegis/gemm.h:217`, `:232`: 37
+  of the 50 decode rows). The auto rule was `splitk.cuh:79` `auto_splits` (fill one wave of
+  resident slots), with a process-static occupancy (`gemv.cu:239`, `:255-256`;
+  `gemv_tc.cu:214`) and a 64-device SM-count cache (`splitk.cuh:64`).
+- **Smem limits and device checks:**
+  - once per process, not per device: `mma.cu:95`, `mma_pipe_impl.cuh:100`, `mma_tma.cu:316`,
+    `gemv_tc.cu:202` (cudaFuncSetAttribute); `mma_tma.cu:297` (TMA eligibility);
+  - `gemv.cu:276` assumed the 48 KiB default limit ("no opt-in");
+  - `matmul.cu:48` queried the arch on every call.
+- **GPU budget:** `src/bench/gpu_budget.h:31-32`, 16 GiB budget and 16 GiB minimum free. That
+  refuses every allocation on an 8 GB Orin Nano.
+- **Occupancy assumptions:** `microbench/cp_async.cu:79` (3 blocks per SM); the comments at
+  `gemm.h:229` ("2 per SM").
+- **No clock values or L2 sizes** were hard-coded in kernels, dispatch or tools. The harness
+  already reads `l2CacheSize`.
+
+**Now:**
+- **Device limits.** `src/hw/device.{h,cu}` queries SM count, smem per SM / block / opt-in, regs,
+  L2 and memory once per device and caches them (`hw::current()`). `hw::PerDevice` /
+  `configure_smem` replace the process statics. `hw::ScopedSimulation` swaps in a profile for
+  tests.
+- **Split count.** Every decode config is `_ksm` (19 configs, from 50): S is chosen at launch by
+  `splitk::sm_load_splits`, the S that minimizes the busiest SM's K rows,
+  ceil(tiles x S / SMs) x ceil(K / S). The smallest S wins a tie. Splits are at least
+  2 x STAGES x BK rows on the TC path and 64 on the CUDA-core path.
+  - On 48 SMs this reproduces every old winner's S: 1 at K = 896 and for N = 4864; 3 for
+    896x4864.
+  - Why not "at least one full wave": the data says it loses. Forcing S = 7 at 1x896x896 was
+    17% slower (11.18 vs 9.55 µs, tune c2b937d8adca). The fill-one-wave `kauto` configs were
+    2-6% behind the 896x4864 winners.
+  - Why no fixed S at all: winners are keyed by arch, but one arch spans SM counts (Orin Nano
+    and AGX Orin are both sm_87).
+- **Winners only from the registry.** `aegis-perf winners` / `tune` / `sweep` now take
+  candidates only from the build's registry (`bench_gemm --list`). Without this, emit-header
+  picked removed `_k3` / `_k1` configs from old runs. Rust test `winners_only_from_the_registry`.
+- **GPU budget defaults:** min(16 GiB, total / 2) and min(16 GiB, total / 4). Both stay 16 GiB on
+  the Spark.
+- **`cp_async` probe:** its block count comes from the occupancy API.
+- **Decode tune** b3ab0da1de2a (display off, watch clean; 19 configs). New winners:
+  - 896x896: `gemv_tc_16x64x64_1x4_s6_ksm`;
+  - 4864x896: `gemv_tc_16x128x32_1x4_s6_ksm`;
+  - 896x4864: `gemv_tc_16x64x64_1x4_s5_ksm`.
+  All dispatch Aegis.
+- **ctest `hw_sizing`:**
+  - the model on hand-worked cases and against a brute-force reference (144 cases);
+  - each decode shape's dispatched kernel planned under simulated 24 / 48 / 96 SMs, and
+    `aegis::matmul` correct against FP64 under each.
+  - S: 896x4864 at 5 / 3 / 6; 4864x896 at 1 / 1 / 2; 896x896 stays 1 (K too short for two ring
+    passes).
+
+**Paired-ab vs main**: baseline worktree at 6b9a3cc vs this tree, cold, 30 pairs, display off.
+Ratio = this tree / main (time). paired_results 45-60; 50-52 are disturbed (gnome-shell) and were
+rerun as 60.
+
+| shape | aegis_matmul (CI) | kernel: main winner -> new winner (CI) |
+|---|---|---|
+| 1x896x896 | 0.965 (0.959-0.968) | 0.970 (0.967-0.975) |
+| 1x4864x896 | 1.000 (0.990-1.024) tie | 1.001 (0.992-1.018) tie |
+| 1x896x4864 | 1.001 (0.994-1.007) tie | 1.010 (0.9995-1.017) tie |
+| 16x896x896 | 0.969 (0.957-0.979) | 0.967 (0.955-0.973) |
+| 16x4864x896 | 0.997 (0.990-1.010) tie | 1.000 (0.990-1.007) tie |
+| 16x896x4864 | 0.994 (0.989-1.002) tie | 1.002 (0.989-1.011) tie |
+| 2048^3 | 1.004 (0.9999-1.009) tie | (same kernel, mma_tma_128x128x32_2x4_s3) |
+
+Verdict: every shape ties or wins. The 896x896 wins are the new s6 winner, which has a deeper ring
+than the old s4 config. They are not from the sizing change: S is 1 there before and after.
+
+Hardening:
+- **memcheck** on the changed launch paths, `artifacts/sanitizer/hw-step1/`:
+  - all 19 decode impls and tiers 3-5 (`mma_64x64x32_2x2`, `mma_pipe` 64x64 s4 / 128x64 s2,
+    `mma_tma` 128x128 s3 / 128x256 s4) on 4 shapes;
+  - `test_splitk`, `test_hw_sizing`, `test_matmul` and the 100-case poisoned decode fuzz.
+  - 100 runs, 0 errors.
+  - `test_matmul` runs with `--report-api-errors no`. Its control case (a cudaMalloc inside a
+    capture, which must fail) is an expected API error that memcheck reports by default. It is
+    in main too.
+- `test_splitk` now names `gemv_tc_16x64x64_1x4_s5_ksm` (S 3 at 1x896x4864) for the
+  first-call-in-capture case. 19 impls x 8 shapes x 10 runs: 129 split cases, 58 with odd S.
+- **`mb_cp_async`** still launches 144 blocks (48 SMs x 3) on GB10. The probe is unchanged here,
+  so its stored numbers stay valid.
+- **Fuzz failure found, pre-existing on main, fixed.** The pre-commit `fuzz_decode` (seed 41)
+  failed case 1360: `aegis::matmul` 24x1872x14747, A col / B row, offsets 7/7, beta 1. The error
+  was 0.130 against a tolerance of 0.060 (4.2 FP16 ulp). That shape has no winner, so matmul ran
+  its cuBLAS fallback (`cublasGemmStridedBatchedEx`, CUBLAS_GEMM_DEFAULT). main's build fails the
+  same case with the same output (20.4688). It surfaced only because the decode target list
+  shrank (51 -> 20), which re-dealt the case's target.
+  - Cause: with FP16 output, cuBLAS may reduce split-K partials in reduced precision.
+  - Fix: the fallback handle sets `CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION`. Mean |err|
+    on that case fell from 0.0082 to 0.00144 (cuBLASLt: 0.00231).
+  - Open: the cuBLASLt floor path rebuilds stored algorithms whose reduction scheme was not
+    checked for this. Nothing has failed there yet.

@@ -7,11 +7,14 @@
 //   aegis::budget::gpu_malloc(&p, bytes)  refuses (cudaErrorMemoryAllocation,
 //                                         reason on stderr) when
 //     - the process's tracked device bytes + bytes > AEGIS_GPU_BUDGET
-//       (default 16 GiB), or
+//       (default: min(16 GiB, total / 2)), or
 //     - cudaMemGetInfo's free memory minus bytes < AEGIS_GPU_MIN_FREE
-//       (default 16 GiB): the system must keep at least that much free after
-//       the allocation (so a call is also refused whenever less than 16 GiB is
-//       free to begin with);
+//       (default: min(16 GiB, total / 4)): the system must keep at least that
+//       much free after the allocation (so a call is also refused whenever less
+//       than that is free to begin with);
+//   total = cudaMemGetInfo's total of the device (16 GiB each on GB10, 128 GB;
+//   an 8 GB Orin Nano gets fractions of its own memory, not a 16 GiB floor it
+//   could never meet);
 //   aegis::budget::gpu_free(p)            frees and untracks.
 // Sizes accept a K/M/G/T suffix (binary units), e.g. AEGIS_GPU_BUDGET=4G.
 // Only allocations made through these functions count; library code
@@ -28,8 +31,21 @@
 namespace aegis::budget {
 
 inline constexpr size_t kGiB = size_t(1) << 30;
-inline constexpr size_t kDefaultBudget = 16 * kGiB;
-inline constexpr size_t kDefaultMinFree = 16 * kGiB;
+inline constexpr size_t kDefaultCap = 16 * kGiB;  // the defaults never exceed this
+
+// The defaults for a device with `total` bytes (cudaMemGetInfo; 0, not queryable: the cap).
+inline size_t default_budget(size_t total) { return total && total / 2 < kDefaultCap ? total / 2 : kDefaultCap; }
+inline size_t default_min_free(size_t total) { return total && total / 4 < kDefaultCap ? total / 4 : kDefaultCap; }
+
+// The device's total memory (cudaMemGetInfo), or 0 if it cannot be queried.
+inline size_t device_total() {
+  size_t free_b = 0, total_b = 0;
+  if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) {
+    cudaGetLastError();
+    return 0;
+  }
+  return total_b;
+}
 
 // Parses "123", "64M", "16G" (binary units). Returns fallback if unset or bad.
 inline size_t parse_size(const char* s, size_t fallback) {
@@ -53,8 +69,9 @@ struct State {
   std::mutex mu;
   std::unordered_map<void*, size_t> live;
   size_t in_use = 0;
-  size_t budget = parse_size(std::getenv("AEGIS_GPU_BUDGET"), kDefaultBudget);
-  size_t min_free = parse_size(std::getenv("AEGIS_GPU_MIN_FREE"), kDefaultMinFree);
+  size_t total = device_total();
+  size_t budget = parse_size(std::getenv("AEGIS_GPU_BUDGET"), default_budget(total));
+  size_t min_free = parse_size(std::getenv("AEGIS_GPU_MIN_FREE"), default_min_free(total));
 };
 
 inline State& state() {

@@ -43,18 +43,23 @@ std::span<const KernelEntry> registry() {
 }
 
 namespace detail {
-int gemv_splits(size_t i, const GemmParams& p);     // gemv.cu
-int gemv_tc_splits(size_t i, const GemmParams& p);  // gemv_tc.cu
+DecodeLaunch gemv_splits(size_t i, const GemmParams& p);     // gemv.cu
+DecodeLaunch gemv_tc_splits(size_t i, const GemmParams& p);  // gemv_tc.cu
 }  // namespace detail
 
-int gemv_split_count(const char* impl, const GemmParams& p) {
+bool gemv_launch_plan(const char* impl, const GemmParams& p, DecodeLaunch* out) {
   const std::string_view name = impl;
   const std::span<const KernelEntry> cc = gemv_entries(), tc = gemv_tc_entries();
   for (size_t i = 0; i < cc.size(); ++i)
-    if (name == cc[i].name) return detail::gemv_splits(i, p);
+    if (name == cc[i].name) return *out = detail::gemv_splits(i, p), true;
   for (size_t i = 0; i < tc.size(); ++i)
-    if (name == tc[i].name) return detail::gemv_tc_splits(i, p);
-  return 0;
+    if (name == tc[i].name) return *out = detail::gemv_tc_splits(i, p), true;
+  return false;
+}
+
+int gemv_split_count(const char* impl, const GemmParams& p) {
+  DecodeLaunch l;
+  return gemv_launch_plan(impl, p, &l) ? l.splits : 0;
 }
 
 const KernelEntry* find(std::string_view name) {

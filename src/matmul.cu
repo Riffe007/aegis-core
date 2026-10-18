@@ -12,6 +12,7 @@
 #include "aegis/gemm.h"
 #include "aegis/matmul.h"
 #include "gemm/workspace.h"
+#include "hw/device.h"
 #include "lt_algo.h"
 
 // One generated table per arch; a missing file just means no tuned winners.
@@ -45,15 +46,10 @@ cudaError_t fail(cudaError_t e, const std::string& what) {
 }
 
 // 0 if the device cannot be queried (then only cuBLAS is used).
+// Cached per device (hw::current; a test's simulated profile included).
 int current_arch() {
-  int dev = 0, major = 0, minor = 0;
-  if (cudaGetDevice(&dev) != cudaSuccess ||
-      cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess ||
-      cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev) != cudaSuccess) {
-    cudaGetLastError();
-    return 0;
-  }
-  return major * 10 + minor;
+  const hw::DeviceLimits* d = hw::current();
+  return d ? d->arch : 0;
 }
 
 const detail::Winner* select_winner(int M, int N, int K) {
@@ -87,10 +83,19 @@ cudaError_t cublas_fail(const char* what, cublasStatus_t s) {
 cudaError_t cublas_gemm_general(const gemm::GemmParams& p, cudaStream_t stream) {
   thread_local cublasHandle_t h = nullptr;
   if (!h) {
-    const cublasStatus_t s = cublasCreate(&h);
+    cublasStatus_t s = cublasCreate(&h);
     if (s != CUBLAS_STATUS_SUCCESS) {
       h = nullptr;
       return cublas_fail("cublasCreate", s);
+    }
+    // FP16 output: by default cuBLAS may reduce split-K partials in FP16. That broke
+    // the tolerance at 24x1872x14747 CR, misaligned (fuzz_decode seed 41 case 1360:
+    // 4.2 ulp, 2.15x tol). Partials must stay FP32, like our own split-K.
+    s = cublasSetMathMode(h, cublasMath_t(CUBLAS_DEFAULT_MATH | CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION));
+    if (s != CUBLAS_STATUS_SUCCESS) {
+      cublasDestroy(h);
+      h = nullptr;
+      return cublas_fail("cublasSetMathMode", s);
     }
   }
   cublasStatus_t s = cublasSetStream(h, stream);

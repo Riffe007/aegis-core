@@ -31,6 +31,7 @@
 
 #include "aegis/common.cuh"
 #include "aegis/gemm.h"
+#include "hw/device.h"
 #include "workspace.h"
 
 namespace aegis::gemm::splitk {
@@ -59,30 +60,41 @@ inline Plan plan(int K, int S_req, long long tiles, int TM, int TN) {
   return pl;
 }
 
-// The device's SM count (cached per device; 0 if it cannot be queried).
-inline int sm_count() {
-  static std::atomic<int> cache[64];  // zero-initialized
-  int dev = 0;
-  if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return 0;
-  if (cache[dev] == 0) {
-    int n = 0;
-    if (cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess) return 0;
-    cache[dev] = n;
+// The split count from the SM count (the "_ksm" configs, S = 0): over
+// S in [1, max(1, K / min_rows)], the one that minimizes the busiest SM's K rows,
+//   ceil(tiles * S / sms) * ceil(K / S),
+// the smallest such S on a tie. Memory-bound decode: an SM's resident CTAs
+// share its bandwidth, so the model counts CTAs per SM, not resident slots,
+// and a partial last wave costs a whole one. More splits pay only while they
+// shorten the busiest SM's rows; min_rows (the caller's pipeline depth) keeps
+// each split long enough to amortize its prologue and its share of the
+// reduction.
+// - Fewer CTAs than SMs is allowed when no larger S lowers the maximum load.
+//   On 48 SMs the 896x4864 decode shapes run 14 tiles x 3 = 42 CTAs.
+// - Filling a wave of resident slots was the previous auto rule; it measured
+//   2-6% slower there (tune c2b937d8adca, LOG 2026-10-18).
+// Deterministic per (shape, SM count). 1 if sms < 1 (no device).
+inline int sm_load_splits(int sms, long long tiles, int K, int min_rows) {
+  if (sms < 1 || tiles < 1 || K < 1) return 1;
+  long long s_max = K / (min_rows > 0 ? min_rows : 1);
+  if (s_max > 4096) s_max = 4096;
+  int best = 1;
+  long long best_load = 0;
+  for (long long S = 1; S <= (s_max < 1 ? 1 : s_max); ++S) {
+    const long long per_sm = (tiles * S + sms - 1) / sms;
+    const long long load = per_sm * ((K + S - 1) / S);
+    if (S == 1 || load < best_load) {
+      best = int(S);
+      best_load = load;
+    }
   }
-  return cache[dev];
+  return best;
 }
 
-// S = 0 in a config ("auto"): as many splits as fill one wave of resident
-// CTAs (blocks_per_sm x SMs, from the occupancy API at the launch's smem),
-// at least 1, and no split shorter than min_rows of K. Deterministic per
-// (shape, device): the same problem always gets the same S.
-inline int auto_splits(int blocks_per_sm, long long tiles, int K, int min_rows) {
-  const long long cap = (long long)blocks_per_sm * sm_count();
-  long long S = tiles > 0 ? cap / tiles : 1;
-  const long long by_k = K / (min_rows > 0 ? min_rows : 1);
-  if (S > by_k) S = by_k;
-  if (S < 1) S = 1;
-  return int(S > 4096 ? 4096 : S);
+// The SM count sizing decisions use: the device's, or the thread's simulated profile.
+inline int sm_count() {
+  const hw::DeviceLimits* d = hw::current();
+  return d ? d->sm_count : 0;
 }
 
 struct Args {

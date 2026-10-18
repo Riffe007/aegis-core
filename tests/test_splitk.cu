@@ -200,9 +200,9 @@ int main() {
     cudaStream_t fresh;
     AEGIS_CUDA_CHECK(cudaStreamCreateWithFlags(&fresh, cudaStreamNonBlocking));
     Problem pr({1, 896, 4864, R, R, 0, 1.f, 0.f});
-    const KernelEntry* e = aegis::gemm::find("gemv_64x128_v8_k8");
+    const KernelEntry* e = aegis::gemm::find("gemv_tc_16x64x64_1x4_s5_ksm");
     if (!e || aegis::gemm::gemv_split_count(e->name, pr.p) < 2) {
-      std::printf("FAIL: gemv_64x128_v8_k8 missing or not split\n");
+      std::printf("FAIL: gemv_tc_16x64x64_1x4_s5_ksm missing or not split\n");
       ok = false;
     } else {
       cudaGraph_t graph = nullptr;

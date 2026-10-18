@@ -47,8 +47,10 @@ add_library(aegis_kernels STATIC
   src/gemm/gemv_tc.cu
   src/gemm/workspace.cu
   src/gemm/registry.cu
+  src/hw/device.cu
 )
 target_include_directories(aegis_kernels PUBLIC include)
+target_include_directories(aegis_kernels PRIVATE src)
 if(AEGIS_TMA)
   target_compile_definitions(aegis_kernels PUBLIC AEGIS_TMA=1)
 endif()
@@ -137,8 +139,8 @@ set(AEGIS_IMPLS
   mma_pipe_64x64x32_2x2_s2 mma_pipe_64x64x32_2x2_s3 mma_pipe_64x64x32_2x2_s4
   mma_pipe_128x256x32_2x4_s2 mma_pipe_128x256x32_2x4_s3 mma_pipe_128x256x32_2x4_s4
   mma_pipe_256x128x32_4x2_s2 mma_pipe_256x128x32_4x2_s3 mma_pipe_256x128x32_4x2_s4
-  gemv_64x64_v8_kauto gemv_64x64_v8_k16 gemv_64x128_v8_kauto gemv_64x128_v8_k4 gemv_64x128_v8_k7 gemv_64x128_v8_k8 gemv_64x128_v8_k16 gemv_128x128_v8_kauto gemv_128x128_v8_k1 gemv_128x128_v8_k3 gemv_128x256_v8_kauto gemv_128x256_v8_k2 gemv_128x256_v8_k4 gemv_256x256_v8_kauto gemv_256x256_v8_k1 gemv_64x128_v4_kauto gemv_64x128_v4_k8 gemv_64x128_v4_k16 gemv_128x256_v4_kauto gemv_128x256_v4_k4 
-  gemv_tc_16x64x64_1x4_s4_kauto gemv_tc_16x64x64_1x4_s4_k1 gemv_tc_16x64x64_1x4_s4_k2 gemv_tc_16x64x64_1x4_s4_k7 gemv_tc_16x64x64_1x4_s4_k10 gemv_tc_16x64x64_1x4_s6_k2 gemv_tc_16x64x64_1x4_s6_k3 gemv_tc_16x64x64_1x4_s5_k3 gemv_tc_16x128x64_1x4_s4_k2 gemv_tc_16x128x64_1x4_s4_k3 gemv_tc_16x64x32_1x4_s6_kauto gemv_tc_16x64x32_1x4_s6_k2 gemv_tc_16x64x32_1x4_s6_k3 gemv_tc_16x64x32_1x4_s6_k4 gemv_tc_16x64x32_1x4_s6_k7 gemv_tc_16x64x32_1x4_s8_k2 gemv_tc_16x64x32_1x4_s8_k3 gemv_tc_16x32x64_1x2_s4_k4 gemv_tc_16x32x64_1x2_s6_k3 gemv_tc_16x128x32_1x4_s6_k2 gemv_tc_16x128x32_1x4_s6_k4 gemv_tc_16x64x64_1x2_s4_kauto gemv_tc_16x64x64_1x2_s4_k7 gemv_tc_16x128x32_1x4_s4_kauto gemv_tc_16x128x32_1x4_s4_k1 gemv_tc_16x128x32_1x4_s4_k2 gemv_tc_16x128x64_1x4_s4_kauto gemv_tc_16x128x64_1x4_s4_k1 gemv_tc_16x256x32_1x8_s4_kauto gemv_tc_16x256x32_1x8_s4_k1 
+  gemv_64x64_v8_ksm gemv_64x128_v8_ksm gemv_128x128_v8_ksm gemv_128x256_v8_ksm gemv_256x256_v8_ksm gemv_64x128_v4_ksm gemv_128x256_v4_ksm 
+  gemv_tc_16x64x64_1x4_s4_ksm gemv_tc_16x64x64_1x4_s5_ksm gemv_tc_16x64x64_1x4_s6_ksm gemv_tc_16x128x64_1x4_s4_ksm gemv_tc_16x64x32_1x4_s6_ksm gemv_tc_16x64x32_1x4_s8_ksm gemv_tc_16x32x64_1x2_s4_ksm gemv_tc_16x32x64_1x2_s6_ksm gemv_tc_16x128x32_1x4_s4_ksm gemv_tc_16x128x32_1x4_s6_ksm gemv_tc_16x64x64_1x2_s4_ksm gemv_tc_16x256x32_1x8_s4_ksm 
 )
 if(AEGIS_TMA)
   list(APPEND AEGIS_IMPLS
@@ -181,7 +183,7 @@ option(AEGIS_SM87_GATE "Also compile every kernel for sm_87 (compile only) and t
 if(AEGIS_SM87_GATE)
   set(AEGIS_SM87_SOURCES
     src/gemm/naive.cu src/gemm/tiled.cu src/gemm/regblock.cu src/gemm/mma.cu src/gemm/mma_pipe.cu src/gemm/mma_tma.cu
-    src/gemm/gemv.cu src/gemm/gemv_tc.cu src/gemm/workspace.cu src/gemm/registry.cu src/matmul.cu src/bench/harness.cu
+    src/gemm/gemv.cu src/gemm/gemv_tc.cu src/gemm/workspace.cu src/gemm/registry.cu src/hw/device.cu src/matmul.cu src/bench/harness.cu
     microbench/ptr_chase.cu microbench/mma_latency.cu microbench/mma_throughput.cu
     microbench/ldmatrix.cu microbench/smem_banks.cu microbench/cp_async.cu microbench/dram_bw.cu
     microbench/launch_overhead.cu
@@ -252,6 +254,12 @@ endif()
 add_executable(test_splitk tests/test_splitk.cu)
 target_link_libraries(test_splitk PRIVATE aegis aegis_bench_harness)
 add_test(NAME splitk_determinism COMMAND test_splitk)
+# Launch sizing from the detected SM count (aegis-hw step 1): the decode family's
+# S and grid under simulated 24 / 48 / 96-SM profiles, and matmul correct under each.
+add_executable(test_hw_sizing tests/test_hw_sizing.cu)
+target_link_libraries(test_hw_sizing PRIVATE aegis aegis_bench_harness)
+target_include_directories(test_hw_sizing PRIVATE src)
+add_test(NAME hw_sizing COMMAND test_hw_sizing)
 # Decode fuzz: the GEMV family and aegis::matmul, M 1..40 (mostly <= 16), K up
 # to 16384, every layout, boundaries, alpha/beta, poisoned memory.
 add_test(NAME fuzz_decode COMMAND aegis_fuzz --cases 2000 --seed 41 --poison --decode --impls gemv_,matmul)

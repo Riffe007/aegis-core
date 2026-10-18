@@ -6,6 +6,7 @@
 // Internal linkage (anonymous namespace): every including file instantiates
 // its own copies, no kernel symbol is shared between translation units.
 #include "aegis/gemm.h"
+#include "hw/device.h"
 #include "mma_common.cuh"
 
 namespace aegis::gemm {
@@ -96,9 +97,9 @@ gemm_mma_pipe_kernel(KParams p, bool vec, bool pairs) {
 template <class T, int STAGES>
 cudaError_t launch_layout(const GemmParams& gp, cudaStream_t stream) {
   constexpr size_t smem = T::STAGE_BYTES * STAGES;
-  // Once per instantiation; a failure is returned on every call.
-  static const cudaError_t configured = cudaFuncSetAttribute(
-      gemm_mma_pipe_kernel<T, STAGES>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(smem));
+  // Once per instantiation and device; a failure is returned on every call.
+  static hw::PerDevice once;
+  const cudaError_t configured = hw::configure_smem(once, gemm_mma_pipe_kernel<T, STAGES>, smem);
   if (configured != cudaSuccess) return configured;
   const dim3 grid(ceil_div(gp.N, T::BN), ceil_div(gp.M, T::BM), gp.batch);
   if (!grid_ok(grid)) return cudaErrorInvalidValue;

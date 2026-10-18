@@ -78,6 +78,7 @@ include/aegis/      public headers: gemm.h (registry, config tables), matmul.h, 
 src/gemm/           one .cu per implementation tier, registry.cu, mma_common.cuh, mma_pipe_impl.cuh (tier 4, shared with tier 5's fallback)
                     splitk.cuh (deterministic split-K: partition, ordered-ticket reduction, epilogue),
                     workspace.{h,cu} (per-stream workspace cache: split-K counters/partials, cuBLASLt)
+src/hw/             device.{h,cu}: per-device limits (SM count, smem, regs, L2), per-device once, simulated profiles
 src/                matmul.cu, capi.cpp, manifest.cpp; src/bench/ harness (timing protocol)
 shapes/             shape sets for tune and sweep
 bench/              bench_gemm.cu: timing, L2 flush, cuBLAS reference check, JSON output
@@ -169,8 +170,9 @@ docs/               LOG.md (dated run log), analysis/ (consolidated analyses, e.
    `aegis::budget::gpu_malloc` / `gpu_free`), never raw `cudaMalloc`. It
    refuses, with `cudaErrorMemoryAllocation` and the reason on stderr, any
    allocation that would take the process past `AEGIS_GPU_BUDGET` (default
-   16 GiB) or leave less than `AEGIS_GPU_MIN_FREE` (default 16 GiB) free
-   system-wide per `cudaMemGetInfo` (which on GB10 reports host RAM: 111.7 GiB
+   min(16 GiB, total / 2)) or leave less than `AEGIS_GPU_MIN_FREE` (default
+   min(16 GiB, total / 4); total = the device's `cudaMemGetInfo` total, so both
+   are 16 GiB on the Spark and fit an 8 GB Orin Nano) free system-wide per `cudaMemGetInfo` (which on GB10 reports host RAM: 111.7 GiB
    free when `free` said 112). This, not the cgroup cap, is the real protection
    on unified memory: the driver does not charge device allocations to the
    job's cgroup. Tests: ctest `gpu_budget_*` (deliberate oversize requests).
@@ -396,6 +398,17 @@ only to compare with old rows (`--protocol 1`).
   (`workspace.h`): first call per stream outside capture, nothing allocates
   after (strict global-mode capture test). `KernelEntry::tune_max_m = 16`
   keeps aegis_tune from timing them on larger M; any M runs.
+- **Launch sizing comes from the device, never from constants (aegis-hw step 1,
+  2026-10-18, `src/hw/device.h`).** Limits are queried per device and cached
+  (`hw::current()`: SM count, smem per SM / block / opt-in, regs, L2, memory).
+  - Every tuned decode config is `_ksm`: split-K S is chosen at launch from the
+    SM count (`splitk::sm_load_splits`, the S minimizing the busiest SM's K
+    rows). Winners are per arch, but one arch spans SM counts (sm_87: Orin Nano,
+    AGX Orin), so no table fixes S.
+  - Smem attributes and TMA eligibility are set per device (`hw::PerDevice`),
+    not once per process.
+  - Tests size against simulated profiles with `hw::ScopedSimulation`
+    (ctest `hw_sizing`: 24 / 48 / 96 SMs).
 - So one templated `mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32` kernel
   with `ldmatrix` and `cp.async` should run on both archs. The autotuner picks
   different tile configs per arch. That divergence is the project's story.

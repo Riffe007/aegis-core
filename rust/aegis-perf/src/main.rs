@@ -72,10 +72,13 @@ enum Cmd {
         #[arg(long)]
         reason: String,
     },
-    /// Recompute the best kernel per (arch, shape).
+    /// Recompute the best kernel per (arch, shape), among the impls the build registers.
     Winners {
         #[arg(long)]
         arch: Option<i64>,
+        /// Build whose bench_gemm --list bounds the candidates (missing: every impl in the DB).
+        #[arg(long, default_value = "build")]
+        build_dir: PathBuf,
     },
     /// % of cuBLAS per shape.
     Report {
@@ -238,7 +241,14 @@ fn main() -> Result<()> {
             Ok(())
         }
         Cmd::Invalidate { run, probe, reason } => db::cmd_invalidate(&cli.db, &run, probe.as_deref(), &reason),
-        Cmd::Winners { arch } => db::cmd_winners(&cli.db, arch),
+        Cmd::Winners { arch, build_dir } => {
+            let bench = build_dir.join("bench_gemm");
+            let reg = if bench.exists() { Some(db::registry_of(&bench)?) } else { None };
+            if reg.is_none() {
+                eprintln!("warning: {} not found; winners from every impl in the DB", bench.display());
+            }
+            db::cmd_winners(&cli.db, arch, reg.as_ref())
+        }
         Cmd::Report { arch, protocol, cache, include_busy, baseline } => {
             db::cmd_report(&cli.db, arch, &db::Selection { protocol, cache, include_busy }, baseline.as_deref())
         }

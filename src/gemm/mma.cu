@@ -23,6 +23,7 @@
 #include <utility>
 
 #include "aegis/gemm.h"
+#include "hw/device.h"
 #include "mma_common.cuh"
 
 namespace aegis::gemm {
@@ -91,9 +92,9 @@ gemm_mma_kernel(KParams p, bool vec, bool pairs) {
 
 template <class T>
 cudaError_t launch_layout(const GemmParams& gp, cudaStream_t stream) {
-  // Once per instantiation; a failure is returned on every call.
-  static const cudaError_t configured = cudaFuncSetAttribute(
-      gemm_mma_kernel<T>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(T::STAGE_BYTES));
+  // Once per instantiation and device; a failure is returned on every call.
+  static hw::PerDevice once;
+  const cudaError_t configured = hw::configure_smem(once, gemm_mma_kernel<T>, T::STAGE_BYTES);
   if (configured != cudaSuccess) return configured;
   const dim3 grid(ceil_div(gp.N, T::BN), ceil_div(gp.M, T::BM), gp.batch);
   if (!grid_ok(grid)) return cudaErrorInvalidValue;

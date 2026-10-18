@@ -35,12 +35,15 @@
 
 #include "aegis/gemm.h"
 #include "gemm_params.cuh"
+#include "hw/device.h"
 #include "splitk.cuh"
 
 namespace aegis::gemm {
 namespace {
 
-constexpr int kASmem = 28 << 10;  // A chunk (FP32) budget; + the MT x BN tile (<= 16 KiB) stays within 48 KiB
+constexpr int kASmem = 28 << 10;  // A chunk (FP32) budget per CTA; the launch sets the dynamic smem limit (configure)
+// A split is at least this many K rows (the CUDA-core path has no smem ring to fill).
+constexpr int kMinSplitRows = 64;
 // k steps per register buffer (two buffers): 4, or 2 when the MT x VEC accumulators
 // already take 128 registers (MT 16, VEC 8), so the kernel stays under 255 without spills.
 template <int MT, int VEC>
@@ -234,33 +237,38 @@ bool b_vec_ok(const GemmParams& p, int vec) {
 
 int pick_mt(int M) { return M <= 1 ? 1 : M <= 2 ? 2 : M <= 4 ? 4 : M <= 8 ? 8 : 16; }
 
-// Resident CTAs per SM of a kernel at `smem` bytes (>= 1).
-template <class Kern>
-int blocks_per_sm(Kern k, int threads, size_t smem) {
-  int n = 0;
-  if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&n, k, threads, smem) != cudaSuccess) {
-    cudaGetLastError();
-    return 1;
-  }
-  return n < 1 ? 1 : n;
-}
-
-// The split plan of one call; S == 0: auto (splitk::auto_splits at the
-// largest smem this instantiation uses, so a wave never overfills).
+// The split plan of one call; S == 0 ("_ksm"): from the SM count
+// (splitk::sm_load_splits), splits of at least kMinSplitRows of K.
 template <int MT, int VEC, int BN, int THREADS>
 splitk::Plan plan_for(const GemmParams& p, int S) {
   const long long tiles = (long long)p.batch * ceil_div(p.M, MT) * ceil_div(p.N, BN);
-  if (S == 0) {
-    using SM = GemvSmem<MT, VEC, BN, THREADS>;
-    static const int bps_vec = blocks_per_sm(gemv_kernel<MT, VEC, BN, THREADS, true>, THREADS, SM::bytes(SM::KCH));
-    static const int bps_elem = blocks_per_sm(gemv_kernel<MT, VEC, BN, THREADS, false>, THREADS, SM::bytes(SM::KCH));
-    S = splitk::auto_splits(b_vec_ok(p, VEC) ? bps_vec : bps_elem, tiles, p.K, 64);
-  }
+  if (S == 0) S = splitk::sm_load_splits(splitk::sm_count(), tiles, p.K, kMinSplitRows);
   return splitk::plan(p.K, S, tiles, MT, BN);
 }
 
 template <int MT, int VEC, int BN, int THREADS>
+DecodeLaunch launch_shape(const GemmParams& p, int S) {
+  const splitk::Plan pl = plan_for<MT, VEC, BN, THREADS>(p, S);
+  return DecodeLaunch{pl.S, unsigned(ceil_div(p.N, BN)), unsigned(ceil_div(p.M, MT)),
+                      unsigned(p.batch) * unsigned(pl.S)};
+}
+
+// The dynamic smem limit of both B paths at the instantiation's largest
+// slice, set once per device (the default limit is the device's
+// sharedMemPerBlock; nothing assumes its value).
+template <int MT, int VEC, int BN, int THREADS>
+cudaError_t configure() {
+  using SM = GemvSmem<MT, VEC, BN, THREADS>;
+  static hw::PerDevice once_vec, once_elem;
+  if (const cudaError_t e = hw::configure_smem(once_vec, gemv_kernel<MT, VEC, BN, THREADS, true>, SM::bytes(SM::KCH));
+      e != cudaSuccess)
+    return e;
+  return hw::configure_smem(once_elem, gemv_kernel<MT, VEC, BN, THREADS, false>, SM::bytes(SM::KCH));
+}
+
+template <int MT, int VEC, int BN, int THREADS>
 cudaError_t launch_mt(const GemmParams& p, int S, cudaStream_t stream) {
+  if (const cudaError_t e = configure<MT, VEC, BN, THREADS>(); e != cudaSuccess) return e;
   GemvArgs g;
   g.mtiles = ceil_div(p.M, MT);
   g.ntiles = ceil_div(p.N, BN);
@@ -273,7 +281,7 @@ cudaError_t launch_mt(const GemmParams& p, int S, cudaStream_t stream) {
   if (!grid_ok(grid) || (long long)p.batch * pl.S > 65535) return cudaErrorInvalidValue;
   using SM = GemvSmem<MT, VEC, BN, THREADS>;
   g.region = SM::region(pl.kc);
-  const size_t smem = SM::bytes(pl.kc);  // <= 44 KiB + 16 B: no opt-in
+  const size_t smem = SM::bytes(pl.kc);  // <= SM::bytes(KCH), the limit configure() set
   if (b_vec_ok(p, VEC))
     gemv_kernel<MT, VEC, BN, THREADS, true><<<grid, THREADS, smem, stream>>>(to_kparams(p), g);
   else
@@ -294,15 +302,15 @@ cudaError_t run(const GemmParams& p, cudaStream_t stream) {
   }
 }
 
-// The effective split count of one call (gemv_split_count).
+// The launch of one call: effective splits and grid (gemv_launch_plan).
 template <int BN, int THREADS, int VEC, int S>
-int splits(const GemmParams& p) {
+DecodeLaunch splits(const GemmParams& p) {
   switch (pick_mt(p.M)) {
-    case 1: return plan_for<1, VEC, BN, THREADS>(p, S).S;
-    case 2: return plan_for<2, VEC, BN, THREADS>(p, S).S;
-    case 4: return plan_for<4, VEC, BN, THREADS>(p, S).S;
-    case 8: return plan_for<8, VEC, BN, THREADS>(p, S).S;
-    default: return plan_for<16, VEC, BN, THREADS>(p, S).S;
+    case 1: return launch_shape<1, VEC, BN, THREADS>(p, S);
+    case 2: return launch_shape<2, VEC, BN, THREADS>(p, S);
+    case 4: return launch_shape<4, VEC, BN, THREADS>(p, S);
+    case 8: return launch_shape<8, VEC, BN, THREADS>(p, S);
+    default: return launch_shape<16, VEC, BN, THREADS>(p, S);
   }
 }
 
@@ -322,15 +330,15 @@ constexpr size_t kN = std::size(GEMV_CONFIGS);
 
 std::string name_of(const GemvConfig& c) {
   return "gemv_" + std::to_string(c.BN) + "x" + std::to_string(c.THREADS) + "_v" + std::to_string(c.VEC) + "_k" +
-         (c.S == 0 ? std::string("auto") : std::to_string(c.S));
+         (c.S == 0 ? std::string("sm") : std::to_string(c.S));
 }
 
 std::string config_of(const GemvConfig& c) {
   return "{\"BN\":" + std::to_string(c.BN) + ",\"THREADS\":" + std::to_string(c.THREADS) +
-         ",\"VEC\":" + std::to_string(c.VEC) + ",\"S\":" + std::to_string(c.S) + ",\"path\":\"cuda_core\"}";
+         ",\"VEC\":" + std::to_string(c.VEC) + ",\"S\":" + std::to_string(c.S) + (c.S == 0 ? ",\"split\":\"sm_load\"" : "") + ",\"path\":\"cuda_core\"}";
 }
 
-using SplitsFn = int (*)(const GemmParams&);
+using SplitsFn = DecodeLaunch (*)(const GemmParams&);
 
 template <size_t... I>
 std::span<const KernelEntry> make_entries(std::index_sequence<I...>) {
@@ -355,7 +363,7 @@ std::span<const KernelEntry> gemv_entries() { return make_entries(std::make_inde
 
 namespace detail {
 // For gemv_split_count (registry.cu): the effective split count of config i.
-int gemv_splits(size_t i, const GemmParams& p) { return splits_fn(i, std::make_index_sequence<kN>{})(p); }
+DecodeLaunch gemv_splits(size_t i, const GemmParams& p) { return splits_fn(i, std::make_index_sequence<kN>{})(p); }
 }  // namespace detail
 
 }  // namespace aegis::gemm

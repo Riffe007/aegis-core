@@ -231,7 +231,7 @@ pub fn cmd_sweep(a: &SweepArgs) -> Result<String> {
     let run_id = db::cmd_ingest(db, &out, Some(&manifest), None, None)?;
     db::mark_disturbed(&db::connect(db)?, &run_id, &report)?;
     if !a.no_winners {
-        db::cmd_winners(db, None)?;
+        db::cmd_winners(db, None, Some(&db::registry_of(&a.build.join("bench_gemm"))?))?;
     }
     println!("\nresults: {} (run {run_id})", out.display());
     if failures > 0 {
