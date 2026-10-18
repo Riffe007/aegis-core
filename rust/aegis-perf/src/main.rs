@@ -11,6 +11,7 @@
 //!     aegis-perf roofline --arch 121 [--out results/roofline-sm121.svg]
 //!     aegis-perf emit-arch --arch 121 [--ptr-chase RUN[:LAYOUT]]...
 //!     aegis-perf paired-ab --a OLD/build/bench_gemm --b build/bench_gemm --impl X --shape M N K
+//!     aegis-perf hw [--root FIXTURE] [--no-cuda] [--no-nvml]   (hardware discovery JSON)
 use std::path::PathBuf;
 
 use aegis_perf::{ab, arch, db, regress, roofline, sweep, tune, watch};
@@ -119,6 +120,22 @@ enum Cmd {
         build_dir: PathBuf,
         #[arg(long, default_value = "results")]
         results_dir: PathBuf,
+    },
+    /// Hardware discovery (include/aegis/hw.h) as JSON: runs <build-dir>/aegis_hw.
+    Hw {
+        #[arg(long, default_value_t = 0)]
+        device: i32,
+        /// Read sysfs / procfs / dev under this directory (a fixture, tests/fixtures/hw/).
+        #[arg(long)]
+        root: Option<PathBuf>,
+        #[arg(long)]
+        no_cuda: bool,
+        #[arg(long)]
+        no_nvml: bool,
+        #[arg(long)]
+        no_video: bool,
+        #[arg(long, default_value = "build")]
+        build_dir: PathBuf,
     },
     /// Winners for an arch -> include/aegis/winners/sm_<arch>.h (commit it).
     EmitHeader {
@@ -262,6 +279,30 @@ fn main() -> Result<()> {
             allow_busy,
             pair_with,
         }),
+        Cmd::Hw { device, root, no_cuda, no_nvml, no_video, build_dir } => {
+            let exe = build_dir.join("aegis_hw");
+            if !exe.exists() {
+                anyhow::bail!("{} not found; run cmake --build build first", exe.display());
+            }
+            let mut cmd = std::process::Command::new(&exe);
+            cmd.args(["--device", &device.to_string()]);
+            if let Some(r) = &root {
+                cmd.arg("--root").arg(r);
+            }
+            for (on, flag) in [(no_cuda, "--no-cuda"), (no_nvml, "--no-nvml"), (no_video, "--no-video")] {
+                if on {
+                    cmd.arg(flag);
+                }
+            }
+            let out = cmd.output()?;
+            if !out.status.success() {
+                anyhow::bail!("aegis_hw failed ({}): {}", out.status, String::from_utf8_lossy(&out.stderr));
+            }
+            // Validate, then print the document as aegis_hw wrote it (one line per section).
+            serde_json::from_slice::<serde_json::Value>(&out.stdout)?;
+            print!("{}", String::from_utf8_lossy(&out.stdout));
+            Ok(())
+        }
         Cmd::EmitHeader { arch, out, results_dir } => {
             tune::cmd_emit_header(&cli.db, arch, &results_dir, out.as_deref())
         }

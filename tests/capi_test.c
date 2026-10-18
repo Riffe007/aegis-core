@@ -131,6 +131,49 @@ static void test_manifest(void) {
   free(buf);
 }
 
+/* ABI 1.3: hardware discovery. */
+static void test_hw(void) {
+  size_t needed = 0;
+  EXPECT(aegis_hw_info_json(0, NULL, 0, &needed) == AEGIS_OK && needed > 1, "hw json size query");
+  char* buf = malloc(needed);
+  size_t again = 0;
+  EXPECT(buf && aegis_hw_info_json(0, buf, needed, &again) == AEGIS_OK, "hw json fill (the size query's snapshot)");
+  EXPECT(again == needed && strlen(buf) + 1 == needed, "hw json: same snapshot as the size query");
+  EXPECT(strstr(buf, "\"schema\":\"aegis-hw/1\"") && strstr(buf, "\"core_types\"") && strstr(buf, "\"nvdec\""),
+         "hw json keys");
+  char small[4];
+  EXPECT(aegis_hw_info_json(0, small, sizeof small, &needed) == AEGIS_ERR_BUFFER_TOO_SMALL, "hw json small buffer");
+  EXPECT(aegis_hw_info_json(-2, NULL, 0, &needed) == AEGIS_ERR_NO_DEVICE, "hw json bad device");
+  EXPECT(aegis_hw_info_json(-1, NULL, 0, &needed) == AEGIS_OK, "hw json without a GPU (device -1)");
+  free(buf);
+
+  aegis_hw_gpu_info g;
+  memset(&g, 0, sizeof g);
+  EXPECT(aegis_hw_gpu(0, &g) == AEGIS_ERR_INVALID_ARGUMENT, "hw gpu: struct_size unset");
+  g.struct_size = sizeof g;
+  EXPECT(aegis_hw_gpu(0, &g) == AEGIS_OK && g.present == 1 && g.sm_count > 0 && g.arch >= 70 &&
+             g.smem_per_block_optin >= g.smem_per_block && g.name[0] != 0 && g.struct_size == sizeof g,
+         "hw gpu struct");
+  EXPECT(aegis_hw_gpu(-1, &g) == AEGIS_ERR_NO_DEVICE, "hw gpu bad device");
+  /* An older caller's smaller struct: only its bytes are written. */
+  unsigned char old[64];
+  memset(old, 0xab, sizeof old);
+  uint32_t old_size = 16;
+  memcpy(old, &old_size, sizeof old_size);
+  EXPECT(aegis_hw_gpu(0, (aegis_hw_gpu_info*)old) == AEGIS_OK && old[16] == 0xab && old[63] == 0xab,
+         "hw gpu: a 16-byte struct_size is respected");
+
+  aegis_hw_cpu_info c;
+  memset(&c, 0, sizeof c);
+  c.struct_size = sizeof c;
+  EXPECT(aegis_hw_cpu(&c) == AEGIS_OK && c.logical_cpus > 0 && c.performance_cores > 0 &&
+             c.performance_cores <= c.logical_cpus && c.core_types >= 1,
+         "hw cpu struct");
+#if defined(__aarch64__)
+  EXPECT(c.neon == 1, "hw cpu: NEON on aarch64");
+#endif
+}
+
 static void test_gemm(aegis_context* ctx, int M, int N, int K) {
   const size_t nA = (size_t)M * K, nB = (size_t)K * N, nC = (size_t)M * N;
   uint16_t* hA = malloc(nA * 2);
@@ -253,6 +296,7 @@ int main(void) {
   }
   test_errors(ctx);
   test_manifest();
+  test_hw();
   test_launch_failure(ctx);
   test_gemm(ctx, 127, 129, 65);  /* unaligned; also proves the process survived */
   test_gemm(ctx, 16, 896, 896);  /* tuned decode shape (if winners are compiled in) */

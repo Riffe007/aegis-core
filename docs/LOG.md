@@ -2167,3 +2167,52 @@ Hardening:
     on that case fell from 0.0082 to 0.00144 (cuBLASLt: 0.00231).
   - Open: the cuBLASLt floor path rebuilds stored algorithms whose reduction scheme was not
     checked for this. Nothing has failed there yet.
+
+## 2026-10-18 — aegis-hw step 2: hardware discovery (C ABI 1.3)
+
+- **C++ API:** `include/aegis/hw.h`, `aegis::hw::discover()` -> `HwInfo` (struct), and `to_json()`
+  (schema `aegis-hw/1`). Implementation: `src/hw/discover.cpp`, in libaegis.
+- **Sources, by part** (every field records its source, and an unreadable field is unknown,
+  never guessed):
+  - GPU: cudaDeviceProp and `hw::query`. NVML via dlopen (name, max SM / memory clock,
+    enforced power limit). Without NVML: the Tegra devfreq max clock. Without CUDA: the Tegra
+    device tree (`nvidia,ga10b` -> sm_87).
+  - CPU: `/sys/devices/system/cpu` (cluster_id, cpu_capacity, midr_el1, cpufreq min/max).
+    Core names come from a MIDR table. The performance type is the one with the highest max
+    frequency, then capacity.
+  - ISA: getauxval(AT_HWCAP / AT_HWCAP2) live, `/proc/cpuinfo` Features under a fixture root.
+  - Memory: `/proc/meminfo`. Thermal: `/sys/class/thermal`.
+  - Video:
+    - NVENC: NVML `nvmlDeviceGetEncoderCapacity`, per H264 / HEVC / AV1.
+    - NVDEC: `cuvidGetDecoderCaps` per codec, via dlopen of libnvcuvid. Its struct is declared
+      from the Video Codec SDK documentation, since the SDK headers are not installed here.
+      It is padded, and results that fail a plausibility check are reported as "unverified".
+    - Tegra: the engines' device nodes, presence only.
+- **C ABI 1.3** (`aegis.h`): `aegis_hw_info_json` (a size query takes a per-thread snapshot that
+  the next fill returns), `aegis_hw_gpu` / `aegis_hw_cpu` with `aegis_hw_*_info` structs. The
+  structs carry `struct_size` and fill at most that many bytes, so later minors can append.
+- **Tools:** `tools/aegis_hw` (`--root`, `--no-cuda`, `--no-nvml`, `--no-video`, `--no-auxv`),
+  `aegis-perf hw`, and the Rust `aegis_sys::safe::hw_info_json`.
+- **Fixtures:**
+  - `tests/fixtures/hw/spark-gb10`: recorded with `tools/record_hw_fixture.sh`.
+  - `tests/fixtures/hw/orin-nano-synthetic`: **hand-written** from the L4T sysfs layout. No
+    Nano was connected; its README says so. Replace it with a recording when the device is
+    available.
+- **Tests:**
+  - ctest `hw_discover`, 28 checks: Orin Nano fixture through the Tegra / no-CUDA / no-NVML
+    path; Spark recording vs live (CPU topology, MemTotal, cpuinfo-ISA = getauxval-ISA); live
+    GPU vs cudaDeviceProp; the no-NVML and no-CUDA paths; an empty root.
+  - `capi_test`: the size-query snapshot, small buffer, bad device, device -1, both structs,
+    and a 16-byte `struct_size`.
+  - aegis-sys `hw_info_json_has_every_section`.
+- **Hardening:** memcheck `test_hw_discover` and `capi_test_shared`, 0 errors
+  (`artifacts/sanitizer/hw-step2/`). No kernel or launch path changed in this step.
+- **Noted, not changed:** `libaegis_capi.so` exports some `std::map` / `std::string` template
+  instantiations besides `aegis_*` (weak symbols from capi.cpp's manifest cache; already present
+  before this step).
+
+Spark discovery (live): GB10, sm_121, 48 SMs, 100 KiB smem per SM (99 KiB opt-in per block),
+24 MiB L2, unified, TMA. Max SM clock 3003 MHz (NVML). The power limit is not readable (NVML: Not
+Supported). CPU: 2 clusters, 10 Cortex-X925 (1378-3900 MHz, performance) and 10 Cortex-A725
+(338-2808 MHz); NEON, fp16, dotprod, SVE, SVE2, i8mm, bf16. NVDEC: MPEG2, MPEG4, VC1, H264,
+HEVC, VP8, VP9, AV1. NVENC: H264, HEVC, AV1.

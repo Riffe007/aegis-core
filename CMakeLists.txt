@@ -59,14 +59,14 @@ set_target_properties(aegis_kernels PROPERTIES CUDA_SEPARABLE_COMPILATION OFF
                                                POSITION_INDEPENDENT_CODE ON)
 
 # aegis::matmul: tuned-winner dispatch over the kernels; cuBLASLt below the dispatch floor, cuBLAS fallback.
-add_library(aegis STATIC src/matmul.cu src/manifest.cpp)
+add_library(aegis STATIC src/matmul.cu src/manifest.cpp src/hw/discover.cpp)
 set_target_properties(aegis PROPERTIES POSITION_INDEPENDENT_CODE ON)
 # matmul.cu pulls winners in with __has_include, which dependency scanning
 # misses when a header first appears; glob them so `aegis-perf emit-header`
 # triggers a rebuild.
 file(GLOB AEGIS_WINNER_HEADERS CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/include/aegis/winners/*.h)
 set_source_files_properties(src/matmul.cu PROPERTIES OBJECT_DEPENDS "${AEGIS_WINNER_HEADERS}")
-target_link_libraries(aegis PUBLIC aegis_kernels CUDA::cudart CUDA::cublas CUDA::cublasLt)
+target_link_libraries(aegis PUBLIC aegis_kernels CUDA::cudart CUDA::cublas CUDA::cublasLt ${CMAKE_DL_LIBS})
 
 # The timing protocol (src/bench/harness.h), shared by bench_gemm and aegis_tune.
 add_library(aegis_bench_harness STATIC src/bench/harness.cu src/bench/reference.cu)
@@ -92,6 +92,9 @@ add_custom_target(fuzz_nightly COMMAND ${CMAKE_SOURCE_DIR}/tools/gpu_job.sh $<TA
 
 add_executable(aegis_manifest tools/aegis_manifest.cu)
 target_link_libraries(aegis_manifest PRIVATE aegis)
+# Hardware discovery as JSON (aegis-perf hw).
+add_executable(aegis_hw tools/aegis_hw.cpp)
+target_link_libraries(aegis_hw PRIVATE aegis)
 
 # C ABI (include/aegis/aegis.h): libaegis_capi.a and libaegis_capi.so. The
 # shared library exports only the AEGIS_API symbols.
@@ -260,6 +263,12 @@ add_executable(test_hw_sizing tests/test_hw_sizing.cu)
 target_link_libraries(test_hw_sizing PRIVATE aegis aegis_bench_harness)
 target_include_directories(test_hw_sizing PRIVATE src)
 add_test(NAME hw_sizing COMMAND test_hw_sizing)
+# Hardware discovery (aegis-hw step 2): the synthetic Orin Nano fixture (Tegra, no CUDA /
+# NVML), the recorded Spark fixture vs live, live GPU vs cudaDeviceProp, the no-NVML path.
+add_executable(test_hw_discover tests/test_hw_discover.cpp)
+target_link_libraries(test_hw_discover PRIVATE aegis)
+target_compile_definitions(test_hw_discover PRIVATE AEGIS_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/fixtures/hw")
+add_test(NAME hw_discover COMMAND test_hw_discover)
 # Decode fuzz: the GEMV family and aegis::matmul, M 1..40 (mostly <= 16), K up
 # to 16384, every layout, boundaries, alpha/beta, poisoned memory.
 add_test(NAME fuzz_decode COMMAND aegis_fuzz --cases 2000 --seed 41 --poison --decode --impls gemv_,matmul)

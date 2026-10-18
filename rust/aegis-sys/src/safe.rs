@@ -73,6 +73,12 @@ pub fn device_manifest(device: i32) -> Result<String> {
     read_string(|buf, len, needed| unsafe { ffi::aegis_device_manifest(device, buf, len, needed) })
 }
 
+/// Hardware discovery JSON (schema "aegis-hw/1", ABI 1.3): GPU, CPU, memory, thermal,
+/// video. `device` -1: no CUDA call (CPU, memory, thermal; a Tegra GPU from sysfs).
+pub fn hw_info_json(device: i32) -> Result<String> {
+    read_string(|buf, len, needed| unsafe { ffi::aegis_hw_info_json(device, buf, len, needed) })
+}
+
 /// One device plus one stream. Usable from one thread at a time: `Send`, not `Sync`.
 pub struct Context {
     raw: NonNull<ffi::aegis_context>,

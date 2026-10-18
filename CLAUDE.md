@@ -59,6 +59,8 @@ rust/target/release/aegis-perf paired-ab --a OLD/bench_gemm --b build/bench_gemm
 tools/nightly.sh                                  # nightly (user timer 03:00; --install): 50k fuzz, regression sweep, DB backup -> results/nightly.log
 rust/target/release/aegis-perf regress --run R   # winners-header shapes: % of cublaslt_best in run R vs the newest earlier clean run;
                                                   # >3% drop = watch, regression if 2 consecutive nightlies or a paired-ab confirm
+rust/target/release/aegis-perf hw                 # hardware discovery JSON (GPU, CPU clusters/ISA, memory, thermal, NVDEC/NVENC)
+tools/record_hw_fixture.sh tests/fixtures/hw/NAME # record a device's sysfs for the discovery tests
 tools/screen_off.sh CMD                          # run CMD with the local display blanked (in-run idle watch; see Benchmark policy)
 ./build/bench_gemm --impl aegis_matmul ...       # time aegis::matmul itself (dispatch), e.g. paired-ab --impl cublaslt_best --impl-b aegis_matmul
 ```
@@ -78,7 +80,10 @@ include/aegis/      public headers: gemm.h (registry, config tables), matmul.h, 
 src/gemm/           one .cu per implementation tier, registry.cu, mma_common.cuh, mma_pipe_impl.cuh (tier 4, shared with tier 5's fallback)
                     splitk.cuh (deterministic split-K: partition, ordered-ticket reduction, epilogue),
                     workspace.{h,cu} (per-stream workspace cache: split-K counters/partials, cuBLASLt)
-src/hw/             device.{h,cu}: per-device limits (SM count, smem, regs, L2), per-device once, simulated profiles
+src/hw/             device.{h,cu}: per-device limits (SM count, smem, regs, L2), per-device once, simulated profiles;
+                    discover.cpp: hardware discovery (include/aegis/hw.h; C ABI 1.3 aegis_hw_*)
+tests/fixtures/hw/  sysfs/procfs trees for discovery tests: spark-gb10 (recorded, tools/record_hw_fixture.sh),
+                    orin-nano-synthetic (hand-written L4T layout until a Nano is connected)
 src/                matmul.cu, capi.cpp, manifest.cpp; src/bench/ harness (timing protocol)
 shapes/             shape sets for tune and sweep
 bench/              bench_gemm.cu: timing, L2 flush, cuBLAS reference check, JSON output

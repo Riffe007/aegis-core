@@ -811,7 +811,7 @@ pub fn cmd_winners(db: &Path, arch: Option<i64>, registry: Option<&Registry>) ->
     let sel = Selection::ranking();
     let rows: Vec<Latest> = latest_rows(&con, arch, &sel, TUNE_RUNS)?
         .into_iter()
-        .filter(|r| registry.map_or(true, |reg| is_baseline(&r.impl_) || r.impl_ == DISPATCH_IMPL || reg.contains(&r.impl_)))
+        .filter(|r| registry.is_none_or(|reg| is_baseline(&r.impl_) || r.impl_ == DISPATCH_IMPL || reg.contains(&r.impl_)))
         .collect();
     let paired = load_paired(&con)?;
     let mut groups: Vec<(ShapeKey, Vec<&Latest>)> = Vec::new();

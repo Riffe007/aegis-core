@@ -77,3 +77,18 @@ fn rejects_bad_arguments() {
     assert!(ctx.gemm_f16(&a, &b, &mut c, 0, 2, 2).is_err(), "zero dimension");
     assert!(Context::new(9999).is_err());
 }
+
+#[test]
+fn hw_info_json_has_every_section() {
+    let j = aegis_sys::safe::hw_info_json(0).expect("hw_info_json(0)");
+    let v: serde_json::Value = serde_json::from_str(&j).expect("valid JSON");
+    assert_eq!(v["schema"], "aegis-hw/1");
+    assert_eq!(v["gpu"]["present"], true);
+    assert!(v["gpu"]["sm_count"].as_i64().unwrap() > 0);
+    assert!(v["cpu"]["logical_cpus"].as_i64().unwrap() > 0);
+    assert!(!v["cpu"]["core_types"].as_array().unwrap().is_empty());
+    assert!(v["thermal"].is_array() && v["video"]["nvdec"].is_object());
+    // No GPU part: no CUDA call.
+    let cpu_only: serde_json::Value = serde_json::from_str(&aegis_sys::safe::hw_info_json(-1).unwrap()).unwrap();
+    assert_eq!(cpu_only["gpu"]["source"], if cpu_only["gpu"]["present"] == true { "sysfs" } else { "none" });
+}

@@ -6,12 +6,14 @@
 
 #include <cuda_runtime.h>
 
+#include <cstdio>
 #include <cstring>
 #include <map>
 #include <mutex>
 #include <new>
 #include <string>
 
+#include "aegis/hw.h"
 #include "aegis/manifest.h"
 #include "aegis/matmul.h"
 
@@ -227,6 +229,104 @@ int aegis_gemm_choice(aegis_context* ctx, int M, int N, int K, char* buf, size_t
   if (M <= 0 || N <= 0 || K <= 0) return fail(AEGIS_ERR_INVALID_ARGUMENT, aegis_status_string(AEGIS_ERR_INVALID_ARGUMENT));
   if (int s = enter(ctx)) return s;
   return copy_out(aegis::matmul_choice(M, N, K), buf, buf_len, needed);
+}
+
+namespace {
+
+// Discovery for the C ABI; device -1: no CUDA call (CPU, memory, thermal; Tegra GPU from sysfs).
+int hw_discover(int device, bool video, aegis::hw::HwInfo* out) {
+  aegis::hw::DiscoverOptions opt;
+  opt.video = video;
+  if (device < 0) {
+    if (device != -1) return fail(AEGIS_ERR_NO_DEVICE, aegis_status_string(AEGIS_ERR_NO_DEVICE));
+    opt.cuda = false;
+    opt.video = false;
+  } else {
+    int count = 0;
+    if (cudaGetDeviceCount(&count) != cudaSuccess || device >= count) {
+      cudaGetLastError();
+      return fail(AEGIS_ERR_NO_DEVICE, aegis_status_string(AEGIS_ERR_NO_DEVICE));
+    }
+    opt.device = device;
+  }
+  *out = aegis::hw::discover(opt);
+  return AEGIS_OK;
+}
+
+}  // namespace
+
+int aegis_hw_info_json(int device, char* buf, size_t buf_len, size_t* needed) {
+  // The size query's snapshot, returned by the next fill on this thread.
+  thread_local bool pending = false;
+  thread_local int pending_device = 0;
+  thread_local std::string snapshot;
+  if (!buf && buf_len != 0) return fail(AEGIS_ERR_INVALID_ARGUMENT, "buf is NULL but buf_len is not 0");
+  if (!(buf && pending && pending_device == device)) {
+    aegis::hw::HwInfo info;
+    if (const int s = hw_discover(device, true, &info); s != AEGIS_OK) return s;
+    snapshot = aegis::hw::to_json(info);
+  }
+  pending = buf == nullptr;
+  pending_device = device;
+  return copy_out(snapshot, buf, buf_len, needed);
+}
+
+int aegis_hw_gpu(int device, aegis_hw_gpu_info* out) {
+  if (!out || out->struct_size < sizeof(uint32_t)) return fail(AEGIS_ERR_INVALID_ARGUMENT, "out is NULL or struct_size unset");
+  if (device < 0) return fail(AEGIS_ERR_NO_DEVICE, aegis_status_string(AEGIS_ERR_NO_DEVICE));
+  aegis::hw::HwInfo info;
+  if (const int s = hw_discover(device, false, &info); s != AEGIS_OK) return s;
+  const aegis::hw::GpuInfo& g = info.gpu;
+  aegis_hw_gpu_info r;
+  std::memset(&r, 0, sizeof r);
+  r.struct_size = uint32_t(sizeof r);
+  r.present = g.present;
+  r.device = g.device;
+  r.arch = g.arch;
+  r.sm_count = g.sm_count;
+  r.regs_per_sm = g.regs_per_sm;
+  r.smem_per_sm = g.smem_per_sm;
+  r.smem_per_block = g.smem_per_block;
+  r.smem_per_block_optin = g.smem_per_block_optin;
+  r.l2_bytes = g.l2_bytes;
+  r.memory_bytes = g.memory_bytes;
+  r.unified = g.unified;
+  r.tma_hardware = g.tma_hardware;
+  r.tma_built = g.tma_built;
+  r.nvml = g.nvml;
+  r.max_sm_clock_mhz = g.max_sm_clock_mhz;
+  r.max_mem_clock_mhz = g.max_mem_clock_mhz;
+  r.power_limit_w = g.power_limit_w;
+  std::snprintf(r.name, sizeof r.name, "%s", g.name.c_str());
+  const uint32_t want = out->struct_size;
+  std::memcpy(out, &r, want < sizeof r ? want : sizeof r);
+  out->struct_size = want < sizeof r ? want : uint32_t(sizeof r);
+  return AEGIS_OK;
+}
+
+int aegis_hw_cpu(aegis_hw_cpu_info* out) {
+  if (!out || out->struct_size < sizeof(uint32_t)) return fail(AEGIS_ERR_INVALID_ARGUMENT, "out is NULL or struct_size unset");
+  aegis::hw::HwInfo info;
+  if (const int s = hw_discover(-1, false, &info); s != AEGIS_OK) return s;
+  const aegis::hw::CpuInfo& c = info.cpu;
+  aegis_hw_cpu_info r;
+  std::memset(&r, 0, sizeof r);
+  r.struct_size = uint32_t(sizeof r);
+  r.logical_cpus = c.logical_cpus;
+  r.clusters = int32_t(c.clusters.size());
+  r.core_types = int32_t(c.core_types.size());
+  r.performance_max_khz = -1;
+  for (const aegis::hw::CoreType& t : c.core_types)
+    if (t.performance) {
+      r.performance_cores += int32_t(t.cpus.size());
+      r.performance_max_khz = t.max_khz > r.performance_max_khz ? t.max_khz : r.performance_max_khz;
+    }
+  r.neon = c.isa.neon; r.fp16 = c.isa.fp16; r.dotprod = c.isa.dotprod; r.sve = c.isa.sve;
+  r.sve2 = c.isa.sve2; r.i8mm = c.isa.i8mm; r.bf16 = c.isa.bf16;
+  const uint32_t want = out->struct_size;
+  std::memcpy(out, &r, want < sizeof r ? want : sizeof r);
+  out->struct_size = want < sizeof r ? want : uint32_t(sizeof r);
+  return AEGIS_OK;
 }
 
 int aegis_device_manifest(int device, char* buf, size_t buf_len, size_t* needed) {

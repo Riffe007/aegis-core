@@ -47,7 +47,7 @@ extern "C" {
 
 /* ABI version: bump the major on any incompatible change. */
 #define AEGIS_ABI_VERSION_MAJOR 1
-#define AEGIS_ABI_VERSION_MINOR 2
+#define AEGIS_ABI_VERSION_MINOR 3
 AEGIS_API int aegis_abi_version(void); /* major * 1000 + minor */
 
 /* Static description of a status code. Never NULL. */
@@ -133,6 +133,65 @@ AEGIS_API int aegis_gemm_choice(aegis_context* ctx, int M, int N, int K, char* b
  * consistent. `needed` (optional) receives the size required including the
  * NUL; pass buf = NULL, buf_len = 0 to query it. */
 AEGIS_API int aegis_device_manifest(int device, char* buf, size_t buf_len, size_t* needed);
+
+/* ---- Hardware discovery (since ABI 1.3) ----------------------------------
+ * What Core runs on: GPU (CUDA device properties; NVML where available, Tegra
+ * sysfs otherwise), CPU (clusters and core types from /sys/devices/system/cpu,
+ * cpufreq ranges, ISA features from getauxval(AT_HWCAP / AT_HWCAP2)), memory,
+ * thermal zones and video engines (NVDEC / NVENC presence and codecs). Fields
+ * no source could read are unknown: -1, "" or JSON null, never a guess. The
+ * C++ API with every field is include/aegis/hw.h.
+ */
+
+/* The full discovery as a JSON document (schema "aegis-hw/1"; the document
+ * tools/aegis_hw and `aegis-perf hw` print), copied NUL-terminated into buf.
+ * Thermal readings change between calls, so a size query (buf = NULL,
+ * buf_len = 0) takes a snapshot for the calling thread and the next call with
+ * a buffer on that thread returns that same snapshot. `needed` (optional)
+ * receives the size required including the NUL. AEGIS_ERR_NO_DEVICE if
+ * `device` is not a CUDA device (the CPU, memory and thermal parts need none:
+ * pass device = -1 for them alone: no CUDA call is made, and the gpu object comes
+ * from Tegra sysfs or has present = false). */
+AEGIS_API int aegis_hw_info_json(int device, char* buf, size_t buf_len, size_t* needed);
+
+/* The GPU part as a struct. Set struct_size = sizeof(aegis_hw_gpu_info) before
+ * the call; a later ABI may append fields, and a library fills at most
+ * struct_size bytes. */
+typedef struct aegis_hw_gpu_info {
+  uint32_t struct_size;
+  int32_t present;               /* 1: a CUDA device answered */
+  int32_t device;
+  int32_t arch;                  /* major * 10 + minor */
+  int32_t sm_count;
+  int32_t regs_per_sm;
+  int64_t smem_per_sm;           /* bytes */
+  int64_t smem_per_block;        /* without opt-in */
+  int64_t smem_per_block_optin;
+  int64_t l2_bytes;
+  int64_t memory_bytes;
+  int32_t unified;               /* 1: device memory is host memory (integrated) */
+  int32_t tma_hardware;          /* 1: arch >= 90 */
+  int32_t tma_built;             /* 1: this library compiled the TMA tier */
+  int32_t nvml;                  /* 1: NVML answered for this device */
+  int32_t max_sm_clock_mhz;      /* -1: unknown */
+  int32_t max_mem_clock_mhz;     /* -1: unknown */
+  double power_limit_w;          /* < 0: not readable */
+  char name[128];
+} aegis_hw_gpu_info;
+AEGIS_API int aegis_hw_gpu(int device, aegis_hw_gpu_info* out);
+
+/* The CPU part as a struct (struct_size as above). Performance cores: the core
+ * type with the highest maximum frequency (then cpu_capacity). */
+typedef struct aegis_hw_cpu_info {
+  uint32_t struct_size;
+  int32_t logical_cpus;
+  int32_t clusters;
+  int32_t core_types;
+  int32_t performance_cores;     /* cores of the performance type(s) */
+  int64_t performance_max_khz;   /* -1: unknown */
+  int32_t neon, fp16, dotprod, sve, sve2, i8mm, bf16;  /* 1: present */
+} aegis_hw_cpu_info;
+AEGIS_API int aegis_hw_cpu(aegis_hw_cpu_info* out);
 
 #ifdef __cplusplus
 }
