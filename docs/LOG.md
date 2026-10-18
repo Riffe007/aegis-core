@@ -1732,3 +1732,103 @@ Dispatch % = 100 / ratio:
 - The nightly sweep times `aegis_matmul` (the dispatch as a caller sees it),
   so the dispatch % is measured, never assumed. `aegis_matmul` is never a winner.
 - The tune table's "% LtBest" is now "kernel %Lt", with a "dispatch" column.
+
+## 2026-10-17 — Tier 5: TMA loads (`mma_tma`), kept
+
+**What.** `src/gemm/mma_tma.cu`: tier 3's warp tiles (`compute_tile`,
+`store_tile` reused) fed by TMA instead of `cp.async`.
+- One elected thread (thread 0) issues `cp.async.bulk.tensor.3d.shared::cta`
+  loads (dims: contiguous, other, batch) into a STAGES-deep smem ring.
+  Completion uses one mbarrier per stage (`arrive.expect_tx`, `try_wait.parity`).
+  All 8 warps consume (no warp specialization yet).
+- 128B hardware swizzle (64B for 32-column boxes). ldmatrix addresses apply
+  the same XOR (byte bits [4,7) ^= bits [7,10)); no manual swizzle in this family.
+- Boundary tiles use TMA's out-of-bounds zero fill; the only masked code left
+  is the epilogue store.
+- Tensor maps: `cuTensorMapEncodeTiled` (driver entry point), passed as
+  `__grid_constant__`, cached per (pointer, shape, layout, ld, batch stride),
+  up to 256 entries per thread. No encode on the hot path once warm.
+- Fallback: a base not 16 B aligned, or an ld or batch stride that is not a
+  multiple of 8 elements, runs tier 4 (`mma_pipe`, STAGES 2) on the same tile.
+  `mma_tma_path()` reports which path a call takes.
+- Built only when every CMake arch is >= 90 (`AEGIS_TMA`). sm_87 never
+  compiles it; the `sm87_gate` passes.
+- `.shared::cluster` as the destination made ptxas emit a remote-CTA check plus
+  `CALL.ABS __cuda_syscall_cp_async_bulk_tensor_3d_tile_unicast` and an 8 B
+  stack frame. `.shared::cta` (PTX ISA 8.6) gives inline `UTMALDG` and 0 stack.
+
+**Correctness.**
+- ctest 201/201, including `tma_paths` and `sm87_gate`. `tma_paths` runs 14
+  cases x 9 impls: aligned, boundary, all 4 layouts, batched, plus 6 that must
+  fall back (misaligned A or B, odd ld, misaligned batch stride). The path and
+  the FP64 tolerance are both checked.
+- fuzz_2000 (poisoned outputs, boundaries, misaligned cases): 0 failures.
+- compute-sanitizer memcheck and racecheck on every `mma_tma` impl x 5 shapes,
+  plus `test_tma`: 92 runs, 0 errors, 0 hazards (artifacts/sanitizer/tma2/).
+- SASS (sm_121): UTMALDG and SYNCS present, 0 LDGSTS, 0 CALL, 0 STL/LDL, stack 0.
+
+**Smem slack bug, found by ncu.** The first tune (run 40abc0790791) had TMA
+128x128x32 s3 at 269 µs vs `mma_pipe` s3 at 237 µs (2048³). ncu showed
+`occupancy_limit_shared_mem` 1 and 5.33 waves. The cause: 49,152 B of stages
++ 1,024 B alignment slack + barriers = 50,200 B, one block per SM. Fix:
+`extern __shared__ __align__(1024)` with no slack (the kernel has no static
+smem; a misaligned base traps), giving 49,176 B and 2 blocks per SM.
+
+**Tune** (run 2d261d8defab, shapes/large-tma.txt, display off, watch clean):
+
+| shape | new winner | kernel %Lt (paired CI) | old winner | old kernel %Lt | dispatch |
+|---|---|---|---|---|---|
+| 2048³ | mma_tma_128x128x32_2x4_s3 | 85.8% (85.7-86.2) | mma_pipe_128x128x32_2x4_s3 | 83.6% | AEGIS |
+| 4096³ | mma_tma_128x256x32_2x4_s4 | 73.3% (73.4-74.3) | mma_pipe_128x128x32_2x4_s3 | 72.2% | cuBLASLt (below 80%) |
+
+TMA configs, tune medians (µs): 2048³ 128x128x32 s3 230.9, 256x128x64 s2
+234.4, 128x256x32 s4 243.2; 4096³ 128x256x32 s4 1972, 256x128x32 s4 2059,
+128x128x32 s3 2066. 128x128x32 s4 and s6, and 128x128x64, lose: one block per SM.
+
+**Paired-ab** (30 pairs, cold, display off, all watches clean). Ratio = B/A time:
+
+| shape | A | B | B/A [95% CI] | paired_results |
+|---|---|---|---|---|
+| 2048³ | mma_pipe_128x128x32_2x4_s3 | mma_tma_128x128x32_2x4_s3 | 0.9719 [0.9690, 0.9796] | 19 |
+| 2048³ | cublaslt_best | mma_tma_128x128x32_2x4_s3 | 1.1653 [1.1578, 1.1700] | 20 |
+| 4096³ | mma_pipe_128x128x32_2x4_s3 | mma_tma_128x256x32_2x4_s4 | 0.9599 [0.9506, 0.9707] | 21 |
+| 4096³ | mma_pipe_256x128x32_4x2_s4 | mma_tma_128x256x32_2x4_s4 | 0.9558 [0.9519, 0.9682] | 22 |
+| 4096³ | cublaslt_best | mma_tma_128x256x32_2x4_s4 | 1.3918 [1.3638, 1.3990] | 23 |
+| 2048³ | cublaslt_best | aegis_matmul | 1.1720 [1.1662, 1.1762] | 24 |
+| 4096³ | cublaslt_best | aegis_matmul | 0.9978 [0.9930, 1.0006] tie | 25 |
+
+| shape | AEGIS kernel % of cublaslt_best | dispatch % (aegis_matmul) |
+|---|---|---|
+| 2048³ | 85.8% (TMA; was 83.6%) | 85.3% (AEGIS kernel) |
+| 4096³ | 71.8% (TMA; was 72.2% in tune 7e94c009266f) | 100.2% (cuBLASLt) |
+
+TMA is 2.8% faster than the old winner at 2048³ and 4.0-4.4% faster at
+4096³. Neither shape reaches the 90% bar.
+
+**ncu** (one launch, base clocks; instructions per HMMA = smsp__inst_executed /
+(MNK / 2048); tensor busy = sm__pipe_tensor_cycles_active % of elapsed):
+
+| kernel | shape | regs | blocks/SM | inst/HMMA | tensor busy | ncu µs |
+|---|---|---|---|---|---|---|
+| mma_pipe_128x128x32_2x4_s3 | 2048³ | 120 | 2 | 4.50 | 50.5% | 330 |
+| mma_tma_128x128x32_2x4_s3 | 2048³ | 94 | 2 | 5.87 | 50.7% | 325 |
+| mma_tma_256x128x64_4x2_s2 | 2048³ | 170 | 1 | 3.73 | 48.2% | 344 |
+| cublaslt_best (nvjet tmaAB) | 2048³ | 255 | 1 | 2.17 | 58.7% | 292 |
+| mma_pipe_128x128x32_2x4_s3 | 4096³ | 120 | 2 | 4.41 | 50.9% | 2578 |
+| mma_tma_128x256x32_2x4_s4 | 4096³ | 166 | 1 | 4.10 | 59.6% | 2204 |
+| mma_tma_128x128x32_2x4_s3 | 4096³ | 94 | 2 | 6.15 | 60.7% | 2164 |
+| cublaslt_best (nvjet tmaAB) | 4096³ | 255 | 1 | 1.92 | 80.9% | 1653 |
+
+- TMA removes the barrier and MIO stalls (barrier stalls per issue: 3.66 ->
+  0.46 at 2048³, 128x128) and the LDGSTS address math.
+- The 128x128 TMA kernel at 94 registers executes *more* instructions per
+  HMMA than its cp.async twin (5.87 vs 4.50). The stall on the barrier wait
+  loop (`try_wait` spin) and the per-k-tile ldmatrix address XOR are the likely
+  sources (hypothesis; not separated).
+- cuBLASLt runs ~2 instructions per HMMA at 255 registers and one block per SM.
+  The gap is instruction overhead per HMMA plus tensor-pipe feed, not memory.
+  Next levers: a warp-specialized producer (no consumer spin), larger warp
+  tiles (fewer ldmatrix per HMMA), precomputed swizzled offsets.
+
+Other shapes were not tuned with `mma_tma` (step scope: 2048³ and 4096³);
+their winners are unchanged.

@@ -163,4 +163,29 @@ inline constexpr MmaPipeConfig MMA_PIPE_CONFIGS[] = {
 };
 std::span<const KernelEntry> mma_pipe_entries();
 
+// ---------------------------------------------------------------------------
+// Tier 5: tier 4's tensor-core loop with TMA (cp.async.bulk.tensor) loads into
+// a STAGES-deep ring, mbarrier completion, TMA's 128B/64B hardware swizzle and
+// out-of-bounds zero fill (src/gemm/mma_tma.cu). sm_90+ only; problems TMA
+// cannot take (misaligned pointers, ld or batch strides; batch-shared operands;
+// devices below sm_90) run tier 4's kernel on the same tile.
+// Name: mma_tma_<BM>x<BN>x<BK>_<WM>x<WN>_s<STAGES>. Smem per block:
+// STAGES * (BM + BN) * BK * 2 + 1024 (alignment) + 8 * STAGES (barriers),
+// within sm_121's 101,376 B.
+// ---------------------------------------------------------------------------
+inline constexpr MmaPipeConfig MMA_TMA_CONFIGS[] = {
+    {128, 128, 32, 2, 4, 3},
+    {128, 128, 32, 2, 4, 4},
+    {128, 128, 32, 2, 4, 6},
+    {128, 128, 64, 2, 4, 2},
+    {128, 128, 64, 2, 4, 3},
+    {256, 128, 32, 4, 2, 3},
+    {256, 128, 32, 4, 2, 4},
+    {128, 256, 32, 2, 4, 4},
+    {256, 128, 64, 4, 2, 2},
+};
+std::span<const KernelEntry> mma_tma_entries();
+// Which path an mma_tma impl takes for p: "tma" or "cp.async (mma_pipe)".
+const char* mma_tma_path(const GemmParams& p);
+
 }  // namespace aegis::gemm

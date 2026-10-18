@@ -1,0 +1,3 @@
+# 2026-10-17 TMA experiment: the two large-shape gaps.
+2048 2048 2048
+4096 4096 4096

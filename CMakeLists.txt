@@ -20,15 +20,35 @@ find_package(CUDAToolkit REQUIRED)
 # -lineinfo keeps source<->SASS correlation for Nsight Compute and sass_dump.
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -lineinfo --expt-relaxed-constexpr -Xptxas=-v")
 
+# TMA (tier 5, mma_tma) needs sm_90+: registered (AEGIS_TMA) only when every
+# target architecture has it. sm_87 (Jetson) builds compile the family to empty
+# kernels and keep tier 4 (cp.async); the sm87_gate checks they compile.
+set(AEGIS_ARCHS "${CMAKE_CUDA_ARCHITECTURES}")
+if(AEGIS_ARCHS STREQUAL "native")
+  set(AEGIS_ARCHS "${CMAKE_CUDA_ARCHITECTURES_NATIVE}")
+endif()
+set(AEGIS_TMA ON)
+foreach(arch ${AEGIS_ARCHS})
+  string(REGEX MATCH "^[0-9]+" arch_num "${arch}")
+  if(arch_num LESS 90)
+    set(AEGIS_TMA OFF)
+  endif()
+endforeach()
+message(STATUS "AEGIS: CUDA architectures ${AEGIS_ARCHS}; TMA family (mma_tma): ${AEGIS_TMA}")
+
 add_library(aegis_kernels STATIC
   src/gemm/naive.cu
   src/gemm/tiled.cu
   src/gemm/regblock.cu
   src/gemm/mma.cu
   src/gemm/mma_pipe.cu
+  src/gemm/mma_tma.cu
   src/gemm/registry.cu
 )
 target_include_directories(aegis_kernels PUBLIC include)
+if(AEGIS_TMA)
+  target_compile_definitions(aegis_kernels PUBLIC AEGIS_TMA=1)
+endif()
 # PIC: the kernels also go into the shared C ABI library.
 set_target_properties(aegis_kernels PROPERTIES CUDA_SEPARABLE_COMPILATION OFF
                                                POSITION_INDEPENDENT_CODE ON)
@@ -115,6 +135,12 @@ set(AEGIS_IMPLS
   mma_pipe_128x256x32_2x4_s2 mma_pipe_128x256x32_2x4_s3 mma_pipe_128x256x32_2x4_s4
   mma_pipe_256x128x32_4x2_s2 mma_pipe_256x128x32_4x2_s3 mma_pipe_256x128x32_4x2_s4
 )
+if(AEGIS_TMA)
+  list(APPEND AEGIS_IMPLS
+    mma_tma_128x128x32_2x4_s3 mma_tma_128x128x32_2x4_s4 mma_tma_128x128x32_2x4_s6
+    mma_tma_128x128x64_2x4_s2 mma_tma_128x128x64_2x4_s3 mma_tma_256x128x32_4x2_s3
+    mma_tma_256x128x32_4x2_s4 mma_tma_128x256x32_2x4_s4 mma_tma_256x128x64_4x2_s2)
+endif()
 foreach(impl ${AEGIS_IMPLS})
   # 127x129x65: scalar fallback. 200x136x72: 16-byte path with partial edge tiles.
   foreach(shape "127;129;65" "200;136;72" "1;896;896" "16;4864;896" "256;256;256")
@@ -149,7 +175,7 @@ add_test(NAME fuzz_modes_same_cases COMMAND ${CMAKE_SOURCE_DIR}/tests/test_fuzz_
 option(AEGIS_SM87_GATE "Also compile every kernel for sm_87 (compile only) and test its resources" OFF)
 if(AEGIS_SM87_GATE)
   set(AEGIS_SM87_SOURCES
-    src/gemm/naive.cu src/gemm/tiled.cu src/gemm/regblock.cu src/gemm/mma.cu src/gemm/mma_pipe.cu
+    src/gemm/naive.cu src/gemm/tiled.cu src/gemm/regblock.cu src/gemm/mma.cu src/gemm/mma_pipe.cu src/gemm/mma_tma.cu
     src/gemm/registry.cu src/matmul.cu src/bench/harness.cu
     microbench/ptr_chase.cu microbench/mma_latency.cu microbench/mma_throughput.cu
     microbench/ldmatrix.cu microbench/smem_banks.cu microbench/cp_async.cu microbench/dram_bw.cu
@@ -207,6 +233,14 @@ set_tests_properties(idle_watch_paths PROPERTIES RUN_SERIAL TRUE)
 add_executable(test_idle_rule tests/test_idle_rule.cu)
 target_link_libraries(test_idle_rule PRIVATE aegis_bench_harness)
 add_test(NAME idle_rule COMMAND test_idle_rule)
+
+# mma_tma: TMA path vs the cp.async fallback (misaligned pointers, ld, strides)
+# and boundary tiles via TMA zero fill, every layout, against the FP64 reference.
+if(AEGIS_TMA)
+  add_executable(test_tma tests/test_tma.cu)
+  target_link_libraries(test_tma PRIVATE aegis_bench_harness)
+  add_test(NAME tma_paths COMMAND test_tma)
+endif()
 
 # GPU lock (CLAUDE.md rule 15): every test except the compile-only sm87_gate
 # touches the GPU, is labelled "gpu" and requires the gpu_lock_guard fixture,

@@ -33,6 +33,9 @@ std::span<const KernelEntry> registry() {
         {"tiled", CONFIG_tiled, &launch_tiled, &attrs_tiled, nullptr},  // legacy: row-major only
     };
     for (auto tier : {regblock_entries(), mma_entries(), mma_pipe_entries()}) v.insert(v.end(), tier.begin(), tier.end());
+#ifdef AEGIS_TMA  // every target architecture is sm_90+ (CMakeLists.txt)
+    for (const KernelEntry& e : mma_tma_entries()) v.push_back(e);
+#endif
     return v;
   }();
   return all;
