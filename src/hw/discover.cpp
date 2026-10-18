@@ -24,6 +24,7 @@
 #include <sstream>
 
 #include "device.h"
+#include "profile.h"
 
 namespace aegis::hw {
 namespace {
@@ -684,6 +685,13 @@ HwInfo discover(const DiscoverOptions& opt) {
   h.memory = discover_memory(opt);
   h.thermal = discover_thermal(opt);
   h.gpu = discover_gpu(opt, &h.video);
+  if (h.gpu.source == "cuda" && cudaSetDevice(opt.device) == cudaSuccess) {
+    const Profile& p = current_profile();
+    h.profile.label = p.label();
+    h.profile.source = p.source;
+    h.profile.mismatch = p.mismatch;
+  }
+  cudaGetLastError();
   return h;
 }
 
@@ -723,6 +731,8 @@ std::string to_json(const HwInfo& h) {
   o += "],\"isa\":{\"neon\":" + b(c.isa.neon) + ",\"fp16\":" + b(c.isa.fp16) + ",\"dotprod\":" + b(c.isa.dotprod) +
        ",\"sve\":" + b(c.isa.sve) + ",\"sve2\":" + b(c.isa.sve2) + ",\"i8mm\":" + b(c.isa.i8mm) +
        ",\"bf16\":" + b(c.isa.bf16) + ",\"hwcap\":" + hw + ",\"source\":" + esc(c.isa.source) + "}},\n";
+  o += " \"profile\":{\"label\":" + esc(h.profile.label) + ",\"source\":" + esc(h.profile.source) +
+       ",\"mismatch\":" + esc(h.profile.mismatch) + "},\n";
   o += " \"memory\":{\"total_bytes\":" + std::to_string(h.memory.total_bytes) +
        ",\"available_bytes\":" + std::to_string(h.memory.available_bytes) + ",\"source\":" + esc(h.memory.source) + "},\n";
   o += " \"thermal\":[";

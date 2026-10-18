@@ -13,6 +13,7 @@
 
 #include <atomic>
 #include <cstddef>
+#include <string>
 
 namespace aegis::hw {
 
@@ -21,6 +22,7 @@ inline constexpr int kMaxCachedDevices = 64;
 
 struct DeviceLimits {
   int device = -1;
+  std::string name;                   // cudaDeviceProp::name
   int arch = 0;                       // major * 10 + minor
   int sm_count = 0;                   // multiProcessorCount
   size_t smem_per_sm = 0;             // sharedMemPerMultiprocessor

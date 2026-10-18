@@ -2216,3 +2216,41 @@ Spark discovery (live): GB10, sm_121, 48 SMs, 100 KiB smem per SM (99 KiB opt-in
 Supported). CPU: 2 clusters, 10 Cortex-X925 (1378-3900 MHz, performance) and 10 Cortex-A725
 (338-2808 MHz); NEON, fp16, dotprod, SVE, SVE2, i8mm, bf16. NVDEC: MPEG2, MPEG4, VC1, H264,
 HEVC, VP8, VP9, AV1. NVENC: H264, HEVC, AV1.
+
+## 2026-10-18 — aegis-hw step 3: device profiles
+
+- **Resolution:** `src/hw/profile.{h,cpp}`. `hw::current_profile()` resolves the device's
+  profile once per device, in order:
+  1. `$AEGIS_PROFILE_DIR/sm_<arch>.json`;
+  2. the arch files compiled into the library (CMake writes `generated/arch_profiles.cpp`
+     from `include/aegis/arch/sm_*.json`, so an installed library has them);
+  `AEGIS_PROFILE_EMBEDDED=0` turns step 2 off.
+- **Matching:** a file matches only when its sm_arch, sm_count, device name and l2_bytes all
+  equal the device's. Arch alone is not enough: sm_87 spans Orin Nano and AGX Orin.
+  `src/hw/json_lite.h` is a minimal reader for Core's own JSON.
+- **No match:** an unmeasured profile. Identity comes from the device query; read / copy
+  bandwidth, mma peak and L2 / DRAM latency are -1 (unknown), not datasheet values (rule 8). The
+  first lookup prints one warning to stderr:
+  `aegis: unmeasured device <name> (sm_X, N SMs): <reason>. Using conservative defaults from the
+  device query; run aegis-perf calibrate.`
+  Nothing at run time reads a measured roof yet, so "conservative" is the device's own limits
+  (SM count, smem, L2) and unknown roofs.
+- **Rows:**
+  - Every bench_gemm / aegis_tune row (measurements and paired) carries `"profile"`, as do
+    microbench rows (`mb::emit`, `emit_clocked`; the probes now link aegis_kernels).
+    paired-ab stores the label of its rows ("mixed" if A and B disagree).
+  - Perf DB schema v5: `profile` on measurements, paired, microbench and paired_results. The
+    DB was migrated, backup `results/aegis_perf.db.bak-v4-2026-10-18`. aegis-perf 0.6.0.
+  - `aegis_hw` / `aegis-perf hw` print a `profile` section.
+- **On the Spark:** measured (embedded sm_121.json). `AEGIS_PROFILE_EMBEDDED=0` gives
+  unmeasured, with the warning.
+- **Tests:**
+  - ctest `hw_profile`, 12 checks: the embedded file matches the device; a 24-SM device, another
+    name, another L2 size and invalid JSON are each unmeasured with their reason; simulated
+    sm_87 is unmeasured; and in a child process with embedded profiles off, the real device is
+    unmeasured, warns exactly once across 3 lookups and 2 matmul calls, and matmul still runs.
+  - ctest `hw_profile_row_label`: a bench row says `"profile":"unmeasured"`.
+  - Rust `ingest_stores_the_profile_label`.
+- **Hardening:** memcheck `test_hw_profile`, `test_matmul` (API errors off; see step 1), and
+  bench_gemm through aegis_matmul and a decode kernel, measured and unmeasured. 0 errors
+  (`artifacts/sanitizer/hw-step3/`).

@@ -1,6 +1,7 @@
 // The AEGIS timing protocol (see harness.h), protocol v1 and v2, the timer
 // resolution probe and the NVML idle guard.
 #include "harness.h"
+#include "hw/profile.h"
 #include "gpu_budget.h"
 #include "lt_algo.h"
 
@@ -144,6 +145,8 @@ Harness::Harness() {
   int dev = 0;
   AEGIS_CUDA_CHECK(cudaGetDevice(&dev));
   AEGIS_CUDA_CHECK(cudaGetDeviceProperties(&prop_, dev));
+  // Resolve the device profile now (prints the one-time unmeasured-device warning first).
+  aegis::hw::current_profile();
   AEGIS_CUDA_CHECK(cudaRuntimeGetVersion(&runtime_));
   AEGIS_CUDA_CHECK(cudaDriverGetVersion(&driver_));
   AEGIS_CUDA_CHECK(cudaStreamCreate(&stream_));
@@ -425,14 +428,14 @@ std::string Harness::json_row(const char* impl, const Impl& impl_e, const Proble
         "\"regs\":%d,\"smem_bytes\":%zu,\"local_bytes\":%zu,"
         "\"device\":\"%s\",\"sm_arch\":%d%d,\"cuda_runtime\":%d,\"cuda_driver\":%d,"
         "\"timer_res_ns\":%.1f,\"protocol_version\":%d,\"batch_n\":%lld,\"window_ms\":%.4f,"
-        "\"cache_mode\":\"%s\",\"buffer_sets\":%d%s}",
+        "\"cache_mode\":\"%s\",\"buffer_sets\":%d,\"profile\":\"%s\"%s}",
         impl, config, M, N, K, t.median_us, t.p10_us, t.p90_us, tflops, gbps, t.reps,
         c.checked ? "true" : "false", c.pass ? "true" : "false", c.max_abs_err, c.rel_err,
         e ? attrs.numRegs : -1, e ? attrs.sharedSizeBytes : size_t(0),
         e ? attrs.localSizeBytes : size_t(0), prop_.name, prop_.major, prop_.minor, runtime_,
         driver_, timer_.tick_ns, t.protocol_version, t.batch_n, t.window_ms,
         t.protocol_version == 1 ? "flush_per_launch" : cache_mode_name(t.cache), t.buffer_sets,
-        extra.c_str());
+        aegis::hw::current_profile().label(), extra.c_str());
   };
   std::string s(size_t(print(nullptr, 0)), '\0');
   print(s.data(), s.size() + 1);

@@ -675,6 +675,7 @@ mod tests {
                     finished_at: "2026-10-15T00:05:00+00:00".into(),
                     disturbed: None,
                     disturbed_detail: None,
+                    profile: None,
                 }
             };
             crate::ab::store(&con, &r("abc123-dirty", "mma_a", (4096, 4096, 4096), Some(2.9), 0.983, 1.016)).unwrap();

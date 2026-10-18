@@ -25,9 +25,11 @@ pub const SCHEMA: &str = include_str!("schema.sql");
 ///    microbench and paired_results;
 /// 4: lt_algo (the cuBLASLt algorithm cublaslt_best picked, every config
 ///    attribute, JSON) on measurements and winners.
+/// 5: profile ("measured" / "unmeasured": did the device match its arch profile,
+///    src/hw/profile.h) on measurements, paired, microbench and paired_results.
 /// Bump it with every migration in migrate(). connect() backs the DB up
 /// (VACUUM INTO <db>.bak-v<old>-<date>) before migrating an older one.
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 
 /// The DB's schema version: None when it has no schema_version table (a v1
 /// DB, or not yet created).
@@ -169,6 +171,11 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     // config attribute; src/lt_algo.h), so aegis::matmul can rebuild it.
     ("measurements", "lt_algo", "TEXT"),
     ("winners", "lt_algo", "TEXT"),
+    // v5: the device profile the row was measured under (NULL: before v5).
+    ("measurements", "profile", "TEXT"),
+    ("paired", "profile", "TEXT"),
+    ("microbench", "profile", "TEXT"),
+    ("paired_results", "profile", "TEXT"),
 ];
 
 /// Reference implementations: always eligible (they are what --check compares
@@ -436,8 +443,8 @@ pub fn cmd_ingest(
         tx.execute(
             "INSERT INTO measurements (run_id, kernel_id, dtype, m, n, k, median_us, p10_us, p90_us, \
              tflops, gbps, reps, checked, pass, max_abs_err, rel_err, power_w, protocol_version, batch_n, \
-             timer_res_ns, cache_mode, buffer_sets, window_ms, allow_busy, idle_util_pct, lt_algo) \
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+             timer_res_ns, cache_mode, buffer_sets, window_ms, allow_busy, idle_util_pct, lt_algo, profile) \
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             params![
                 run_id, kid, sql(Some(get(r, "dtype")?)),
                 sql(Some(get(s, "M")?)), sql(Some(get(s, "N")?)), sql(Some(get(s, "K")?)),
@@ -456,6 +463,7 @@ pub fn cmd_ingest(
                 r.get("allow_busy").and_then(Value::as_bool).unwrap_or(false) as i64,
                 sql(r.get("idle_util_pct")),
                 r.get("lt").filter(|v| v.is_object()).map(dumps_sorted),
+                r.get("profile").and_then(Value::as_str),
             ],
         )?;
     }
@@ -464,7 +472,7 @@ pub fn cmd_ingest(
         tx.execute(
             "INSERT INTO paired (run_id, op, dtype, m, n, k, a_impl, b_impl, role, pairs, ratio_median, \
              ratio_ci_lo, ratio_ci_hi, tied, bootstrap_resamples, bootstrap_seed, protocol_version, cache_mode, \
-             allow_busy) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+             allow_busy, profile) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             params![
                 run_id, sql(Some(get(r, "op")?)), sql(Some(get(r, "dtype")?)),
                 sql(Some(get(s, "M")?)), sql(Some(get(s, "N")?)), sql(Some(get(s, "K")?)),
@@ -473,6 +481,7 @@ pub fn cmd_ingest(
                 sql(Some(get(r, "ratio_ci_hi")?)), get(r, "tied")?.as_bool().unwrap_or(false) as i64,
                 sql(r.get("bootstrap_resamples")), sql(r.get("bootstrap_seed")), sql(r.get("protocol_version")),
                 sql(r.get("cache_mode")), r.get("allow_busy").and_then(Value::as_bool).unwrap_or(false) as i64,
+                r.get("profile").and_then(Value::as_str),
             ],
         )?;
     }
@@ -532,8 +541,8 @@ pub fn cmd_ingest_microbench(
     for r in &rows {
         let probe = get(r, "probe")?.as_str().unwrap_or_default().to_string();
         tx.execute(
-            "INSERT INTO microbench (run_id, probe, param_json, value, unit, sm_clock_mhz, clocks_locked, clock_lock) \
-             VALUES (?,?,?,?,?,?,?,?)",
+            "INSERT INTO microbench (run_id, probe, param_json, value, unit, sm_clock_mhz, clocks_locked, clock_lock, \
+             profile) VALUES (?,?,?,?,?,?,?,?,?)",
             params![
                 run_id,
                 probe,
@@ -543,6 +552,7 @@ pub fn cmd_ingest_microbench(
                 r.get("sm_clock_mhz").and_then(Value::as_f64),
                 r.get("clocks_locked").and_then(Value::as_bool).map(i64::from),
                 r.get("clock_lock").and_then(Value::as_str),
+                r.get("profile").and_then(Value::as_str),
             ],
         )?;
         if !probes.contains(&probe) {
@@ -1123,6 +1133,39 @@ mod tests {
         format!(
             r#"{{"op":"gemm","impl":"x","config":{{}},"shape":{{"M":8,"N":8,"K":8}},"dtype":"f16f32f16","median_us":1.0,"p10_us":1.0,"p90_us":1.0,"tflops":1.0,"gbps":1.0,"reps":1,"checked":true,"pass":true,"max_abs_err":0.0,"rel_err":0.0,"sm_arch":121,"protocol_version":2,"cache_mode":"cold","idle_util_pct":{idle},"idle_source":"nvml","allow_busy":{busy}}}"#
         )
+    }
+
+    /// v5: a row's device profile label is stored on measurements, paired and
+    /// microbench rows; rows without one (older builds) store NULL.
+    #[test]
+    fn ingest_stores_the_profile_label() {
+        let db = tmp("profile.db");
+        let _ = std::fs::remove_file(&db);
+        let f = tmp("profile.jsonl");
+        let labelled = row(0.1, false).replacen("\"op\":\"gemm\"", "\"op\":\"gemm\",\"profile\":\"unmeasured\"", 1);
+        let paired = r#"{"kind":"paired","op":"gemm","dtype":"f16f32f16","shape":{"M":8,"N":8,"K":8},"a":"x","b":"y","role":"runner_up","pairs":30,"ratio_median":1.0,"ratio_ci_lo":0.99,"ratio_ci_hi":1.01,"tied":true,"protocol_version":2,"cache_mode":"cold","profile":"measured"}"#;
+        std::fs::write(&f, format!("{labelled}\n{}\n{paired}\n", row(0.1, false))).unwrap();
+        cmd_ingest(&db, &f, None, Some("p".into()), None).unwrap();
+        std::fs::remove_file(&f).ok();
+        let mb = tmp("profile-mb.jsonl");
+        std::fs::write(&mb, r#"{"probe":"p","param":{},"value":1.0,"unit":"ns","sm_arch":121,"profile":"unmeasured"}"#.to_string() + "\n").unwrap();
+        let idle = RunIdle { pct: Some(0.1), source: Some("nvml".into()), allow_busy: false };
+        cmd_ingest_microbench(&db, &mb, None, Some("mb".into()), &idle).unwrap();
+        std::fs::remove_file(&mb).ok();
+        let con = connect(&db).unwrap();
+        let labels: Vec<Option<String>> = con
+            .prepare("SELECT profile FROM measurements WHERE run_id = 'p' ORDER BY rowid")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(labels, vec![Some("unmeasured".to_string()), None]);
+        let p: Option<String> = con.query_row("SELECT profile FROM paired WHERE run_id = 'p'", [], |r| r.get(0)).unwrap();
+        assert_eq!(p.as_deref(), Some("measured"));
+        let m: Option<String> = con.query_row("SELECT profile FROM microbench WHERE run_id = 'mb'", [], |r| r.get(0)).unwrap();
+        assert_eq!(m.as_deref(), Some("unmeasured"));
+        std::fs::remove_file(&db).ok();
     }
 
     /// Every run row stores the idle guard's reading: an idle run, and a busy

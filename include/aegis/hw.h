@@ -101,6 +101,11 @@ struct VideoInfo {
 struct HwInfo {
   std::string host;
   GpuInfo gpu;
+  // The device profile (src/hw/profile.h): did an arch file match the CUDA device.
+  struct {
+    std::string label;     // "measured", "unmeasured", or "" (no CUDA device queried)
+    std::string source, mismatch;
+  } profile;
   CpuInfo cpu;
   MemoryInfo memory;
   std::vector<ThermalZone> thermal;

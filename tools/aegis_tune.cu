@@ -40,6 +40,7 @@
 
 #include "aegis/gemm.h"
 #include "bench/harness.h"
+#include "hw/profile.h"
 
 namespace {
 
@@ -231,9 +232,10 @@ int main(int argc, char** argv) {
             "{\"kind\":\"paired\",\"op\":\"gemm\",\"dtype\":\"f16f32f16\",\"shape\":{\"M\":%d,\"N\":%d,\"K\":%d},"
             "\"a\":\"%s\",\"b\":\"%s\",\"role\":\"%s\",\"pairs\":%d,\"ratio_median\":%.5f,"
             "\"ratio_ci_lo\":%.5f,\"ratio_ci_hi\":%.5f,\"tied\":%s,\"batch_a\":%lld,\"batch_b\":%lld,"
-            "\"bootstrap_resamples\":%d,\"bootstrap_seed\":%llu,\"protocol_version\":2,\"cache_mode\":\"cold\"%s}\n",
+            "\"bootstrap_resamples\":%d,\"bootstrap_seed\":%llu,\"protocol_version\":2,\"cache_mode\":\"cold\",\"profile\":\"%s\"%s}\n",
             s.M, s.N, s.K, w.name, o.name, role, r.pairs, r.median, r.ci_lo, r.ci_hi, r.tied ? "true" : "false",
-            r.batch_a, r.batch_b, aegis::bench::kBootstrapResamples, shape_seed, idle_json.c_str());
+            r.batch_a, r.batch_b, aegis::bench::kBootstrapResamples, shape_seed, aegis::hw::current_profile().label(),
+            idle_json.c_str());
         std::fflush(stdout);
         std::fprintf(stderr, "  paired %-28s vs %-28s ratio %.4f [%.4f, %.4f] %s\n", w.name, o.name, r.median,
                      r.ci_lo, r.ci_hi, r.tied ? "TIED" : "");

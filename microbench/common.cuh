@@ -30,6 +30,7 @@
 #include <utility>
 #include <vector>
 
+#include "hw/profile.h"        // the device profile label on every row (aegis-hw step 3)
 #include "bench/gpu_budget.h"  // every probe allocates through the GPU budget (CLAUDE.md rule 13)
 
 #define MB_CHECK(expr)                                                         \
@@ -71,8 +72,9 @@ inline void emit(const Device& d, const char* probe, const std::string& param, d
                  const char* unit) {
   std::printf(
       "{\"probe\":\"%s\",\"param\":%s,\"value\":%.6g,\"unit\":\"%s\",\"device\":\"%s\","
-      "\"sm_arch\":%d,\"cuda_runtime\":%d,\"cuda_driver\":%d}\n",
-      probe, param.c_str(), value, unit, d.prop.name, d.sm_arch, d.runtime, d.driver);
+      "\"sm_arch\":%d,\"cuda_runtime\":%d,\"cuda_driver\":%d,\"profile\":\"%s\"}\n",
+      probe, param.c_str(), value, unit, d.prop.name, d.sm_arch, d.runtime, d.driver,
+      aegis::hw::current_profile().label());
   std::fflush(stdout);
 }
 

@@ -25,6 +25,7 @@ cudaError_t query(int dev, DeviceLimits* out) {
   if (const cudaError_t e = cudaGetDeviceProperties(&p, dev); e != cudaSuccess) return e;
   DeviceLimits d;
   d.device = dev;
+  d.name = p.name;
   d.arch = p.major * 10 + p.minor;
   d.sm_count = p.multiProcessorCount;
   d.smem_per_sm = p.sharedMemPerMultiprocessor;

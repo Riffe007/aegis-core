@@ -38,7 +38,7 @@ pub struct AbArgs<'a> {
 }
 
 /// One bench_gemm run: (median_us, protocol_version).
-fn run_once(bench: &Path, impl_: &str, (m, n, k): (i64, i64, i64), reps: u32, cache: &str) -> Result<(f64, i64)> {
+fn run_once(bench: &Path, impl_: &str, (m, n, k): (i64, i64, i64), reps: u32, cache: &str) -> Result<(f64, i64, Option<String>)> {
     let out = crate::gpujob::command(bench)?
         .args(["--impl", impl_, "--m", &m.to_string(), "--n", &n.to_string(), "--k", &k.to_string()])
         .args(["--reps", &reps.to_string(), "--warmup", "3", "--cache", cache])
@@ -52,6 +52,7 @@ fn run_once(bench: &Path, impl_: &str, (m, n, k): (i64, i64, i64), reps: u32, ca
     Ok((
         v["median_us"].as_f64().context("bench_gemm row without median_us")?,
         v["protocol_version"].as_i64().unwrap_or(1),
+        v["profile"].as_str().map(str::to_string),
     ))
 }
 
@@ -127,6 +128,9 @@ pub struct NewPairedResult {
     /// above the limit mid-run; None not watched.
     pub disturbed: Option<bool>,
     pub disturbed_detail: Option<String>,
+    /// The device profile both builds ran under ("measured" / "unmeasured"); "mixed" if
+    /// their rows disagree; None if no row carried one (builds before schema v5).
+    pub profile: Option<String>,
 }
 
 /// Insert one result; returns its id.
@@ -134,12 +138,12 @@ pub fn store(con: &rusqlite::Connection, r: &NewPairedResult) -> Result<i64> {
     let (m, n, k) = r.shape;
     con.execute(
         "INSERT INTO paired_results (sha_a, sha_b, shape, impl_a, impl_b, ratio, ci_lo, ci_hi, n, protocol_version, \
-         cache_mode, idle_reading, clocks_locked, started_at, finished_at, disturbed, disturbed_detail) \
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+         cache_mode, idle_reading, clocks_locked, started_at, finished_at, disturbed, disturbed_detail, profile) \
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         params![
             r.sha_a, r.sha_b, format!("{m}x{n}x{k}"), r.impl_a, r.impl_b, r.ratio, r.ci_lo, r.ci_hi, r.n as i64,
             r.protocol_version, r.cache_mode, r.idle_reading, r.clocks_locked as i64, r.started_at, r.finished_at,
-            r.disturbed.map(i64::from), r.disturbed_detail,
+            r.disturbed.map(i64::from), r.disturbed_detail, r.profile,
         ],
     )?;
     Ok(con.last_insert_rowid())
@@ -159,6 +163,7 @@ pub fn cmd_paired_ab(a: &AbArgs) -> Result<()> {
     let watch = crate::watch::Watch::start(a.b)?;
     let (mut ta, mut tb, mut ratios) = (Vec::new(), Vec::new(), Vec::new());
     let mut protocols = Vec::new();
+    let mut profiles: Vec<Option<String>> = Vec::new();
     for i in 0..a.pairs {
         // Alternate which side runs first so neither always follows the other.
         let (x, y) = if i % 2 == 0 {
@@ -172,6 +177,7 @@ pub fn cmd_paired_ab(a: &AbArgs) -> Result<()> {
         tb.push(y.0);
         ratios.push(y.0 / x.0);
         protocols.extend([x.1, y.1]);
+        profiles.extend([x.2, y.2]);
     }
     let finished_at = now();
     let report = watch.finish()?;
@@ -198,6 +204,11 @@ pub fn cmd_paired_ab(a: &AbArgs) -> Result<()> {
         finished_at,
         disturbed: report.disturbed,
         disturbed_detail: Some(report.detail()),
+        profile: match profiles.iter().flatten().collect::<std::collections::BTreeSet<_>>() {
+            s if s.is_empty() => None,
+            s if s.len() == 1 => s.into_iter().next().cloned(),
+            _ => Some("mixed".to_string()),
+        },
     };
     let id = store(&crate::db::connect(a.db)?, &result)?;
     println!(

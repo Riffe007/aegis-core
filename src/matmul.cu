@@ -13,6 +13,7 @@
 #include "aegis/matmul.h"
 #include "gemm/workspace.h"
 #include "hw/device.h"
+#include "hw/profile.h"
 #include "lt_algo.h"
 
 // One generated table per arch; a missing file just means no tuned winners.
@@ -339,6 +340,7 @@ cudaError_t matmul(const gemm::GemmParams& p, cudaStream_t stream) {
   if (const cudaError_t e = gemm::validate(p); e != cudaSuccess)
     return fail(e, "aegis::matmul: invalid GEMM parameters");
   if (gemm::is_empty(p)) return cudaSuccess;
+  hw::current_profile();  // cached; the first call on an unmeasured device prints the warning
   if (p.alpha == 0.f) return scale_c(p, stream);  // BLAS: A*B does not contribute
   const detail::Winner* w = select_winner(p.M, p.N, p.K);
   if (to_cublaslt(w)) return cublaslt_gemm(p, stream, stored_for(w, p));  // dispatch floor

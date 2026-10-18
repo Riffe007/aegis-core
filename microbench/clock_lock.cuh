@@ -132,9 +132,10 @@ inline void emit_clocked(const Device& d, const char* probe, const std::string& 
     if (c == '"' || c == '\\') c = '\'';
   std::printf(
       "{\"probe\":\"%s\",\"param\":%s,\"value\":%.6g,\"unit\":\"%s\",\"device\":\"%s\","
-      "\"sm_arch\":%d,\"cuda_runtime\":%d,\"cuda_driver\":%d,\"sm_clock_mhz\":%.2f,\"clocks_locked\":%s,"
+      "\"sm_arch\":%d,\"cuda_runtime\":%d,\"cuda_driver\":%d,\"profile\":\"%s\",\"sm_clock_mhz\":%.2f,\"clocks_locked\":%s,"
       "\"clock_lock\":\"%s\"}\n",
-      probe, param.c_str(), value, unit, d.prop.name, d.sm_arch, d.runtime, d.driver, clk.mhz(),
+      probe, param.c_str(), value, unit, d.prop.name, d.sm_arch, d.runtime, d.driver,
+      aegis::hw::current_profile().label(), clk.mhz(),
       clk.locked() ? "true" : "false", detail.c_str());
   std::fflush(stdout);
 }

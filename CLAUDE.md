@@ -45,7 +45,7 @@ rust/target/release/aegis-perf sweep              # shape sweep -> results/*.jso
 rust/target/release/aegis-perf report             # % of cuBLAS per shape
 rust/target/release/aegis-perf tune               # aegis_tune: every config x shapes/default.txt -> winners
 rust/target/release/aegis-perf emit-header        # winners -> include/aegis/winners/sm_<arch>.h (commit it)
-rust/target/release/aegis-perf init               # create / migrate the perf DB (schema v4; backs up first: <db>.bak-v<old>-<date>)
+rust/target/release/aegis-perf init               # create / migrate the perf DB (schema v5; backs up first: <db>.bak-v<old>-<date>)
 rust/target/release/aegis-perf roofline --arch 121  # results/roofline-sm121.svg from measured roofs
 rust/target/release/aegis-perf emit-arch --arch 121  # include/aegis/arch/sm_121.json: measured L2/DRAM latency, DRAM bw, mma peak
 tools/sass_dump.sh                                # SASS + register usage per kernel
@@ -414,6 +414,18 @@ only to compare with old rows (`--protocol 1`).
     not once per process.
   - Tests size against simulated profiles with `hw::ScopedSimulation`
     (ctest `hw_sizing`: 24 / 48 / 96 SMs).
+- **Device profiles (aegis-hw step 3, `src/hw/profile.h`).**
+  - `include/aegis/arch/sm_<arch>.json` is compiled into the library (CMake) and used
+    only when its sm_arch, sm_count, device name and l2_bytes all match the detected
+    device. `$AEGIS_PROFILE_DIR/sm_<arch>.json` takes precedence;
+    `AEGIS_PROFILE_EMBEDDED=0` turns the compiled-in files off.
+  - No match: an unmeasured profile. Identity comes from the device query, and every
+    measured roof is -1 (never a datasheet value). One stderr warning per process and
+    device: "unmeasured device ...: run aegis-perf calibrate".
+  - Every measurement row carries `"profile": "measured" | "unmeasured"` (perf DB v5:
+    measurements, paired, microbench, paired_results).
+  - Winners still dispatch on an unmeasured device of the same arch. S and grids follow
+    its SM count, and step 4 filters kernels by capability.
 - So one templated `mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32` kernel
   with `ldmatrix` and `cp.async` should run on both archs. The autotuner picks
   different tile configs per arch. That divergence is the project's story.
