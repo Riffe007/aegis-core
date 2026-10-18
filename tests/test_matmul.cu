@@ -285,6 +285,32 @@ aegis::gemm::GemmParams general(int M, int N, int K, aegis::gemm::Layout la, aeg
   return p;
 }
 
+#ifdef AEGIS_WINNERS_SM121
+// Every decode shape (shapes/decode.txt, M <= 16) dispatches to its tuned AEGIS
+// decode kernel (gemv_*), not the cuBLASLt floor, and runs correctly; so does
+// a nearest-M shape between them.
+bool decode_dispatch() {
+  constexpr int kShapes[][3] = {{1, 896, 896},  {1, 4864, 896},  {1, 896, 4864},
+                                {16, 896, 896}, {16, 4864, 896}, {16, 896, 4864}};
+  bool ok = true;
+  for (const auto& s : kShapes) {
+    const aegis::detail::Winner* w = aegis::detail::winner_for(s[0], s[1], s[2]);
+    const bool exact = w && w->M == s[0] && w->N == s[1] && w->K == s[2];
+    const char* choice = aegis::matmul_choice(s[0], s[1], s[2]);
+    const bool good = exact && w->dispatch == aegis::detail::Dispatch::Aegis && std::strcmp(choice, w->impl) == 0 &&
+                      std::strncmp(choice, "gemv_", 5) == 0;
+    std::printf("%-5s %5dx%5dx%5d  decode dispatch %s (want the tuned gemv_* kernel)\n", good ? "ok" : "FAIL", s[0],
+                s[1], s[2], choice);
+    ok &= good && check(s[0], s[1], s[2]);
+  }
+  const char* mid = aegis::matmul_choice(8, 896, 4864);  // nearest M among 1, 16, 512
+  const bool good = std::strncmp(mid, "gemv_", 5) == 0;
+  std::printf("%-5s %5dx%5dx%5d  decode dispatch %s (nearest M; want gemv_*)\n", good ? "ok" : "FAIL", 8, 896, 4864,
+              mid);
+  return ok && good && check(8, 896, 4864);
+}
+#endif
+
 }  // namespace
 
 int main() {
@@ -305,30 +331,31 @@ int main() {
     ok &= lt_config_round_trip(4096, 4096, 4096);
     ok &= lt_config_round_trip(16, 896, 4864);
     ok &= stored_rejected_falls_back(16, 896, 4864);
-    // Sub-80% shapes (winners/sm_121.h, dispatch Cublaslt): the three of the first
-    // floor; the loop below covers every other Cublaslt row (512x4864x896 since tune 7e94c009266f).
+    ok &= decode_dispatch();
+    // Sub-80% shapes (winners/sm_121.h, dispatch Cublaslt). Since the decode tune
+    // c2b937d8adca the M <= 16 rows run AEGIS (decode_dispatch); the floor's
+    // general-parameter cases use 512x4864x896 (nearest M 300 -> 512).
     ok &= check_floor(4096, 4096, 4096);
-    ok &= check_floor(1, 896, 4864);
-    ok &= check_floor(16, 896, 4864);
-    ok &= check_floor(8, 896, 4864);  // nearest M (1 or 16) is below the floor too
+    ok &= check_floor(512, 4864, 896);
+    ok &= check_floor(300, 4864, 896);  // nearest M (512) is below the floor too
     {
       using aegis::gemm::Layout;
-      auto p = general(16, 896, 4864, Layout::ColMajor, Layout::RowMajor, 3);
+      auto p = general(300, 4864, 896, Layout::ColMajor, Layout::RowMajor, 3);
       p.alpha = -0.5f; p.beta = 0.75f;
       ok &= check_floor_general("A col, B row, ld +3, alpha -0.5, beta 0.75", p, 0, false);
-      p = general(5, 896, 4864, Layout::RowMajor, Layout::ColMajor, 5);
+      p = general(301, 4864, 896, Layout::RowMajor, Layout::ColMajor, 5);
       ok &= check_floor_general("nearest M; A row, B col, ld +5, B misaligned by 2 B", p, 1, false);
-      p = general(16, 896, 4864, Layout::ColMajor, Layout::ColMajor, 0);
+      p = general(300, 4864, 896, Layout::ColMajor, Layout::ColMajor, 0);
       p.batch = 3;
-      p.stride_a = p.lda * 4864 + 8; p.stride_b = p.ldb * 896 + 8; p.stride_c = p.ldc * 16 + 8;  // col A: lda x K
+      p.stride_a = p.lda * 896 + 8; p.stride_b = p.ldb * 4864 + 8; p.stride_c = p.ldc * 300 + 8;  // col A: lda x K
       p.beta = 1.f;
       ok &= check_floor_general("batch 3, strides +8, both col, beta 1", p, 0, false);
-      p = general(1, 896, 4864, Layout::RowMajor, Layout::RowMajor, 0);
+      p = general(300, 4864, 896, Layout::RowMajor, Layout::RowMajor, 0);
       ok &= check_floor_general("NaN in A propagates", p, 0, true);
     }
     // Every other row the header sends to cuBLASLt.
     for (const aegis::detail::Winner& w : kWinners_sm121)
-      if (w.dispatch == aegis::detail::Dispatch::Cublaslt && !(w.N == 896 && w.K == 4864 && w.M <= 16) &&
+      if (w.dispatch == aegis::detail::Dispatch::Cublaslt && !(w.M == 512 && w.N == 4864 && w.K == 896) &&
           !(w.M == 4096 && w.N == 4096 && w.K == 4096))
         ok &= check_floor(w.M, w.N, w.K);
     cublasLtLoggerSetLevel(0);

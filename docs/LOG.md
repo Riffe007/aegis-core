@@ -1973,3 +1973,58 @@ Checks, all on this tree:
 - **Decode tune c2b937d8adca** (display off, watch clean; the attempt before it,
   1903faa76c26, was disturbed by gnome-shell and is excluded). Winners in the DB come from this
   run; step 4 measures them.
+
+## 2026-10-17 — Phase C step 4: decode results, winners and dispatch
+
+Winners come from decode tune c2b937d8adca (watch clean). `emit-header` regenerated
+`winners/sm_121.h`; every decode row is now a `gemv_tc_*` kernel with dispatch Aegis.
+- The two K = 4864 decode shapes (1x896x4864, 16x896x4864) were sent to cuBLASLt by the
+  80% floor under the old `mma_pipe` winners. They now dispatch to AEGIS.
+- The only non-decode change: 512x896x4864 went from `mma_pipe_64x64x32_2x2_s4` to `_s3`
+  (tie-break on neighbors). It still dispatches to AEGIS; CI upper bound 0.8065.
+- New `test_matmul` check `decode_dispatch`: each of the 6 decode shapes resolves to its tuned
+  `gemv_*` winner with dispatch Aegis and passes against cuBLAS; so does nearest-M 8x896x4864.
+- The dispatch-floor checks (plan reuse, capture, layouts / batch / NaN through the cuBLASLt
+  plan) move to the rows that still go to cuBLASLt: 4096^3 and 512x4864x896 (nearest M 300 and
+  301 -> 512).
+
+**Paired-ab**, same build (0bd0f22 + this header), cold, 30 pairs, display off. All 18 runs
+watched clean: one retry after an idle-guard refusal, one after a gnome-shell disturbance.
+paired_results ids 26-44; id 37 is the disturbed run, marked and excluded.
+- "ours" and "cublaslt_best" are the two medians of the kernel-vs-cublaslt_best run.
+- % of cublaslt_best = 1 / paired ratio median; the CI is the inverted 95% bootstrap CI.
+- Dispatch = `aegis_matmul` vs cublaslt_best.
+
+| shape | floor µs | ours µs | cublaslt_best µs | ours % of floor | lt % of floor | kernel % of cublaslt_best | kernel CI | dispatch | dispatch % of cublaslt_best (CI) |
+|---|---|---|---|---|---|---|---|---|---|
+| 1x896x896 | 6.227 | 8.92 | 9.46 | 69.8% | 65.8% | 106.2% | 105.2-106.7% | aegis `gemv_tc_16x64x64_1x4_s4_k1` | 105.1% (104.2-106.8%) |
+| 1x4864x896 | 33.805 | 36.84 | 36.89 | 91.8% | 91.6% | 100.2% | 97.7-101.2% (tie) | aegis `gemv_tc_16x128x64_1x4_s4_k1` | 100.3% (99.3-101.1%, tie) |
+| 1x896x4864 | 33.805 | 37.67 | 39.38 | 89.7% | 85.8% | 105.3% | 104.0-105.7% | aegis `gemv_tc_16x64x64_1x4_s5_k3` | 104.5% (103.4-105.2%) |
+| 16x896x896 | 6.227 | 9.30 | 10.69 | 67.0% | 58.3% | 114.8% | 113.5-115.3% | aegis `gemv_tc_16x64x64_1x4_s4_k1` | 115.0% (113.6-115.4%) |
+| 16x4864x896 | 33.805 | 37.84 | 38.25 | 89.3% | 88.4% | 101.1% | 100.6-102.3% | aegis `gemv_tc_16x64x64_1x4_s4_k1` | 101.3% (100.7-103.2%) |
+| 16x896x4864 | 33.805 | 38.62 | 38.86 | 87.5% | 87.0% | 100.3% | 97.3-100.8% (tie) | aegis `gemv_tc_16x64x64_1x4_s5_k3` | 101.2% (100.6-101.8%) |
+
+New winner vs the previous winner (`mma_pipe_64x64x32_2x2_s4` on all six), as time ratio
+new / old:
+
+| shape | ratio | CI |
+|---|---|---|
+| 1x896x896 | 0.822 | 0.821-0.824 |
+| 1x4864x896 | 0.987 | 0.980-0.989 |
+| 1x896x4864 | 0.729 | 0.713-0.735 |
+| 16x896x896 | 0.859 | 0.853-0.864 |
+| 16x4864x896 | 0.996 | 0.991-0.999 |
+| 16x896x4864 | 0.742 | 0.719-0.747 |
+
+**Verdict.** Every decode shape meets the decode bar, >= 100% of cublaslt_best (tie or win):
+- four kernel wins and two kernel ties (1x4864x896, 16x896x4864);
+- through dispatch, five wins and one tie (1x4864x896).
+
+**The 896x896 shapes** run at ~65-70% of the floor, and cuBLASLt at 58-66%. They are bound by
+launch overhead: fixed per-launch cost (launch, ramp, tail) against a ~6 µs transfer. Closing
+that gap is a stage-2 item: multi-kernel CUDA Graphs or a persistent decode kernel (see the
+2026-10-14 launch-overhead decision).
+
+**The 4864 shapes** run at 87-92% of the floor. What's left: each CTA's pipeline prologue and
+tail, plus the split-K reduction pass on the K-heavy shape. The next lever: split-K and grid
+sized from the SM count at run time, rather than per-config constants (aegis-hw, first item).
