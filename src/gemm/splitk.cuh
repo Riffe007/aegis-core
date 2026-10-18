@@ -164,32 +164,47 @@ __device__ __forceinline__ void finish_tile(const float* red, const Args& a, lon
   __syncthreads();
   if (!*flag) return;
   __threadfence();  // acquire: the other S - 1 partials are visible
-  // Sum slots 0..S-1 in that order (v = p0, v += p1, ...): the loads of up to
-  // kBatch slots are issued together (independent), the adds stay in order.
-  constexpr int kBatch = 8;
-  for (int i = threadIdx.x; i < VECS; i += THREADS) {
-    const int r = (i * 4) / TN, c = (i * 4) % TN;
-    if (r >= o.rows || c >= o.cols) continue;
-    float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+  // Sum slots 0..S-1 in that order (v = p0, v += p1, ...). Each thread takes
+  // kElems float4s at a time and loads kBatch slots of all of them before any
+  // add (kElems x kBatch independent loads in flight: one L2 round trip per
+  // group instead of one per element); the adds per element stay in order.
+  constexpr int kElems = 4, kBatch = 4;
+  for (int i0 = threadIdx.x; i0 < VECS; i0 += THREADS * kElems) {
+    float4 v[kElems];
+#pragma unroll
+    for (int e = 0; e < kElems; ++e) v[e] = make_float4(0.f, 0.f, 0.f, 0.f);
     for (int s0 = 0; s0 < a.S; s0 += kBatch) {
-      float4 q[kBatch];
+      float4 q[kElems][kBatch];
 #pragma unroll
-      for (int u = 0; u < kBatch; ++u)
-        if (s0 + u < a.S) q[u] = __ldcg(slot0 + (long long)(s0 + u) * VECS + i);
+      for (int e = 0; e < kElems; ++e)
 #pragma unroll
-      for (int u = 0; u < kBatch; ++u) {
-        if (s0 + u >= a.S) break;
-        if (s0 + u == 0) {
-          v = q[0];
-        } else {
-          v.x += q[u].x; v.y += q[u].y; v.z += q[u].z; v.w += q[u].w;
+        for (int u = 0; u < kBatch; ++u) {
+          const int i = i0 + e * THREADS;
+          if (i < VECS && s0 + u < a.S) q[e][u] = __ldcg(slot0 + (long long)(s0 + u) * VECS + i);
         }
-      }
-    }
-    const float vs[4] = {v.x, v.y, v.z, v.w};
 #pragma unroll
-    for (int e = 0; e < 4; ++e)
-      if (c + e < o.cols) store_one(o, r, c + e, vs[e]);
+      for (int e = 0; e < kElems; ++e)
+#pragma unroll
+        for (int u = 0; u < kBatch; ++u) {
+          if (s0 + u >= a.S) break;
+          if (s0 + u == 0) {
+            v[e] = q[e][0];
+          } else {
+            v[e].x += q[e][u].x; v[e].y += q[e][u].y; v[e].z += q[e][u].z; v[e].w += q[e][u].w;
+          }
+        }
+    }
+#pragma unroll
+    for (int e = 0; e < kElems; ++e) {
+      const int i = i0 + e * THREADS;
+      if (i >= VECS) break;
+      const int r = (i * 4) / TN, c = (i * 4) % TN;
+      if (r >= o.rows || c >= o.cols) continue;
+      const float vs[4] = {v[e].x, v[e].y, v[e].z, v[e].w};
+#pragma unroll
+      for (int j = 0; j < 4; ++j)
+        if (c + j < o.cols) store_one(o, r, c + j, vs[j]);
+    }
   }
   if (threadIdx.x == 0) a.counters[tile] = 0;  // the next launch starts from 0
 }

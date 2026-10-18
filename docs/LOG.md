@@ -1941,3 +1941,35 @@ d13561cb3d16 just before it was disturbed by Firefox and is excluded). GB/s = by
 - Pre-existing, not from this work: tier 4's `mma_pipe_64x64x32_2x2_s2` (layouts RC) has 12 B spill /
   16 B stack on sm_121; it is in the 17:19 SASS dump from the TMA step too.
 - Winners in the DB come from this run; the header is regenerated in step 4.
+
+## 2026-10-17 — Phase C step 3: hardening of the decode family
+
+Code since step 2:
+- **Split-K reducer.** The last CTA now takes 4 float4 elements at a time and loads 4 split slots of
+  each before adding (16 independent L2 loads in flight). The adds per element still run in split
+  order 0..S-1, so output is bitwise identical to before.
+- **New tensor-core configs.** BK = 64 deep rings: 64x64 s5 / s6 with S 2-3, and 128x64 s4 with S 2-3.
+  The impl list in CMakeLists.txt was regenerated from `bench_gemm --list`: 50 decode impls,
+  118 kernels.
+
+Checks, all on this tree:
+- **SASS** (`tools/sass_dump.sh`): 118 gemv / gemv_tc kernels, 0 stack, 0 local (no spills).
+- **compute-sanitizer memcheck and racecheck**, one tool per invocation:
+  - every gemv / gemv_tc impl on 127x129x65, 16x896x896, 1x896x4864 and 9x137x5003, through
+    `bench_gemm --check`;
+  - `test_splitk`;
+  - `aegis_fuzz --cases 100 --seed 43 --poison --decode --impls gemv_,matmul`.
+  - Total: 404 runs, 0 errors, 0 hazards. Logs in `artifacts/sanitizer/gemv/`.
+- **ctest `splitk_determinism` (test_splitk):**
+  - 50 impls x 8 shapes x 10 runs, bitwise identical and within the FP64 tolerance;
+  - 345 split cases (S > 1), 142 with odd S;
+  - strict global-mode capture of the split impls and `aegis::matmul`: no allocation after the
+    first call, and replay equals the direct call bitwise;
+  - first call inside a capture: cudaErrorStreamCaptureUnsupported, and the capture stays valid.
+- **ctest `fuzz_decode`:** 2000 poisoned cases. M is 1..16 in 85% of cases (else 17..40); K goes
+  up to 16384, primes included; all layouts, ld padding, misalignment, alpha/beta and NaN/Inf.
+  0 failures.
+- **ctest `sm87_gate`:** gemv.cu and gemv_tc.cu compile for sm_87.
+- **Decode tune c2b937d8adca** (display off, watch clean; the attempt before it,
+  1903faa76c26, was disturbed by gnome-shell and is excluded). Winners in the DB come from this
+  run; step 4 measures them.

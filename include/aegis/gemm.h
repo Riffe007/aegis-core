@@ -226,10 +226,13 @@ inline constexpr GemvConfig GEMV_CONFIGS[] = {
 std::span<const KernelEntry> gemv_entries();
 
 struct GemvTcConfig { int BN, BK, WARPS_N, STAGES, S; };  // S = 0: auto
-// Smem per CTA (ring): 64x64 s4 42 KiB (2 per SM), 64x32 s6 32 KiB (3), 128x32 s4
-// 38 KiB (2), 128x64 s4 73 KiB and 256x32 s4 69 KiB (1).
+// Smem per CTA (ring): 64x64 s4 42 KiB (2 per SM), s5 52 KiB, s6 63 KiB (1); 64x32 s6
+// 32 KiB (3), s8 43 KiB (2); 32x64 s4 25 KiB; 128x32 s4 38 KiB (2), s6 57 KiB (1);
+// 128x64 s4 73 KiB and 256x32 s4 69 KiB (1).
 inline constexpr GemvTcConfig GEMV_TC_CONFIGS[] = {
     {64, 64, 4, 4, 0},  {64, 64, 4, 4, 1},  {64, 64, 4, 4, 2},  {64, 64, 4, 4, 7}, {64, 64, 4, 4, 10},
+    {64, 64, 4, 6, 2},  {64, 64, 4, 6, 3},  {64, 64, 4, 5, 3},
+    {128, 64, 4, 4, 2}, {128, 64, 4, 4, 3},
     {64, 32, 4, 6, 0},  {64, 32, 4, 6, 2},  {64, 32, 4, 6, 3},  {64, 32, 4, 6, 4}, {64, 32, 4, 6, 7},
     {64, 32, 4, 8, 2},  {64, 32, 4, 8, 3},
     {32, 64, 2, 4, 4},  {32, 64, 2, 6, 3},
