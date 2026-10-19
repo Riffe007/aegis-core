@@ -27,9 +27,12 @@ pub const SCHEMA: &str = include_str!("schema.sql");
 ///    attribute, JSON) on measurements and winners.
 /// 5: profile ("measured" / "unmeasured": did the device match its arch profile,
 ///    src/hw/profile.h) on measurements, paired, microbench and paired_results.
+/// 6: telemetry (opt-in, src/hw/telemetry.h) on measurements: max_temp_c,
+///    throttle_reasons (NVML clock-event reasons that slow the clocks, "a|b"; "" none),
+///    clock_event_reasons (every reason bit seen), sm_clock_min_mhz / sm_clock_max_mhz.
 /// Bump it with every migration in migrate(). connect() backs the DB up
 /// (VACUUM INTO <db>.bak-v<old>-<date>) before migrating an older one.
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 6;
 
 /// The DB's schema version: None when it has no schema_version table (a v1
 /// DB, or not yet created).
@@ -176,6 +179,12 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("paired", "profile", "TEXT"),
     ("microbench", "profile", "TEXT"),
     ("paired_results", "profile", "TEXT"),
+    // v6: telemetry over the measurement's timed windows (NULL: not sampled).
+    ("measurements", "max_temp_c", "REAL"),
+    ("measurements", "throttle_reasons", "TEXT"),
+    ("measurements", "clock_event_reasons", "TEXT"),
+    ("measurements", "sm_clock_min_mhz", "INTEGER"),
+    ("measurements", "sm_clock_max_mhz", "INTEGER"),
 ];
 
 /// Reference implementations: always eligible (they are what --check compares
@@ -357,6 +366,16 @@ pub fn mark_disturbed(con: &Connection, run_id: &str, w: &crate::watch::WatchRep
     }
     if w.disturbed == Some(true) {
         eprintln!("run {run_id}: every row marked disturbed=1 ({})", w.detail());
+        // A disturbed run is not evidence, so it replaces nothing: the microbench rows its
+        // ingest marked replaced are valid again (2026-10-18: a disturbed throttle_profile
+        // run had retired the clean one).
+        let restored = con.execute(
+            "UPDATE microbench SET status = 'valid', replaced_by = NULL WHERE replaced_by = ?1 AND status = 'replaced'",
+            params![run_id],
+        )?;
+        if restored > 0 {
+            eprintln!("run {run_id}: {restored} older microbench rows it had replaced are valid again");
+        }
     }
     Ok(())
 }
@@ -443,8 +462,9 @@ pub fn cmd_ingest(
         tx.execute(
             "INSERT INTO measurements (run_id, kernel_id, dtype, m, n, k, median_us, p10_us, p90_us, \
              tflops, gbps, reps, checked, pass, max_abs_err, rel_err, power_w, protocol_version, batch_n, \
-             timer_res_ns, cache_mode, buffer_sets, window_ms, allow_busy, idle_util_pct, lt_algo, profile) \
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+             timer_res_ns, cache_mode, buffer_sets, window_ms, allow_busy, idle_util_pct, lt_algo, profile, \
+             max_temp_c, throttle_reasons, clock_event_reasons, sm_clock_min_mhz, sm_clock_max_mhz) \
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             params![
                 run_id, kid, sql(Some(get(r, "dtype")?)),
                 sql(Some(get(s, "M")?)), sql(Some(get(s, "N")?)), sql(Some(get(s, "K")?)),
@@ -464,6 +484,11 @@ pub fn cmd_ingest(
                 sql(r.get("idle_util_pct")),
                 r.get("lt").filter(|v| v.is_object()).map(dumps_sorted),
                 r.get("profile").and_then(Value::as_str),
+                sql(r.get("max_temp_c")),
+                r.get("throttle_reasons").and_then(Value::as_str),
+                r.get("clock_event_reasons").and_then(Value::as_str),
+                sql(r.get("sm_clock_min_mhz")),
+                sql(r.get("sm_clock_max_mhz")),
             ],
         )?;
     }
@@ -1165,6 +1190,63 @@ mod tests {
         assert_eq!(p.as_deref(), Some("measured"));
         let m: Option<String> = con.query_row("SELECT profile FROM microbench WHERE run_id = 'mb'", [], |r| r.get(0)).unwrap();
         assert_eq!(m.as_deref(), Some("unmeasured"));
+        std::fs::remove_file(&db).ok();
+    }
+
+    /// A disturbed microbench run replaces nothing: the clean run it would have
+    /// superseded stays valid.
+    #[test]
+    fn disturbed_microbench_run_replaces_nothing() {
+        let db = tmp("disturbed-mb.db");
+        let _ = std::fs::remove_file(&db);
+        let idle = RunIdle { pct: Some(0.1), source: Some("nvml".into()), allow_busy: false };
+        let line = r#"{"probe":"p","param":{"stat":"x"},"value":1.0,"unit":"s","sm_arch":121}"#.to_string() + "\n";
+        for id in ["clean", "noisy"] {
+            let f = tmp(&format!("{id}.jsonl"));
+            std::fs::write(&f, &line).unwrap();
+            cmd_ingest_microbench(&db, &f, None, Some(id.into()), &idle).unwrap();
+            std::fs::remove_file(&f).ok();
+        }
+        let con = connect(&db).unwrap();
+        let status = |id: &str| -> String {
+            con.query_row("SELECT status FROM microbench WHERE run_id = ?1", [id], |r| r.get(0)).unwrap()
+        };
+        assert_eq!(status("clean"), "replaced", "ingest replaces first");
+        let report = crate::watch::WatchReport { disturbed: Some(true), ..Default::default() };
+        mark_disturbed(&con, "noisy", &report).unwrap();
+        assert_eq!(status("clean"), "valid", "the disturbed run gives the clean one back");
+        assert_eq!(current_run(&con, 121, "p").unwrap().as_deref(), Some("clean"));
+        std::fs::remove_file(&db).ok();
+    }
+
+    /// v6: telemetry fields on measurement rows (opt-in; NULL without).
+    #[test]
+    fn ingest_stores_telemetry() {
+        let db = tmp("telemetry.db");
+        let _ = std::fs::remove_file(&db);
+        let f = tmp("telemetry.jsonl");
+        let tel = row(0.1, false).replacen(
+            "\"op\":\"gemm\"",
+            "\"op\":\"gemm\",\"max_temp_c\":61.0,\"throttle_reasons\":\"sw_power_cap\",\"clock_event_reasons\":\"sw_power_cap|applications_clocks_setting\",\"sm_clock_min_mhz\":2400,\"sm_clock_max_mhz\":2520,\"power_w\":71.5",
+            1,
+        );
+        std::fs::write(&f, format!("{tel}\n{}\n", row(0.1, false))).unwrap();
+        cmd_ingest(&db, &f, None, Some("t".into()), None).unwrap();
+        std::fs::remove_file(&f).ok();
+        let con = connect(&db).unwrap();
+        type Row = (Option<f64>, Option<String>, Option<String>, Option<i64>, Option<i64>, Option<f64>);
+        let rows: Vec<Row> = con
+            .prepare("SELECT max_temp_c, throttle_reasons, clock_event_reasons, sm_clock_min_mhz, sm_clock_max_mhz, power_w \
+                      FROM measurements WHERE run_id = 't' ORDER BY rowid")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(rows[0], (Some(61.0), Some("sw_power_cap".into()),
+                             Some("sw_power_cap|applications_clocks_setting".into()), Some(2400), Some(2520), Some(71.5)));
+        assert_eq!(rows[1], (None, None, None, None, None, None), "no telemetry: NULL");
+        assert_eq!(schema_version(&con).unwrap(), Some(6));
         std::fs::remove_file(&db).ok();
     }
 

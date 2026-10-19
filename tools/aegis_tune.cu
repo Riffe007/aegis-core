@@ -84,6 +84,7 @@ Args parse(int argc, char** argv) {
     else if (k == "--protocol") a.protocol = std::stoi(next());
     else if (k == "--warm-top") a.warm_top = std::stoi(next());
     else if (k == "--allow-busy") a.allow_busy = true;
+    else if (k == "--telemetry") setenv("AEGIS_TELEMETRY", "1", 1);  // opt-in: rows carry max_temp_c, throttle_reasons
     else if (k == "--no-paired") a.paired = false;
     else if (k == "--pair-with") a.pair_with = next();
     else { std::fprintf(stderr, "unknown arg %s\n", k.c_str()); std::exit(2); }

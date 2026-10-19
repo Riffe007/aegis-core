@@ -16,6 +16,7 @@ set(CMAKE_CUDA_STANDARD 20)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
 find_package(CUDAToolkit REQUIRED)
+find_package(Threads REQUIRED)
 
 # -lineinfo keeps source<->SASS correlation for Nsight Compute and sass_dump.
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -lineinfo --expt-relaxed-constexpr -Xptxas=-v")
@@ -73,12 +74,14 @@ add_library(aegis_kernels STATIC
   src/gemm/registry.cu
   src/hw/device.cu
   src/hw/profile.cpp
+  src/hw/discover.cpp
+  src/hw/telemetry.cpp
   ${CMAKE_BINARY_DIR}/generated/arch_profiles.cpp
 )
 target_include_directories(aegis_kernels PUBLIC include)
 target_include_directories(aegis_kernels PRIVATE src)
 # profile.cpp (host C++) includes cuda_runtime.h.
-target_link_libraries(aegis_kernels PUBLIC CUDA::cudart)
+target_link_libraries(aegis_kernels PUBLIC CUDA::cudart Threads::Threads ${CMAKE_DL_LIBS})
 if(AEGIS_TMA)
   target_compile_definitions(aegis_kernels PUBLIC AEGIS_TMA=1)
 endif()
@@ -87,14 +90,14 @@ set_target_properties(aegis_kernels PROPERTIES CUDA_SEPARABLE_COMPILATION OFF
                                                POSITION_INDEPENDENT_CODE ON)
 
 # aegis::matmul: tuned-winner dispatch over the kernels; cuBLASLt below the dispatch floor, cuBLAS fallback.
-add_library(aegis STATIC src/matmul.cu src/manifest.cpp src/hw/discover.cpp)
+add_library(aegis STATIC src/matmul.cu src/manifest.cpp)
 set_target_properties(aegis PROPERTIES POSITION_INDEPENDENT_CODE ON)
 # matmul.cu pulls winners in with __has_include, which dependency scanning
 # misses when a header first appears; glob them so `aegis-perf emit-header`
 # triggers a rebuild.
 file(GLOB AEGIS_WINNER_HEADERS CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/include/aegis/winners/*.h)
 set_source_files_properties(src/matmul.cu PROPERTIES OBJECT_DEPENDS "${AEGIS_WINNER_HEADERS}")
-target_link_libraries(aegis PUBLIC aegis_kernels CUDA::cudart CUDA::cublas CUDA::cublasLt ${CMAKE_DL_LIBS})
+target_link_libraries(aegis PUBLIC aegis_kernels CUDA::cudart CUDA::cublas CUDA::cublasLt Threads::Threads ${CMAKE_DL_LIBS})
 
 # The timing protocol (src/bench/harness.h), shared by bench_gemm and aegis_tune.
 add_library(aegis_bench_harness STATIC src/bench/harness.cu src/bench/reference.cu)
@@ -318,6 +321,12 @@ add_executable(test_hw_dispatch tests/test_hw_dispatch.cu)
 target_link_libraries(test_hw_dispatch PRIVATE aegis aegis_bench_harness)
 target_include_directories(test_hw_dispatch PRIVATE src)
 add_test(NAME hw_dispatch COMMAND test_hw_dispatch)
+# Telemetry (aegis-hw step 7): sysfs fallbacks on fixtures, the live 100 ms sampler, sustained mode.
+add_executable(test_telemetry tests/test_telemetry.cpp)
+target_link_libraries(test_telemetry PRIVATE aegis_kernels Threads::Threads)
+target_include_directories(test_telemetry PRIVATE src)
+target_compile_definitions(test_telemetry PRIVATE AEGIS_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+add_test(NAME telemetry COMMAND test_telemetry)
 add_test(NAME hw_profile_row_label COMMAND bench_gemm --impl cublas --m 64 --n 64 --k 64 --reps 2)
 set_tests_properties(hw_profile_row_label PROPERTIES ENVIRONMENT AEGIS_PROFILE_EMBEDDED=0
   PASS_REGULAR_EXPRESSION "\"profile\":\"unmeasured\"")

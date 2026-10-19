@@ -163,6 +163,12 @@ Harness::Harness() {
   flush_bytes_ = std::max<size_t>(size_t(prop_.l2CacheSize) * 2, 1 << 20);
   AEGIS_CUDA_CHECK(aegis::budget::gpu_malloc(&flush_, flush_bytes_));
   timer_ = measure_timer_resolution(stream_);
+  if (const char* t = std::getenv("AEGIS_TELEMETRY"); t && std::string(t) == "1") {
+    hw::TelemetryOptions o;
+    o.device = dev;
+    telemetry_ = std::make_unique<hw::Telemetry>(o);
+    std::fprintf(stderr, "telemetry: %s (%s)\n", telemetry_->source().c_str(), telemetry_->detail().c_str());
+  }
 }
 
 Harness::~Harness() {
@@ -217,8 +223,15 @@ Check Harness::check(Problem& p) {
 }
 
 Timing Harness::time(const Impl& e, Problem& p, const TimingOptions& o) {
-  if (o.protocol == 1) return time_v1(e, p, o);
-  if (o.protocol == 2) return time_v2(e, p, o);
+  if (o.protocol == 1 || o.protocol == 2) {
+    const size_t m0 = telemetry_ ? telemetry_->mark() : 0;
+    Timing t = o.protocol == 1 ? time_v1(e, p, o) : time_v2(e, p, o);
+    if (telemetry_) {
+      t.telemetry = true;
+      t.tel = telemetry_->summary(m0, telemetry_->mark());
+    }
+    return t;
+  }
   std::fprintf(stderr, "unknown timing protocol %d\n", o.protocol);
   std::exit(2);
 }
@@ -417,6 +430,22 @@ std::string Harness::json_row(const char* impl, const Impl& impl_e, const Proble
                                      : R"({"algo":"CUBLAS_GEMM_DEFAULT"})";
   cudaFuncAttributes attrs{};
   if (e) AEGIS_CUDA_CHECK(e->attrs(&attrs));
+  // Telemetry fields (opt-in), then the caller's extra fields.
+  std::string tail;
+  if (t.telemetry) {
+    char tb[320];
+    std::snprintf(tb, sizeof tb,
+                  ",\"max_temp_c\":%.1f,\"throttle_reasons\":\"%s\",\"clock_event_reasons\":\"%s\",\"sm_clock_min_mhz\":%d,"
+                  "\"sm_clock_max_mhz\":%d,\"telemetry_samples\":%d",
+                  t.tel.max_temp_c, hw::reason_names(t.tel.throttle).c_str(), hw::reason_names(t.tel.reasons).c_str(),
+                  t.tel.min_sm_mhz, t.tel.max_sm_mhz, t.tel.samples);
+    tail = tb;
+    if (t.tel.mean_power_w >= 0) {
+      std::snprintf(tb, sizeof tb, ",\"power_w\":%.2f", t.tel.mean_power_w);
+      tail += tb;
+    }
+  }
+  tail += extra;
   auto print = [&](char* buf, size_t n) {
     return std::snprintf(
         buf, n,
@@ -435,7 +464,7 @@ std::string Harness::json_row(const char* impl, const Impl& impl_e, const Proble
         e ? attrs.localSizeBytes : size_t(0), prop_.name, prop_.major, prop_.minor, runtime_,
         driver_, timer_.tick_ns, t.protocol_version, t.batch_n, t.window_ms,
         t.protocol_version == 1 ? "flush_per_launch" : cache_mode_name(t.cache), t.buffer_sets,
-        aegis::hw::current_profile().label(), extra.c_str());
+        aegis::hw::current_profile().label(), tail.c_str());
   };
   std::string s(size_t(print(nullptr, 0)), '\0');
   print(s.data(), s.size() + 1);

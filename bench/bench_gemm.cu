@@ -101,6 +101,7 @@ Args parse(int argc, char** argv) {
     else if (k == "--idle-watch") a.idle_watch = true;
     else if (k == "--root") a.idle_watch_root = std::atoi(next());
     else if (k == "--allow-busy") a.allow_busy = true;
+    else if (k == "--telemetry") setenv("AEGIS_TELEMETRY", "1", 1);  // opt-in: rows carry max_temp_c, throttle_reasons
     else if (k == "--idle-util-pct") a.idle_util_pct = std::atof(next());
     else if (k == "--idle-source") a.idle_source = next();
     else if (k == "--lt-rank") a.lt_rank = std::atoi(next());

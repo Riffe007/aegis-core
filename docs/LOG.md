@@ -2485,3 +2485,79 @@ HEVC, VP8, VP9, AV1. NVENC: H264, HEVC, AV1.
   - 16x4864x896 `gemv_tc_16x64x64_1x4_s4_ksm` (100.6%).
   The committed header was not regenerated. Whether to adopt these needs paired-ab against the
   current winners: open.
+
+## 2026-10-18 — aegis-hw step 7: telemetry and sustained mode
+
+- **Telemetry** (`src/hw/telemetry.{h,cpp}`), opt-in with `AEGIS_TELEMETRY=1` or
+  `bench_gemm` / `aegis_tune --telemetry`:
+  - A sampler thread reads every 100 ms: temperature, SM / memory clock, power, and NVML
+    clock-event reasons (`nvmlDeviceGetCurrentClocksEventReasons`, nvml.h bit values).
+  - Without NVML (Tegra) it falls back to the hottest sysfs thermal zone and the GPU devfreq
+    `cur_freq`.
+  - Samples go into a fixed ring; `mark()` / `summary()` bracket a measurement.
+  - Harness rows get `max_temp_c`, `throttle_reasons` (power cap, thermal / hardware
+    slowdown, power brake, sync boost), `clock_event_reasons` (every bit seen), the SM clock
+    range and `power_w`.
+  - Perf DB schema v6 adds those columns to measurements; aegis-perf 0.7.0. The DB was
+    migrated, backup `results/aegis_perf.db.bak-v5-2026-10-18`.
+  - On the Spark NVML gives temperature, SM clock, power and reasons; it has no memory clock.
+  - `discover.cpp` moved from `aegis` into `aegis_kernels` (telemetry uses discovery).
+- **Overhead** (paired-ab: the same bench_gemm, telemetry off as A, on as B; cold; clean):
+
+  | shape | kernel | B / A | 95% CI | pairs |
+  |---|---|---|---|---|
+  | 1x896x896 | gemv_tc_16x64x64_1x4_s6_ksm | 0.9998 | [0.9954, 1.0028] | 60 (paired_results 63) |
+  | 2048^3 | mma_tma_128x128x32_2x4_s3 | 0.9987 | [0.9905, 1.0022] | 30 (62) |
+
+  Both CIs are within +0.28%, so the ≤1% target holds at 100 ms with the sampler unpinned.
+  A first 30-pair decode run, 1.0063 [0.9988, 1.0203] (id 61), was too wide to show it; the
+  60-pair run settles it. Pinning the sampler to the efficiency cores (the A725s, from
+  discovery) is implemented and tested, but stays off by default (`pin_efficiency`): it was
+  not needed.
+- **Sustained mode:**
+  - `fit_throttle_profile` turns a recorded load curve into ambient temperature, the
+    throttle point, and a first-order fit of steady temperature and tau over the whole
+    recording.
+  - `sustained_duty` is the busiest fraction whose projected steady temperature stays
+    `margin_c` (3 C) below the throttle point. `sustained_concurrency(n)` = max(1,
+    floor(duty x n)).
+  - Reporting and sizing only; nothing changes clocks or power limits.
+- **GB10 reports no throttle reason.**
+  - In 3,000 samples per recording NVML never set a clock-event reason, yet the SM clock sags.
+  - So the throttle point is the first NVML throttle reason, or the clock sag (`cause`
+    sm_clock_sag): the 10 s rolling median SM clock below 97% of the first 10 s median.
+  - Medians, because GB10 boosts and dips for single samples. A first version (8 of 10
+    samples under 97% of the first-10 s maximum) flagged a ~1 s dip in a run whose throughput
+    held within 1-2%. Fitting only up to the onset underestimated the steady temperature
+    (81 C fit, 86 C reached).
+- **Recordings** (`microbench/run_throttle_profile.sh 300`: back-to-back aegis::matmul
+  4096^3 (the cuBLASLt floor path), screen off, every 10 s window counted; probe rows in the
+  microbench table). Refit with the final criterion (`mb_throttle_profile --refit`):
+
+  | run | start clock | throttle | throughput, first -> last 10 s | duty |
+  |---|---|---|---|---|
+  | 6b6b15c38870 | 2509 MHz (boost) | 84.7 s, 79 C | 7392 -> 7040 launches (-4.8%) | 0.75 |
+  | f1e3c02b5f2e | 2405 MHz | none | 7168 -> 7072 (-1%) | 1.00 |
+  | 42e9078b71a1 | (disturbed: firefox) | - | - | - |
+  | **f0bd08d67cd2** | 2528 MHz (boost) | **47.4 s, 76 C** | 7456 -> 7200 (-3.4%) | **0.69** |
+
+  f0bd08d67cd2 (clean, final code) is `include/aegis/arch/throttle/sm_121.json`: ambient
+  46 C, max 85 C, steady 85.1 C, tau 68.9 s, mean 70.5 W, 98.96-102.47 TFLOP/s. GB10's
+  behaviour depends on whether it starts boosted: from a boost clock it sags 3-5% within
+  1.5 min; without boost it holds.
+- **Pre-existing bug fixed:** ingesting the disturbed run 42e9078b71a1 marked the clean run's
+  throttle_profile rows replaced. `current_run` still found them through its fallback, but a
+  disturbed run is not evidence.
+  - `mark_disturbed` now gives back the rows a disturbed run had replaced (Rust test
+    `disturbed_microbench_run_replaces_nothing`).
+  - The DB was repaired the same way for every such run. Only this one, 13 rows; backup
+    `results/aegis_perf.db.bak-pre-disturbed-repair-2026-10-18`.
+- **Tests:**
+  - ctest `telemetry`, 23 checks: reason names; the sysfs paths on orin-nano-synthetic (49 C,
+    306 MHz from a `cur_freq` added to the fixture) and spark-gb10; no sensor; the live
+    sampler (11 samples in 1.05 s); the latest-sample stand-in.
+  - Sustained mode on synthetic curves: reason throttle, clock sag, 3 s dip, boost start, no
+    throttle, JSON round trip.
+  - Rust `ingest_stores_telemetry`.
+- **Hardening:** memcheck `test_telemetry`, `bench_gemm --telemetry` (decode kernel) and a 3 s
+  `mb_throttle_profile`: 0 errors (`artifacts/sanitizer/hw-step7/`).

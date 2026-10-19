@@ -11,3 +11,9 @@ endforeach()
 add_executable(mb_launch_overhead launch_overhead.cu)
 target_link_libraries(mb_launch_overhead PRIVATE aegis CUDA::cuda_driver)
 target_include_directories(mb_launch_overhead PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+# Time-to-throttle profile under sustained aegis::matmul load (sustained mode; minutes long,
+# not in run_all.sh): microbench/run_throttle_profile.sh.
+add_executable(mb_throttle_profile throttle_profile.cu)
+target_link_libraries(mb_throttle_profile PRIVATE aegis Threads::Threads)
+target_include_directories(mb_throttle_profile PRIVATE ${CMAKE_SOURCE_DIR}/src)

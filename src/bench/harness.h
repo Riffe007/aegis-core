@@ -47,6 +47,7 @@
 #include <vector>
 
 #include "aegis/gemm.h"
+#include "hw/telemetry.h"
 
 namespace aegis::bench {
 
@@ -115,6 +116,10 @@ struct Timing {
   double window_ms = 0;      // median window length (v2)
   CacheMode cache = CacheMode::Cold;  // v2
   int buffer_sets = 1;       // v2: K
+  // Opt-in telemetry over the timed windows (AEGIS_TELEMETRY=1): samples taken while
+  // this measurement ran; rows get max_temp_c, throttle_reasons, power_w.
+  bool telemetry = false;
+  hw::TelemetrySummary tel;
 };
 
 // Paired comparison (protocol v2): `pairs` alternating windows A, B, A, B...
@@ -256,6 +261,7 @@ class Harness {
   void* flush_ = nullptr;
   size_t flush_bytes_ = 0;
   TimerResolution timer_{};
+  std::unique_ptr<hw::Telemetry> telemetry_;  // AEGIS_TELEMETRY=1
 };
 
 // GPU utilization over a sampling period: NVML (dlopen; device matched to the

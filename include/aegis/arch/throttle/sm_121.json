@@ -1,0 +1,21 @@
+{
+  "schema": "aegis-throttle/1",
+  "device": "NVIDIA GB10",
+  "ambient_c": 46.00,
+  "throttle_c": 76.00,
+  "time_to_throttle_s": 47.40,
+  "recorded_s": 299.90,
+  "steady_c": 85.10,
+  "tau_s": 68.87,
+  "margin_c": 3.00,
+  "cause": "sm_clock_sag",
+  "clock_ref_mhz": 2528,
+  "clock_sag": 0.030,
+  "sustained_duty": 0.6905,
+  "reasons_seen": "",
+  "launches": 216832,
+  "wall_s": 300.0,
+  "sm_count": 48,
+  "generated_by": "microbench/run_throttle_profile.sh on spark-5822, 2026-10-19 04:53 UTC",
+  "source": "throttle-spark-5822-20261018-214801.jsonl"
+}
