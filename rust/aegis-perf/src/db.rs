@@ -1521,6 +1521,81 @@ mod tests {
         std::env::temp_dir().join(format!("aegis-perf-{name}-{}", std::process::id()))
     }
 
+    /// The DBs a live install can hold migrate to the current version: a v5 DB (before
+    /// telemetry and build identity) and a v6 DB (telemetry; build identity was v6 on the
+    /// repro branch and is v7 here). Each is backed up at its old version first, its rows
+    /// survive, the v7 backfills run, and check() reads the result.
+    #[test]
+    fn migrate_v5_and_v6_to_v7() {
+        const V6: &[(&str, &str)] = &[
+            ("measurements", "max_temp_c"),
+            ("measurements", "throttle_reasons"),
+            ("measurements", "clock_event_reasons"),
+            ("measurements", "sm_clock_min_mhz"),
+            ("measurements", "sm_clock_max_mhz"),
+        ];
+        const V7: &[(&str, &str)] = &[
+            ("runs", "build_sha"),
+            ("runs", "build_dirty"),
+            ("runs", "allow_dirty"),
+            ("runs", "kind"),
+            ("paired_results", "build_sha_a"),
+            ("paired_results", "build_sha_b"),
+            ("paired_results", "build_dirty_a"),
+            ("paired_results", "build_dirty_b"),
+            ("paired_results", "allow_dirty"),
+            ("paired_results", "device_id"),
+            ("paired_results", "sm_arch"),
+            ("paired_results", "dtype"),
+            ("winners", "lt_ratio_median"),
+            ("winners", "dispatch"),
+        ];
+        assert_eq!(SCHEMA_VERSION, 7);
+        for from in [5i64, 6] {
+            let db = tmp(&format!("migrate-v{from}.db"));
+            let _ = std::fs::remove_file(&db);
+            {
+                // The current schema minus what came after `from`.
+                drop(connect(&db).unwrap());
+                let con = Connection::open(&db).unwrap();
+                con.execute_batch("DROP TABLE fuzz_cases; DROP TABLE fuzz_runs;").unwrap();
+                let later: Vec<_> = V7.iter().chain(if from < 6 { V6 } else { &[] }).collect();
+                for (table, column) in later {
+                    con.execute_batch(&format!("ALTER TABLE {table} DROP COLUMN {column}")).unwrap();
+                }
+                con.execute("INSERT OR REPLACE INTO schema_version (id, version) VALUES (1, ?1)", [from]).unwrap();
+                con.execute_batch(
+                    "INSERT INTO runs (run_id, device_id, sm_arch, git_sha, started_at) VALUES ('old', 'spark', 121, 'abc1234', 't');
+                     INSERT INTO paired_results (shape, impl_a, impl_b, ratio, ci_lo, ci_hi, n, protocol_version, cache_mode,
+                       started_at, finished_at, sha_a, sha_b)
+                       VALUES ('8x8x8', 'a', 'b', 1.0, 0.9, 1.1, 30, 2, 'cold', 't', 't', '0bd0f22a35a6-dirty', '0bd0f22a35a6');",
+                )
+                .unwrap();
+            }
+            assert_eq!(check(&db).unwrap(), Compat::TooOld { found: from }, "v{from}: readers refuse it before migration");
+            let bak = backup_path(&db, from);
+            let con = connect(&db).unwrap();
+            assert_eq!(schema_version(&con).unwrap(), Some(SCHEMA_VERSION), "v{from} -> v{SCHEMA_VERSION}");
+            let run: (String, Option<String>, Option<String>, i64) = con
+                .query_row("SELECT git_sha, build_sha, kind, allow_dirty FROM runs WHERE run_id = 'old'", [], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                })
+                .unwrap();
+            assert_eq!(run, ("abc1234".into(), None, None, 0), "v{from}: the run survives; its build is unknown, not guessed");
+            let dirty: (Option<i64>, Option<i64>) = con
+                .query_row("SELECT build_dirty_a, build_dirty_b FROM paired_results", [], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap();
+            assert_eq!(dirty, (Some(1), Some(0)), "v{from}: dirty flags backfilled from the -dirty suffix");
+            drop(con);
+            assert_eq!(check(&db).unwrap(), Compat::Ok { version: SCHEMA_VERSION }, "v{from}: readable after migration");
+            let old = Connection::open(&bak).unwrap();
+            assert_eq!(schema_version(&old).unwrap(), Some(from), "the backup {} is the v{from} DB", bak.display());
+            drop(old);
+            std::fs::remove_file(&bak).ok();
+            std::fs::remove_file(&db).ok();
+        }
+    }
+
     fn row(idle: f64, busy: bool) -> String {
         format!(
             r#"{{"op":"gemm","impl":"x","config":{{}},"shape":{{"M":8,"N":8,"K":8}},"dtype":"f16f32f16","median_us":1.0,"p10_us":1.0,"p90_us":1.0,"tflops":1.0,"gbps":1.0,"reps":1,"checked":true,"pass":true,"max_abs_err":0.0,"rel_err":0.0,"sm_arch":121,"protocol_version":2,"cache_mode":"cold","idle_util_pct":{idle},"idle_source":"nvml","allow_busy":{busy},"build_sha":"{CLEAN}","build_dirty":false}}"#
