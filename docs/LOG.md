@@ -2349,3 +2349,43 @@ HEVC, VP8, VP9, AV1. NVENC: H264, HEVC, AV1.
     So the ctest uses seed 62.
 - **Hardening:** ctest 307/307 including sm87_gate. memcheck `test_lt_reduction`, 24 large-K
   fuzz cases (all three paths) and case 129: 0 errors (`artifacts/sanitizer/hardening-1/`).
+
+## 2026-10-18 — hardening 2: nightly kernel-log guard
+
+- **Why:** the 2026-10-18 nightly was skipped because of
+  `NVRM: refcntRequestReference_IMPL: Failed to enter state 1 (current state: 0, status: 0x00000056)`
+  at 19:44 the evening before. The driver logs it during Nsight Compute sessions (1,072 such
+  lines 2026-10-14..17).
+- **Session windows:**
+  - `tools/profiler_session.sh CMD` appends `begin <unix time> pid=... <cmd>` and
+    `end <unix time> pid=... rc=...` to `results/profiler_sessions.log`. The end line is
+    written by an EXIT trap, so it appears also when CMD fails. Nested calls log once.
+  - `tools/gpu_lock.sh` runs any command containing ncu, nsys, ncu_gemm.sh or profile_*.sh
+    through it, with the lock taken or already held.
+  - `tools/ncu_gemm.sh` and `microbench/profile_ldmatrix.sh` call ncu through it as well.
+- **Guard:** `tools/kernel_log_guard.sh` (kernel log as `journalctl -k -o short-unix`).
+  - An NVRM line is ignored only if it matches the known profiler pattern AND its time falls
+    inside a logged window, with 5 s of slack on each side. A window with no end line covers
+    1 h.
+  - Everything else blocks: any Xid, any other NVRM line, and a profiler-pattern line outside
+    every window.
+- **Nightly:**
+  - Summary lines are now `status=OK`, `status=FAIL` or `status=SKIPPED reason="..."`; a skip
+    also writes `== NIGHTLY SKIPPED: ...` in the detail log.
+  - The kernel-log check runs right after the lock.
+  - `--preflight-only` (lock + kernel-log guard) and the `AEGIS_NIGHTLY_SUMMARY`,
+    `AEGIS_NIGHTLY_DIR`, `AEGIS_KERNEL_LOG` overrides exist for the test.
+- **ctest `kernel_log_guard`:** 13 checks on lines recorded on the Spark
+  (`tests/fixtures/kernel_log/`: ncu refcnt lines of 2026-10-17 19:44, an Xid 43, an NVRM OOM
+  check, non-GPU lines).
+  - Ignored: profiler lines inside a window; inside the second of two windows; inside an
+    unclosed window.
+  - Blocked: profiler lines with no window, or after one; an Xid inside a window; another NVRM
+    line inside a window; profiler lines followed by an Xid. No GPU lines: clean.
+  - profiler_session.sh logs one window with the command's exit status. gpu_lock.sh logs ncu
+    with the lock taken and with it held, and nothing for other commands.
+  - The nightly: profiler lines with no window give `status=SKIPPED` with the reason; inside a
+    window, `status=PREFLIGHT_OK`; an Xid, `status=SKIPPED`.
+- **Real log since the last nightly start (2026-10-18 03:00:50):** clean, 0 GPU lines.
+  The 2026-10-17 profiles ran without session logging, so those lines would still block,
+  which is correct: no window was recorded for them.

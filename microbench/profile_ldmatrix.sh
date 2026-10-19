@@ -39,7 +39,7 @@ METRICS=(
 )
 for w in 8 16; do
   for r in $(seq 1 "$RUNS"); do
-    "$NCU" --clock-control none -k mb_ldmatrix_x4 --launch-skip 1 --launch-count 1 \
+    "$ROOT/tools/profiler_session.sh" "$NCU" --clock-control none -k mb_ldmatrix_x4 --launch-skip 1 --launch-count 1 \
       --metrics "$(IFS=,; echo "${METRICS[*]}")" --csv --page raw \
       "$ROOT/build/microbench/mb_ldmatrix" --warps "$w" > "$OUT/ldmatrix_ncu_w${w}_r$r.csv"
     echo "wrote $OUT/ldmatrix_ncu_w${w}_r$r.csv"

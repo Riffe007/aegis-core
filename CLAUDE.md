@@ -58,6 +58,8 @@ tools/sanitize.sh                                 # ctest suite under compute-sa
 tools/ncu_gemm.sh IMPL M N K; tools/ncu_summary.sh artifacts/ncu/*.ncu-rep   # Nsight profile + key metrics
 rust/target/release/aegis-perf paired-ab --a OLD/bench_gemm --b build/bench_gemm --impl X --shape M N K  # A/B across builds
 tools/nightly.sh                                  # nightly (user timer 03:00; --install): 50k fuzz, regression sweep, DB backup -> results/nightly.log
+                                                  # summary lines: status=OK / FAIL / SKIPPED reason="..."
+tools/kernel_log_guard.sh --since TIME            # new Xid / NVRM lines? (profiler lines inside logged sessions ignored)
 rust/target/release/aegis-perf regress --run R   # winners-header shapes: % of cublaslt_best in run R vs the newest earlier clean run;
                                                   # >3% drop = watch, regression if 2 consecutive nightlies or a paired-ab confirm
 rust/target/release/aegis-perf hw                 # hardware discovery JSON (GPU, CPU clusters/ISA, memory, thermal, NVDEC/NVENC)
@@ -330,7 +332,12 @@ only to compare with old rows (`--protocol 1`).
 - **Before any run:** `nvidia-smi` answers, no orphaned `bench_gemm`,
   `aegis_fuzz`, `aegis_tune` or `compute-sanitizer` processes, and no new
   `Xid` / `NVRM` errors in `dmesg` / `journalctl -k`. If anything looks wrong,
-  stop.
+  stop. Exception, and only this one: Nsight Compute makes the driver log
+  `NVRM: refcntRequestReference_IMPL: Failed to enter state 1 (...0x00000056)`.
+  `tools/kernel_log_guard.sh` (the nightly's check) ignores such a line only
+  inside a profiler session window logged in `results/profiler_sessions.log`
+  (`tools/profiler_session.sh`; gpu_lock.sh and the ncu wrappers use it). So run
+  ncu through `tools/gpu_lock.sh` or a wrapper, never bare.
 - **Sanitizer scope** (`tools/sanitize.sh`): one tool per invocation, never
   nested (the `memcheck_*` ctests are skipped by the script, as are `sm87_gate`
   and `gpu_budget_*`, which launch no kernels); JOBS 1 for

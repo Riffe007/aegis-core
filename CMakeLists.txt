@@ -201,6 +201,9 @@ add_test(NAME fuzz_poison COMMAND aegis_fuzz --cases 2000 --seed 21 --poison)
 # cuBLASLt-reference failure must be overruled by the FP64 reference.
 add_test(NAME fuzz_lt_reference_error COMMAND aegis_fuzz --seed 20261014 --case 24632 --poison)
 add_test(NAME fuzz_modes_same_cases COMMAND ${CMAKE_SOURCE_DIR}/tests/test_fuzz_modes.sh $<TARGET_FILE:aegis_fuzz>)
+# Nightly kernel-log guard: profiler NVRM lines inside logged profiler sessions are ignored,
+# everything else blocks; a skipped nightly says status=SKIPPED (recorded log lines).
+add_test(NAME kernel_log_guard COMMAND ${CMAKE_SOURCE_DIR}/tests/test_kernel_log_guard.sh)
 
 # sm_87 compile gate (Jetson Orin; CLAUDE.md Decisions: compile only, nothing
 # runs for sm_87 until the Jetson port). Every source with kernels is compiled

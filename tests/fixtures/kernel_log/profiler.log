@@ -1,0 +1,6 @@
+1792291458.347196 spark-5822 kernel: Bluetooth: hci0: ACL packet for unknown connection handle 3837
+1792291459.093290 spark-5822 kernel: NVRM: refcntRequestReference_IMPL: Failed to enter state 1 (current state: 0, status: 0x00000056)
+1792291459.288321 spark-5822 kernel: NVRM: refcntRequestReference_IMPL: Failed to enter state 1 (current state: 0, status: 0x00000056)
+1792291459.350541 spark-5822 kernel: NVRM: refcntRequestReference_IMPL: Failed to enter state 1 (current state: 0, status: 0x00000056)
+1792291460.041294 spark-5822 kernel: NVRM: refcntRequestReference_IMPL: Failed to enter state 1 (current state: 0, status: 0x00000056)
+1792291460.144290 spark-5822 kernel: NVRM: refcntRequestReference_IMPL: Failed to enter state 1 (current state: 0, status: 0x00000056)
