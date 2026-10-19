@@ -2836,3 +2836,57 @@ On this branch's build (CPU only, cuobjdump):
   Layout arguments (gemv, gemv_tc, mma_tma, CUDA-core tiers, helpers).
 - The old naming on the same binary left 107 files, so 174 listings were overwritten.
 - Not done: Nsight summaries per kernel (#6 item 2).
+
+## 2026-10-19 — repro merged; perf DB schema v7; aegis-perf-v0.8.0
+
+The `repro` branch (six commits from the "Correction: the decode record" entry through
+`sass_dump.sh`, above) was rebased onto main and fast-forwarded: main 00030f9..0de4f14, tagged
+`aegis-perf-v0.8.0` at 0de4f14 and pushed. The nightly timer was stopped for the merge.
+
+**Schema numbers.** Both sides had bumped to v6. Main's v6 is telemetry (measurements:
+max_temp_c, throttle_reasons, clock_event_reasons, sm_clock_min/max_mhz). Repro's v6, build
+identity (runs, paired_results, winners columns) plus the fuzz_runs / fuzz_cases tables, is
+v7 now. The two touch no common table. Migrations are column-presence based (`ADDED_COLUMNS`),
+so the order only decides the version number and the backup name. Repro's entries above say v7
+where they named its schema; the ones that report runs made on the branch say both numbers.
+Test `migrate_v5_and_v6_to_v7`: a v5 DB and a v6 DB each back up at their old version, keep
+their rows, get the v7 backfills (dirty flags from the `-dirty` suffix, unknown builds left
+NULL), and `check()` reads them as v7.
+
+**Folded into the rebased commits** (so each one builds and passes):
+- `calibrate` gets `--allow-dirty` and refuses a dirty or unknown build before any GPU work; it
+  passes the flag to tune, run_all.sh and run_latency_locked.sh (ALLOW_DIRTY=1).
+- `microbench/run_throttle_profile.sh` gets the same build gate as run_all.sh. Without it,
+  ingest-microbench now refuses its rows.
+- Main's two DB tests use the new `cmd_ingest` / `cmd_ingest_microbench` signatures.
+  `disturbed_microbench_run_replaces_nothing` wrote `tmp("clean.jsonl")`, the name repro's
+  `ingest_rows("clean")` uses. The tests share one pid, so the two raced: 4 failures in 30
+  runs. It writes `disturbed-mb-*.jsonl` now: 0 failures in 40 runs.
+
+**Checks.**
+- aegis-perf tests and clippy at every rebased commit: 41 / 46 / 46 / 48 / 55 / 55 / 56
+  passed, 0 clippy warnings.
+- GPU ctest on the tip under the lock: 311/311.
+
+**Live DB.**
+- Backed up with `sqlite3 .backup` to `results/aegis_perf.db.bak-v6-2026-10-19`.
+- Migrated v6 -> v7 by the tagged binary (aegis-perf 0.8.0, build 0de4f14 clean). Its own
+  backup is `...bak-v6-2026-10-19.1`.
+- `check-db`: "schema v7, readable".
+- Backfill: runs.kind is tune 21, sweep 12, microbench 17.
+- Of the 63 paired_results, 45 have a dirty A build and 60 a dirty B build. No pre-v7 paired
+  result is clean.
+
+**Nightly.**
+- `systemctl --user start aegis-nightly.timer` started the service in the same second, although
+  the timer is `Persistent=false` (journal 09:14:50). So a full nightly ran mid-morning: build
+  0de4f1431115 (main, clean), fuzz 50,000 cases with 0 failures, then the sweep FAILED. My
+  hand-run `--build-only` started with it and was SKIPPED on the lock.
+- Run again afterwards: `status=BUILD_OK main 0de4f143111546a39923e307ad0ba59dcdefdc00 clean`.
+- The sweep failure, also in the 03:00 nightly: `unknown impl 'aegis_matmul' (not in
+  bench_gemm --list)`, nothing ingested. The nightly sweeps aegis_matmul for the dispatch %
+  column. It is bench_gemm's dispatch entry, not a registry row, so `sweep --impls` refused it.
+  Fixed in a5cc03e: an explicit list may name it; the default list is unchanged; test
+  `explicit_impls_accept_the_dispatch`. Not yet confirmed by a nightly run.
+- Re-enabling the timer later: expect it to fire at once. Start it right after 03:00, or
+  accept a run.
