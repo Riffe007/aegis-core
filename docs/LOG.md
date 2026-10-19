@@ -2890,3 +2890,91 @@ NULL), and `check()` reads them as v7.
   `explicit_impls_accept_the_dispatch`. Not yet confirmed by a nightly run.
 - Re-enabling the timer later: expect it to fire at once. Start it right after 03:00, or
   accept a run.
+
+## 2026-10-19 — Clean re-run from aegis-perf-v0.8.0: tune, paired-ab, probes, header
+
+Built from the tag in a clean worktree (`../aegis-v0.8.0`). `bench_gemm --build-info` gives
+0de4f143111546a39923e307ad0ba59dcdefdc00, `build_dirty: false`. Every GPU step held the GPU
+lock, passed the idle guard (no --allow-busy, no --allow-dirty) and ran under
+`tools/screen_off.sh`. Every row used below names that full SHA, is clean, and is not
+disturbed.
+
+**Tunes.**
+- ba4b0b1cc736: the decode shapes plus the 4 shapes where calibrate's winners differed (7 in
+  all).
+- 450accefed68: the other 7 tracked shapes. Without them the header could not come from clean
+  results only.
+
+**Header winner vs calibrate's winner** (paired-ab, B/A time, B = calibrate's):
+
+| shape | header (A) | calibrate (B) | B/A [95% CI] | id | decision |
+|---|---|---|---|---|---|
+| 1x896x4864 | gemv_tc_16x64x64_1x4_s5_ksm | gemv_tc_16x64x32_1x4_s8_ksm | 1.0016 [0.9746, 1.0059] | 64 | tie: kept |
+| 512x896x4864 | mma_pipe_64x64x32_2x2_s3 | mma_tma_128x128x64_2x4_s3 | 0.9738 [0.9673, 0.9769] | 65 | win: changed |
+| 1x4864x896 | gemv_tc_16x128x32_1x4_s6_ksm | gemv_tc_16x128x64_1x4_s4_ksm | 1.0048 [0.9913, 1.0210] | 66 | tie: kept |
+| 16x4864x896 | gemv_tc_16x128x32_1x4_s6_ksm | gemv_tc_16x64x64_1x4_s4_ksm | 0.9949 [0.9884, 1.0037] | 67 | tie: kept |
+
+**Tune picks vs the header.** The clean tune picked other decode configs on 5 shapes. Paired-ab
+of each pick (B) against the header's config (A):
+- 1x896x896: s5 vs s6, 1.0135 [1.0098, 1.0170] (id 68). The header's s6 is faster, the opposite
+  of the tune's own tie test (s5 faster by 1.5-2.4%).
+- 1x896x4864: s6 vs s5, 0.9994 [0.9941, 1.0048] (id 69). Tie.
+- 16x896x4864: s6 vs s5, 1.0021 [0.9960, 1.0065] (id 71). Tie.
+- 16x4864x896: 16x128x64 s4 vs 16x128x32 s6, 0.9973 [0.9937, 1.0013] (id 70). Tie.
+- 1x4864x896: as id 66 above. Tie.
+
+`emit-header` writes the DB winners, which may not be hand-edited, so "adopt only on a
+CI-confirmed win" needed tooling. The incumbent rule (16e1787, CLAUDE.md rule 11): the
+committed header's config stays unless the newest clean paired-ab shows the pick faster with
+its CI below 1. The regenerated header changes one config, 512x896x4864 to
+mma_tma_128x128x64_2x4_s3.
+
+**Kernel vs cublaslt_best** (paired-ab, 30 pairs, cold; % = 1 / (winner / cublaslt_best time),
+CI inverted; win/tie/loss on the CI). Bars: >= 90% for shapes >= 1024 in every dimension, >= 100%
+(tie or win) for decode, >= 80% for every kernel the dispatch runs.
+
+| shape | winner | % [95% CI] | id | call | dispatch | bar |
+|---|---|---|---|---|---|---|
+| 256x256x256 | mma_pipe_64x64x32_2x2_s4 | 81.9 [81.7, 82.0] | 92 | loss | aegis | floor pass |
+| 512x512x512 | mma_pipe_64x64x32_2x2_s4 | 86.5 [85.9, 87.0] | 73 | loss | aegis | floor pass |
+| 1024x1024x1024 | mma_pipe_128x64x32_2x2_s2 | 98.4 [97.1, 98.7] | 74 | loss | aegis | >= 90 pass |
+| 2048x2048x2048 | mma_tma_128x128x32_2x4_s3 | 85.7 [85.2, 86.2] | 75 | loss | aegis | >= 90 FAIL |
+| 4096x4096x4096 | mma_tma_128x256x32_2x4_s4 | 74.0 [73.9, 74.1] | 76 | loss | cublaslt | >= 90 FAIL (kernel); floor met by dispatch |
+| 1x896x896 | gemv_tc_16x64x64_1x4_s6_ksm | 108.8 [107.3, 109.7] | 81 | win | aegis | pass |
+| 1x4864x896 | gemv_tc_16x128x32_1x4_s6_ksm | 100.3 [99.3, 100.7] | 87 | tie | aegis | pass (tie) |
+| 1x896x4864 | gemv_tc_16x64x64_1x4_s5_ksm | 104.5 [103.8, 105.1] | 83 | win | aegis | pass |
+| 16x896x896 | gemv_tc_16x64x64_1x4_s6_ksm | 119.8 [119.3, 120.0] | 80 | win | aegis | pass |
+| 16x4864x896 | gemv_tc_16x128x32_1x4_s6_ksm | 100.8 [100.1, 101.2] | 89 | win | aegis | pass |
+| 16x896x4864 | gemv_tc_16x64x64_1x4_s5_ksm | 101.2 [100.5, 101.8] | 85 | win | aegis | pass |
+| 512x896x896 | mma_pipe_64x64x32_2x2_s4 | 92.3 [92.0, 92.8] | 77 | loss | aegis | floor pass |
+| 512x4864x896 | mma_pipe_128x64x32_2x2_s2 | 80.3 [79.9, 80.6] | 78 | loss | cublaslt | floor met by dispatch |
+| 512x896x4864 | mma_tma_128x128x64_2x4_s3 | 87.2 [85.9, 87.9] | 79 | loss | aegis | floor pass |
+
+- The dispatch % (aegis_matmul) was not measured. The tag build carries the old header, so it is
+  unmeasured for the new one.
+- Paired-ab and the tunes' in-process paired tests disagree at 256^3: 81.9% here vs 91.6%
+  [91.4, 91.7] in tune 450accefed68. Elsewhere they agree within 1.6 points, except 16x896x896
+  (119.8% vs 114.6%). The header carries the tune's CI where the tune paired the winner, and the
+  paired-ab CI for the 5 kept incumbents.
+- id 72 (256^3, nautilus) and id 91 (gnome-shell) were marked disturbed; id 92 is the clean
+  re-run. Two other runs were refused by the blocking idle guard (18% and 7%) and re-run.
+
+**Verdict changes against the 2026-10-18 header.**
+- 512x896x4864: its kernel CI straddled the 80% floor (79.8-80.7%); with the new winner it is
+  85.9-87.9%.
+- Every other win/tie/loss call is unchanged. 1x4864x896 is still a tie.
+- 16x896x4864 was a tie in the dirty Phase C record. On clean builds it is a win (s5, header and
+  paired-ab both).
+
+**Probes** (run_all.sh, run 19e7a4ecf8a3). `sudo -n` needs a password, so clocks were unlocked
+and recorded as `clocks_locked: false` (NVML: Insufficient Permissions; 2407 MHz before and
+after). All SASS proofs passed. Regenerated sm_121.json against the 2026-10-15 file:
+- DRAM latency: 950.7 cycles (956.6).
+- L2 latency: 335.41 cycles (335.44).
+- Read bandwidth: 250.0 GB/s (257.8).
+- Write bandwidth: 238.6 GB/s (236.7).
+- mma peak: 118.2 TFLOP/s (125.6). The same 0.24998 HMMA per clock per SM, so the clock was
+  lower during that probe.
+
+**SASS** (`tools/sass_dump.sh`, tag build): 281 symbols, 281 listings, BUILD 0de4f14 clean. No
+kernel uses local memory. One mma_pipe instantiation has a 16-byte stack frame.

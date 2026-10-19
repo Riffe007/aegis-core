@@ -2,68 +2,68 @@
   "copy_bw_gbps": {
     "method": "cudaMemcpyAsync D2D, 512 MiB, (read + write bytes) / time; median of 20 copies per rep, median of reps",
     "reps": [
-      236.696,
-      236.739,
-      230.24,
-      236.317,
-      237.948
+      239.999,
+      238.684,
+      238.64,
+      238.47,
+      237.922
     ],
     "source": {
       "probe": "dram_bandwidth",
-      "run_id": "941ff9215564",
+      "run_id": "19e7a4ecf8a3",
       "stream": "memcpy_d2d"
     },
-    "value": 236.696
+    "value": 238.64
   },
   "device": "NVIDIA GB10",
   "dram_latency": {
     "clock_spread_pct": 0.0,
     "clocks_locked": false,
     "combine": "source-run clocks within 2%",
-    "cycles": 956.6305,
-    "cycles_max": 964.767,
-    "cycles_min": 952.092,
+    "cycles": 950.6669999999999,
+    "cycles_max": 959.581,
+    "cycles_min": 886.495,
     "method": "dependent-load pointer chase, one thread, 128 B node stride, median of 5 repeats per point; cycles = median across points and runs; ns are derived by readers (cycles / clock)",
     "points": 10,
     "probe": "ptr_chase_latency",
-    "ref_clock_mhz": 2406.78,
+    "ref_clock_mhz": 2406.68,
     "ref_clock_rule": "the highest source-run SM clock (clocks not locked in every source run)",
     "runs": [
       {
-        "clock_lock": null,
-        "clocks_locked": null,
-        "cycles": 956.6305,
+        "clock_lock": "lock requested at 2418 MHz via NVML: Insufficient Permissions; measured 2407 / 2407 MHz before / after",
+        "clocks_locked": false,
+        "cycles": 950.6669999999999,
         "layout": "both",
         "points": 10,
-        "run_id": "a825f4e557a3",
-        "sm_clock_mhz": 2406.78
+        "run_id": "19e7a4ecf8a3",
+        "sm_clock_mhz": 2406.68
       }
     ],
     "working_sets": ">= 32 MiB"
   },
-  "generated_by": "aegis-perf emit-arch on spark-5822, 2026-10-15 00:54 UTC",
+  "generated_by": "aegis-perf emit-arch on spark-5822, 2026-10-19 16:53 UTC",
   "l2_bytes": 25165824,
   "l2_latency": {
     "clock_spread_pct": 0.0,
     "clocks_locked": false,
     "combine": "source-run clocks within 2%",
-    "cycles": 335.437,
-    "cycles_max": 335.448,
-    "cycles_min": 335.379,
+    "cycles": 335.411,
+    "cycles_max": 335.428,
+    "cycles_min": 335.334,
     "method": "dependent-load pointer chase, one thread, 128 B node stride, median of 5 repeats per point; cycles = median across points and runs; ns are derived by readers (cycles / clock)",
     "points": 12,
     "probe": "ptr_chase_latency",
-    "ref_clock_mhz": 2406.78,
+    "ref_clock_mhz": 2406.68,
     "ref_clock_rule": "the highest source-run SM clock (clocks not locked in every source run)",
     "runs": [
       {
-        "clock_lock": null,
-        "clocks_locked": null,
-        "cycles": 335.437,
+        "clock_lock": "lock requested at 2418 MHz via NVML: Insufficient Permissions; measured 2407 / 2407 MHz before / after",
+        "clocks_locked": false,
+        "cycles": 335.411,
         "layout": "both",
         "points": 12,
-        "run_id": "a825f4e557a3",
-        "sm_clock_mhz": 2406.78
+        "run_id": "19e7a4ecf8a3",
+        "sm_clock_mhz": 2406.68
       }
     ],
     "working_sets": "256 KiB - 8 MiB"
@@ -74,30 +74,30 @@
       "sms": 48,
       "warps_per_sm": 32
     },
-    "hmma_per_clk_per_sm": 0.249981,
+    "hmma_per_clk_per_sm": 0.249982,
     "instruction": "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32",
     "source": {
       "probe": "mma_throughput",
-      "run_id": "eb3e197afc8e"
+      "run_id": "19e7a4ecf8a3"
     },
-    "tflops": 125.597
+    "tflops": 118.221
   },
   "note": "Measured on this device (CLAUDE.md rule 8). Regenerate with aegis-perf emit-arch after re-running the probes; do not edit by hand.",
   "read_bw_gbps": {
     "method": "read-only stream, 4 independent 128-bit loads per thread per iteration (SASS-proven), 512 MiB, bytes read / time; median of 20 runs per rep, median of reps",
     "reps": [
-      258.27,
-      257.841,
-      256.086,
-      258.764,
-      257.0
+      249.91,
+      249.959,
+      250.156,
+      249.873,
+      250.833
     ],
     "source": {
       "probe": "dram_bandwidth",
-      "run_id": "941ff9215564",
+      "run_id": "19e7a4ecf8a3",
       "stream": "read_v4"
     },
-    "value": 257.841
+    "value": 249.959
   },
   "roof_rule": "memory roof: read_bw_gbps for GEMV and decode shapes (M <= 16), copy_bw_gbps elsewhere",
   "schema": "aegis-arch-params/3",
