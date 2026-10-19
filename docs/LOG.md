@@ -2561,3 +2561,35 @@ HEVC, VP8, VP9, AV1. NVENC: H264, HEVC, AV1.
   - Rust `ingest_stores_telemetry`.
 - **Hardening:** memcheck `test_telemetry`, `bench_gemm --telemetry` (decode kernel) and a 3 s
   `mb_throttle_profile`: 0 errors (`artifacts/sanitizer/hw-step7/`).
+
+## 2026-10-18 — aegis-hw step 8: CPU thread pool
+
+- **`aegis::cpu::ThreadPool`** (`src/cpu/thread_pool.{h,cpp}`, in aegis_kernels), for the
+  AArch64 GEMV in stage 2:
+  - Sized from discovery: one worker per physical core of the chosen class.
+    `CoreClass::Performance` is the default (the 10 Cortex-X925 on the Spark, CPUs 5-9 and
+    15-19). `CoreClass::Efficiency` is every other class (the 10 Cortex-A725, 0-4 and 10-14),
+    for background work. A CPU with one class (Orin) falls back to that class and says so.
+  - Each worker pins itself (sched affinity) before it can run anything.
+  - `submit(fn, ctx)`: a function pointer and a context into a fixed ring (allocated at
+    construction); false when full.
+  - `parallel_for(n, f)`: dynamic split over the workers and the caller; the job lives on the
+    caller's stack. `wait_idle()`.
+  - Nothing allocates on the submit path.
+- **Discovery:** `CoreType::physical_cpus`, one logical CPU per core (`topology/core_cpus_list`,
+  else `thread_siblings_list`), so SMT siblings count once. The JSON adds `physical_cpus`.
+  `tools/record_hw_fixture.sh` records both files; the spark-gb10 fixture has them (copied
+  from this machine's sysfs; no SMT on GB10).
+- **ctest `thread_pool`,** 12 checks:
+  - Fixtures: spark-gb10 performance = 5-9, 15-19, efficiency = 0-4, 10-14; orin-nano-synthetic
+    efficiency falls back to its one class; SMT siblings count once; the fixture pool has 10
+    unpinned workers when asked.
+  - This machine: 10 workers pinned to the X925s, and every index a worker ran ran on that
+    worker's core (sched_getcpu); an efficiency pool of 10 runs each task on its A725.
+  - max_threads caps; parallel_for covers 200 x 10007 indices exactly once each; an 8-slot ring
+    refuses when full and every accepted task runs.
+  - Global operator new is counted: 1000 submit + 1000 parallel_for + wait_idle allocate 0
+    times.
+- **Hardening:** ThreadSanitizer build of the test, 3 runs, 0 warnings
+  (`artifacts/sanitizer/hw-step8/`). CPU-only code, so no GPU launch path changed and there was
+  nothing for memcheck to cover.

@@ -76,6 +76,7 @@ add_library(aegis_kernels STATIC
   src/hw/profile.cpp
   src/hw/discover.cpp
   src/hw/telemetry.cpp
+  src/cpu/thread_pool.cpp
   ${CMAKE_BINARY_DIR}/generated/arch_profiles.cpp
 )
 target_include_directories(aegis_kernels PUBLIC include)
@@ -327,6 +328,12 @@ target_link_libraries(test_telemetry PRIVATE aegis_kernels Threads::Threads)
 target_include_directories(test_telemetry PRIVATE src)
 target_compile_definitions(test_telemetry PRIVATE AEGIS_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 add_test(NAME telemetry COMMAND test_telemetry)
+# CPU thread pool (stage 2 CPU kernels): sized from discovery, pinned, no allocation on submit.
+add_executable(test_thread_pool tests/test_thread_pool.cpp)
+target_link_libraries(test_thread_pool PRIVATE aegis_kernels Threads::Threads)
+target_include_directories(test_thread_pool PRIVATE src)
+target_compile_definitions(test_thread_pool PRIVATE AEGIS_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+add_test(NAME thread_pool COMMAND test_thread_pool)
 add_test(NAME hw_profile_row_label COMMAND bench_gemm --impl cublas --m 64 --n 64 --k 64 --reps 2)
 set_tests_properties(hw_profile_row_label PROPERTIES ENVIRONMENT AEGIS_PROFILE_EMBEDDED=0
   PASS_REGULAR_EXPRESSION "\"profile\":\"unmeasured\"")

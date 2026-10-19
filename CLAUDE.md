@@ -91,6 +91,8 @@ src/gemm/           one .cu per implementation tier, registry.cu, mma_common.cuh
                     workspace.{h,cu} (per-stream workspace cache: split-K counters/partials, cuBLASLt)
 src/hw/             device.{h,cu}: per-device limits (SM count, smem, regs, L2), per-device once, simulated profiles;
                     discover.cpp: hardware discovery (include/aegis/hw.h; C ABI 1.3 aegis_hw_*)
+src/cpu/            thread_pool.{h,cpp}: CPU worker pool sized from discovery (physical performance or
+                    efficiency cores), pinned, no allocation on submit; for the AArch64 kernels (stage 2)
 tests/fixtures/hw/  sysfs/procfs trees for discovery tests: spark-gb10 (recorded, tools/record_hw_fixture.sh),
                     orin-nano-synthetic (hand-written L4T layout until a Nano is connected)
 src/                matmul.cu, capi.cpp, manifest.cpp; src/bench/ harness (timing protocol)

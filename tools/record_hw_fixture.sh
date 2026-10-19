@@ -24,6 +24,8 @@ copy $cpu/online
 for d in $cpu/cpu[0-9]*; do
   copy "$d/topology/cluster_id"
   copy "$d/topology/physical_package_id"
+  copy "$d/topology/core_cpus_list"
+  copy "$d/topology/thread_siblings_list"
   copy "$d/cpu_capacity"
   copy "$d/cpufreq/cpuinfo_min_freq"
   copy "$d/cpufreq/cpuinfo_max_freq"

@@ -121,6 +121,7 @@ constexpr CoreName kCores[] = {
 struct CpuRaw {
   int cpu = -1;
   int cluster = -1;
+  int core_first = -1;  // lowest logical CPU of its physical core
   uint32_t implementer = 0, part = 0;
   int capacity = -1;
   long long min_khz = -1, max_khz = -1;
@@ -221,6 +222,15 @@ CpuInfo discover_cpu(const DiscoverOptions& opt) {
     r.cpu = cpu;
     r.cluster = int(read_ll(opt.root, d + "/topology/cluster_id").value_or(-1));
     if (r.cluster < 0) r.cluster = int(read_ll(opt.root, d + "/topology/physical_package_id").value_or(-1));
+    // SMT: the core's first logical CPU represents it (core_cpus_list, older kernels
+    // thread_siblings_list; neither: its own core).
+    r.core_first = cpu;
+    for (const char* f : {"/topology/core_cpus_list", "/topology/thread_siblings_list"})
+      if (const auto l = read_file(opt.root, d + f)) {
+        const std::vector<int> sib = parse_cpulist(*l);
+        if (!sib.empty()) r.core_first = *std::min_element(sib.begin(), sib.end());
+        break;
+      }
     r.capacity = int(read_ll(opt.root, d + "/cpu_capacity").value_or(-1));
     r.min_khz = read_ll(opt.root, d + "/cpufreq/cpuinfo_min_freq").value_or(-1);
     r.max_khz = read_ll(opt.root, d + "/cpufreq/cpuinfo_max_freq").value_or(-1);
@@ -244,6 +254,7 @@ CpuInfo discover_cpu(const DiscoverOptions& opt) {
     t.implementer = r.implementer;
     t.part = r.part;
     t.cpus.push_back(r.cpu);
+    if (r.core_first == r.cpu) t.physical_cpus.push_back(r.cpu);
     t.capacity = std::max(t.capacity, r.capacity);
     t.max_khz = std::max<int64_t>(t.max_khz, r.max_khz);
     if (r.min_khz >= 0) t.min_khz = t.min_khz < 0 ? r.min_khz : std::min<int64_t>(t.min_khz, r.min_khz);
@@ -721,7 +732,7 @@ std::string to_json(const HwInfo& h) {
     const CoreType& t = c.core_types[i];
     char midr[32];
     std::snprintf(midr, sizeof midr, "0x%02x/0x%03x", t.implementer, t.part);
-    o += std::string(i ? "," : "") + "{\"name\":" + esc(t.name) + ",\"midr\":" + esc(midr) + ",\"cpus\":" + ints(t.cpus) +
+    o += std::string(i ? "," : "") + "{\"name\":" + esc(t.name) + ",\"midr\":" + esc(midr) + ",\"cpus\":" + ints(t.cpus) + ",\"physical_cpus\":" + ints(t.physical_cpus) +
          ",\"min_khz\":" + std::to_string(t.min_khz) + ",\"max_khz\":" + std::to_string(t.max_khz) +
          ",\"capacity\":" + std::to_string(t.capacity) + ",\"performance\":" + b(t.performance) + "}";
   }

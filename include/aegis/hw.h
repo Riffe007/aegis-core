@@ -52,6 +52,9 @@ struct CoreType {
   std::string name;              // "Cortex-X925", ..., or "arm:0x41/0xd85" when unknown
   uint32_t implementer = 0, part = 0;
   std::vector<int> cpus;
+  // One logical CPU per physical core (the lowest of each topology/core_cpus_list
+  // group; without the file every CPU is its own core): SMT siblings counted once.
+  std::vector<int> physical_cpus;
   int64_t min_khz = -1, max_khz = -1;  // cpufreq cpuinfo_{min,max}_freq
   int capacity = -1;                   // cpu_capacity (max over its cpus)
   bool performance = false;            // the highest max_khz (then capacity) class
