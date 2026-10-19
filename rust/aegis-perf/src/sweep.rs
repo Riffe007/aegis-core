@@ -55,6 +55,22 @@ pub fn default_impls(bench: &Path) -> Result<Vec<String>> {
     Ok(impls)
 }
 
+/// bench_gemm's `--impl aegis_matmul`: the aegis::matmul dispatch itself. Not a
+/// registry entry, so not in `--list` or the default list, but an explicit
+/// `--impls` may name it (the nightly sweep does, for the dispatch % column).
+pub const DISPATCH_IMPL: &str = "aegis_matmul";
+
+/// Every name in an explicit `--impls` list is a baseline, a registry entry or
+/// the dispatch.
+pub fn check_impls(list: &[String], registered: &[String]) -> Result<()> {
+    for i in list {
+        if i != DISPATCH_IMPL && !registered.contains(i) {
+            bail!("unknown impl '{i}' (not in bench_gemm --list)");
+        }
+    }
+    Ok(())
+}
+
 /// One idle-guard reading (bench_gemm --idle-check), recorded on every run.
 #[derive(Clone, Debug, PartialEq)]
 pub struct IdleReading {
@@ -195,11 +211,7 @@ pub fn cmd_sweep(a: &SweepArgs) -> Result<String> {
     let registered = default_impls(&bench)?;
     let impls = match a.impls.clone() {
         Some(list) => {
-            for i in &list {
-                if !registered.contains(i) {
-                    bail!("unknown impl '{i}' (not in bench_gemm --list)");
-                }
-            }
+            check_impls(&list, &registered)?;
             list
         }
         None => registered,
@@ -248,6 +260,17 @@ pub fn cmd_sweep(a: &SweepArgs) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The nightly's --impls (cublas cublaslt_best aegis_matmul <winners>) passes; a
+    /// typo does not (2026-10-19: the nightly sweep failed on aegis_matmul).
+    #[test]
+    fn explicit_impls_accept_the_dispatch() {
+        let registered: Vec<String> = ["cublas", "cublaslt_best", "tiled"].map(String::from).to_vec();
+        let nightly: Vec<String> = ["cublas", "cublaslt_best", "aegis_matmul", "tiled"].map(String::from).to_vec();
+        check_impls(&nightly, &registered).unwrap();
+        let err = check_impls(&["tiledd".to_string()], &registered).unwrap_err();
+        assert!(err.to_string().contains("unknown impl 'tiledd'"), "{err}");
+    }
 
     #[test]
     fn idle_reading_passes_and_busy_reading_aborts_unless_allowed() {
