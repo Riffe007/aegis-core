@@ -63,6 +63,8 @@ tools/kernel_log_guard.sh --since TIME            # new Xid / NVRM lines? (profi
 rust/target/release/aegis-perf regress --run R   # winners-header shapes: % of cublaslt_best in run R vs the newest earlier clean run;
                                                   # >3% drop = watch, regression if 2 consecutive nightlies or a paired-ab confirm
 rust/target/release/aegis-perf hw                 # hardware discovery JSON (GPU, CPU clusters/ISA, memory, thermal, NVDEC/NVENC)
+rust/target/release/aegis-perf calibrate [--dry-run] [--out-dir DIR]  # this device: microbench (clocks locked if sudo -n can), tune, then
+                                                  # DIR/arch/sm_<arch>.json + DIR/winners/sm_<arch>.h (default include/aegis); step times -> results/calibrate-history.jsonl
 tools/record_hw_fixture.sh tests/fixtures/hw/NAME # record a device's sysfs for the discovery tests
 tools/screen_off.sh CMD                          # run CMD with the local display blanked (in-run idle watch; see Benchmark policy)
 ./build/bench_gemm --impl aegis_matmul ...       # time aegis::matmul itself (dispatch), e.g. paired-ab --impl cublaslt_best --impl-b aegis_matmul

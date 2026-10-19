@@ -2437,3 +2437,51 @@ HEVC, VP8, VP9, AV1. NVENC: H264, HEVC, AV1.
   runtime launch 9.46 µs; 1x4864x896 13.41 vs. 13.30; 1x896x4864 13.78 vs. 13.60.
 - **Hardening:** memcheck test_matmul (API errors off, as before) and 100 decode fuzz cases
   (gemv_, matmul): 0 errors (`artifacts/sanitizer/hardening-4/`).
+
+## 2026-10-18 — hardening 5: tag aegis-perf-v0.6.0
+
+- Tagged `aegis-perf-v0.6.0` at 8dcb752 and pushed it: aegis-perf 0.6.0, perf DB schema v5.
+  It covers aegis-hw part 1 and hardening 1-4.
+
+## 2026-10-18 — aegis-hw step 6: aegis-perf calibrate
+
+- **`aegis-perf calibrate [--dry-run] [--out-dir DIR]`** (`rust/aegis-perf/src/calibrate.rs`):
+  1. Hardware discovery names the device. The GPU lock is held for the whole run and passed
+     to every step.
+  2. Clocks are locked with `sudo -n nvidia-smi -lgc` at the default applications clock if
+     sudo needs no password; otherwise the latency probes run unlocked, and that is recorded.
+  3. `microbench/run_all.sh`.
+  4. Only when step 2 locked the clocks: `run_latency_locked.sh`, then `-rgc`.
+  5. `aegis-perf tune` of shapes/default.txt.
+  6. emit-arch and emit-header into DIR/arch and DIR/winners. The default DIR is include/aegis
+     (the committed files).
+  Every step keeps its own idle guard, in-run watch and GPU budget. Each step's time and run go
+  to `results/calibrate-history.jsonl` and DIR/calibrate.json.
+  - If DIR is not include/aegis, the new arch file's cycle counts are compared with the
+    committed one's.
+  - A disturbed step (its rows don't count) is reported and calibrate exits with an error.
+  - `--dry-run` lists the steps and estimates each from this device's last calibrate, or from a
+    stated rough model when there is none.
+- **Dry run on the Spark:** first ~16m29s, all rough models; after a run ~1m59s (microbench
+  1m06s, tune 49s, from history).
+- **Full run into `results/calibrate-scratch-20261018`:**
+  - The first attempt's tune (run df3f7eb3537a) was disturbed: gnome-shell used up to 5% of
+    the GPU with the screen off. Calibrate then still exited 0. Since this change it warns and
+    fails on a disturbed step.
+  - Second run, both steps clean: microbench 73b6fddb5677 (66 s), tune b306efb675b0 (48 s, 674
+    configs timed). Clocks unlocked (sudo -n needs a password), ref clock 2406.7 MHz.
+
+  | arch file | committed | calibrate | diff |
+  |---|---|---|---|
+  | l2_latency cycles | 335.44 | 335.43 | -0.00% |
+  | dram_latency cycles | 956.63 | 953.47 | -0.33% |
+
+  Both are within 3%.
+- **Winners:** with tune b306efb675b0 counted, the perf DB's winners differ from the committed
+  sm_121.h on 5 shapes. The scratch header has, for example:
+  - 1x896x4864 `gemv_tc_16x64x32_1x4_s8_ksm` (105.6% of cublaslt_best);
+  - 512x896x4864 `mma_tma_128x128x64_2x4_s3` (86.1%);
+  - 1x4864x896 `gemv_tc_16x128x64_1x4_s4_ksm` (100.5%);
+  - 16x4864x896 `gemv_tc_16x64x64_1x4_s4_ksm` (100.6%).
+  The committed header was not regenerated. Whether to adopt these needs paired-ab against the
+  current winners: open.

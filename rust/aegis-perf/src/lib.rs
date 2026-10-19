@@ -14,6 +14,7 @@ pub mod tune;
 pub mod view;
 pub mod watch;
 pub mod regress;
+pub mod calibrate;
 
 /// The rusqlite this crate is built against, so viewers name the same `Connection`.
 pub use rusqlite;

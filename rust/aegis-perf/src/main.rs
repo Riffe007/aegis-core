@@ -12,9 +12,10 @@
 //!     aegis-perf emit-arch --arch 121 [--ptr-chase RUN[:LAYOUT]]...
 //!     aegis-perf paired-ab --a OLD/build/bench_gemm --b build/bench_gemm --impl X --shape M N K
 //!     aegis-perf hw [--root FIXTURE] [--no-cuda] [--no-nvml]   (hardware discovery JSON)
+//!     aegis-perf calibrate [--dry-run] [--out-dir DIR]   (microbench + tune -> arch json + winners header)
 use std::path::PathBuf;
 
-use aegis_perf::{ab, arch, db, regress, roofline, sweep, tune, watch};
+use aegis_perf::{ab, arch, calibrate, db, regress, roofline, sweep, tune, watch};
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
@@ -116,6 +117,25 @@ enum Cmd {
         /// (e.g. the previous winner), when it is not already the runner-up.
         #[arg(long)]
         pair_with: Option<String>,
+        #[arg(long, default_value = "build")]
+        build_dir: PathBuf,
+        #[arg(long, default_value = "results")]
+        results_dir: PathBuf,
+    },
+    /// Measure this device end to end: microbenchmarks (clocks locked if `sudo -n` can),
+    /// tune of the tracked shapes, then arch/sm_<arch>.json and winners/sm_<arch>.h.
+    Calibrate {
+        /// List the steps with an estimated duration; run nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Where arch/ and winners/ go (default include/aegis: the committed files).
+        #[arg(long, default_value = "include/aegis")]
+        out_dir: PathBuf,
+        #[arg(long, default_value = "shapes/default.txt")]
+        shapes: PathBuf,
+        /// Pass --allow-busy to every step (rows are marked; not evidence).
+        #[arg(long)]
+        allow_busy: bool,
         #[arg(long, default_value = "build")]
         build_dir: PathBuf,
         #[arg(long, default_value = "results")]
@@ -302,6 +322,17 @@ fn main() -> Result<()> {
             serde_json::from_slice::<serde_json::Value>(&out.stdout)?;
             print!("{}", String::from_utf8_lossy(&out.stdout));
             Ok(())
+        }
+        Cmd::Calibrate { dry_run, out_dir, shapes, allow_busy, build_dir, results_dir } => {
+            calibrate::cmd_calibrate(&calibrate::CalibrateArgs {
+                db: &cli.db,
+                build: &build_dir,
+                results: &results_dir,
+                shapes: &shapes,
+                out_dir: &out_dir,
+                dry_run,
+                allow_busy,
+            })
         }
         Cmd::EmitHeader { arch, out, results_dir } => {
             tune::cmd_emit_header(&cli.db, arch, &results_dir, out.as_deref())
