@@ -2389,3 +2389,20 @@ HEVC, VP8, VP9, AV1. NVENC: H264, HEVC, AV1.
 - **Real log since the last nightly start (2026-10-18 03:00:50):** clean, 0 GPU lines.
   The 2026-10-17 profiles ran without session logging, so those lines would still block,
   which is correct: no window was recorded for them.
+
+## 2026-10-18 — hardening 3: libaegis_capi.so exports only aegis_*
+
+- **Before:** 26 defined dynamic symbols: the 20 C ABI functions plus 6 C++ standard-library
+  instantiations from capi.cpp (`std::string` destructors and `_M_dispose`, a
+  `std::map<int, std::string>` destructor and `_M_emplace_hint_unique`).
+  `-fvisibility=hidden` and `--exclude-libs,ALL` did not cover them: they are weak symbols
+  defined in capi.cpp's own object.
+- **Fix:** linker version script `src/capi.map` (`global: aegis_*; local: *;`). It is
+  anonymous, so the symbols stay unversioned as before and nothing that links the library
+  changes.
+- **ctest `capi_exports`** (`tests/test_capi_exports.sh`): every symbol in
+  `nm -D --defined-only` is an `aegis_*` function declared `AEGIS_API` in aegis.h, and every
+  declared function is exported. Before the fix it failed and listed the 6 std:: symbols;
+  now it reports 20 exported, 20 declared.
+- capi_static, capi_shared, the Rust bindings' tests (dynamic link) and sm87_gate pass;
+  memcheck capi_test_shared: 0 errors.

@@ -136,6 +136,10 @@ add_library(aegis_capi_shared SHARED $<TARGET_OBJECTS:aegis_capi_objs>)
 target_link_libraries(aegis_capi_shared PRIVATE aegis)
 # Keep symbols from the static kernel/matmul libraries out of the dynamic table.
 target_link_options(aegis_capi_shared PRIVATE -Wl,--exclude-libs,ALL)
+# And only aegis_* in it at all: inline / template instantiations from capi.cpp
+# (std::string, std::map) were exported too until 2026-10-18 (ctest capi_exports).
+target_link_options(aegis_capi_shared PRIVATE -Wl,--version-script=${CMAKE_SOURCE_DIR}/src/capi.map)
+set_target_properties(aegis_capi_shared PROPERTIES LINK_DEPENDS ${CMAKE_SOURCE_DIR}/src/capi.map)
 set_target_properties(aegis_capi_static aegis_capi_shared PROPERTIES OUTPUT_NAME aegis_capi)
 set_target_properties(aegis_capi_shared PROPERTIES CUDA_VISIBILITY_PRESET hidden
                                                    VISIBILITY_INLINES_HIDDEN ON
@@ -194,6 +198,8 @@ endforeach()
 add_test(NAME matmul_dispatch COMMAND test_matmul)
 add_test(NAME capi_static COMMAND capi_test_static)
 add_test(NAME capi_shared COMMAND capi_test_shared)
+add_test(NAME capi_exports COMMAND ${CMAKE_SOURCE_DIR}/tests/test_capi_exports.sh $<TARGET_FILE:aegis_capi_shared>
+         ${CMAKE_SOURCE_DIR}/include/aegis/aegis.h)
 add_test(NAME fuzz_2000 COMMAND aegis_fuzz --cases 2000 --seed 1)
 add_test(NAME fuzz_selftest COMMAND aegis_fuzz --cases 200 --seed 3 --corrupt)
 add_test(NAME fuzz_poison COMMAND aegis_fuzz --cases 2000 --seed 21 --poison)

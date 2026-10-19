@@ -1,0 +1,10 @@
+/* Linker version script for libaegis_capi.so (CMakeLists.txt): the dynamic
+   symbol table holds the C ABI (include/aegis/aegis.h, aegis_*) and nothing
+   else. Anonymous (no version node), so symbols stay unversioned as before.
+   ctest capi_exports checks the result with nm -D --defined-only. */
+{
+  global:
+    aegis_*;
+  local:
+    *;
+};
