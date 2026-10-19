@@ -4,6 +4,7 @@
 //! [`db::connect_ro`] and read it through [`view`].
 pub mod ab;
 pub mod arch;
+pub mod bars;
 pub mod db;
 pub mod gpujob;
 pub mod params;

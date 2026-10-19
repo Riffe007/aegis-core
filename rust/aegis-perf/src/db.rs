@@ -32,7 +32,7 @@ pub const SCHEMA: &str = include_str!("schema.sql");
 ///    clock_event_reasons (every reason bit seen), sm_clock_min_mhz / sm_clock_max_mhz.
 /// 7: build identity: runs.build_sha (40 hex) / build_dirty / allow_dirty / kind;
 ///    paired_results.build_sha_a/_b, build_dirty_a/_b, allow_dirty, device_id,
-///    sm_arch, dtype.
+///    sm_arch, dtype; winners.lt_ratio_median (paired) and dispatch.
 /// Bump it with every migration in migrate(). connect() backs the DB up
 /// (VACUUM INTO <db>.bak-v<old>-<date>) before migrating an older one.
 pub const SCHEMA_VERSION: i64 = 7;
@@ -206,6 +206,11 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("paired_results", "device_id", "TEXT"),
     ("paired_results", "sm_arch", "INTEGER"),
     ("paired_results", "dtype", "TEXT"),
+    // v7: the pick's paired median ratio cublaslt_best / pick (the number of record;
+    // pct_of_cublaslt_best is the unpaired median), and where aegis::matmul sends
+    // the shape ("aegis" | "cublaslt": tune::dispatch on the paired CI).
+    ("winners", "lt_ratio_median", "REAL"),
+    ("winners", "dispatch", "TEXT"),
 ];
 
 /// Runs whose rows are excluded by default for their build: written with
@@ -1000,31 +1005,36 @@ fn tie_set<'a>(ours: &[&'a Latest], paired: &PairedMap) -> TieCall<'a> {
     }
 }
 
-/// Paired tie tests: (run_id, m, n, k, a_impl, b_impl) -> 95% CI of b / a.
-type PairedMap = HashMap<(String, i64, i64, i64, String, String), (f64, f64)>;
+/// Paired tie tests: (run_id, m, n, k, a_impl, b_impl) -> (95% CI lo, hi, median) of b / a.
+type PairedMap = HashMap<(String, i64, i64, i64, String, String), (f64, f64, f64)>;
 
 fn load_paired(con: &Connection) -> Result<PairedMap> {
     let mut stmt = con.prepare(&format!(
-        "SELECT run_id, m, n, k, a_impl, b_impl, ratio_ci_lo, ratio_ci_hi FROM paired \
+        "SELECT run_id, m, n, k, a_impl, b_impl, ratio_ci_lo, ratio_ci_hi, ratio_median FROM paired \
          WHERE protocol_version = 2 AND cache_mode = 'cold' AND allow_busy = 0 AND coalesce(disturbed, 0) = 0 \
            AND run_id NOT IN ({DIRTY_RUNS})"
     ))?;
     let rows = stmt.query_map([], |r| {
-        Ok(((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?), (r.get(6)?, r.get(7)?)))
+        Ok(((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?), (r.get(6)?, r.get(7)?, r.get(8)?)))
     })?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
-/// CI of `other` / `w` from a paired test in the run both rows came from.
-fn paired_ci(paired: &PairedMap, w: &Latest, other: &str, other_run: &str) -> Option<(f64, f64)> {
+/// (CI lo, CI hi, median) of `other` / `w` from a paired test in the run both rows came from.
+fn paired_test(paired: &PairedMap, w: &Latest, other: &str, other_run: &str) -> Option<(f64, f64, f64)> {
     if w.run_id != other_run {
         return None;
     }
     let key = |a: &str, b: &str| (w.run_id.clone(), w.m, w.n, w.k, a.to_string(), b.to_string());
-    if let Some(&ci) = paired.get(&key(&w.impl_, other)) {
-        return Some(ci);
+    if let Some(&t) = paired.get(&key(&w.impl_, other)) {
+        return Some(t);
     }
-    paired.get(&key(other, &w.impl_)).map(|&(lo, hi)| (1.0 / hi, 1.0 / lo))
+    paired.get(&key(other, &w.impl_)).map(|&(lo, hi, med)| (1.0 / hi, 1.0 / lo, 1.0 / med))
+}
+
+/// CI of `other` / `w` from a paired test in the run both rows came from.
+fn paired_ci(paired: &PairedMap, w: &Latest, other: &str, other_run: &str) -> Option<(f64, f64)> {
+    paired_test(paired, w, other, other_run).map(|(lo, hi, _)| (lo, hi))
 }
 
 /// Neighboring shapes for the tie-break: same N and K with a different M (the
@@ -1145,7 +1155,9 @@ pub fn cmd_winners(db: &Path, arch: Option<i64>, registry: Option<&Registry>) ->
         // the pick itself, never of the other config in its tie (aegis_tune
         // pairs the runner-up too whenever it can become the pick). None when
         // no such test exists (rows tuned before that).
-        let lt_ci = lt_best.and_then(|lt| paired_ci(&paired, pick, &lt.impl_, &lt.run_id));
+        let lt_test = lt_best.and_then(|lt| paired_test(&paired, pick, &lt.impl_, &lt.run_id));
+        let lt_ci = lt_test.map(|(lo, hi, _)| (lo, hi));
+        let lt_median = lt_test.map(|(_, _, med)| med);
         // The cuBLASLt algorithm cublaslt_best picked at this shape in the pick's run.
         let lt_algo: Option<String> = lt_best
             .map(|lt| {
@@ -1161,17 +1173,20 @@ pub fn cmd_winners(db: &Path, arch: Option<i64>, registry: Option<&Registry>) ->
             .flatten();
         let pct = cublas.map(|c| c.median_us / pick.median_us * 100.0);
         let pct_lt = lt_best.map(|c| c.median_us / pick.median_us * 100.0);
+        // Where aegis::matmul sends the shape (the dispatch floor on the paired CI), stored so
+        // readers need not restate the rule or parse the header (schema v7).
+        let dispatch = crate::tune::dispatch(lt_ci, pct_lt);
         let set_json = serde_json::to_string(&tie.iter().map(|r| r.impl_.as_str()).collect::<Vec<_>>())?;
         con.execute(
             "INSERT OR REPLACE INTO winners (sm_arch, op, dtype, shape_bucket, kernel_id, run_id, median_us, \
              pct_of_cublas, tied, tie_set, pick_reason, protocol_version, warm_median_us, pct_of_cublaslt_best, \
-             tie_method, ratio_ci_lo, ratio_ci_hi, lt_ratio_ci_lo, lt_ratio_ci_hi, lt_algo) \
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+             tie_method, ratio_ci_lo, ratio_ci_hi, lt_ratio_ci_lo, lt_ratio_ci_hi, lt_algo, lt_ratio_median, dispatch) \
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             params![arch, op, dtype, shape_bucket(*m, *nn, *k), pick.kernel_id, pick.run_id, pick.median_us, pct,
                     (tie.len() > 1) as i64, set_json, reason, sel.protocol,
                     warm_of(&pick.kernel_id, (*arch, dtype.as_str(), *m, *nn, *k))?, pct_lt, call.method,
                     call.ci.map(|c| c.0), call.ci.map(|c| c.1), lt_ci.map(|c| c.0), lt_ci.map(|c| c.1),
-                    lt_algo],
+                    lt_algo, lt_median, dispatch.as_str()],
         )?;
         n += 1;
     }
@@ -1321,8 +1336,52 @@ pub fn roof_text(con: &Connection, arch: Option<i64>, sel: &Selection) -> Result
     Ok(out)
 }
 
+/// The winners, with the number of record first (bars.rs): the kernel's paired
+/// % of cublaslt_best and its 95% CI, the dispatch, then the unpaired median,
+/// labelled, and flagged where it disagrees with the CI.
+pub fn winners_text(con: &Connection, arch: Option<i64>) -> Result<String> {
+    let mut out = String::new();
+    let mut ws = crate::view::winners(con, arch)?;
+    if ws.is_empty() {
+        return Ok(out);
+    }
+    writeln!(out, "Winners: kernel % of cublaslt_best of record = paired median (95% CI); unpaired medians are secondary.")?;
+    let hdr = format!(
+        "{:>5} {:>6} {:>6} {:>6}  {:<32} {:<26} {:<9} {}",
+        "arch", "M", "N", "K", "winner", "kernel (paired)", "dispatch", "unpaired median"
+    );
+    writeln!(out, "{hdr}\n{}", "-".repeat(hdr.len()))?;
+    ws.sort_by_key(|w| (w.sm_arch, w.m, w.n, w.k));
+    for w in &ws {
+        let paired = w.kernel_pct();
+        let dispatch = w.dispatch.unwrap_or_else(|| crate::tune::dispatch(w.lt_ratio_ci, w.pct_of_cublaslt_best));
+        let unpaired = match (w.pct_of_cublaslt_best, &paired) {
+            (Some(u), Some(p)) if crate::bars::median_disagrees(u, p) => {
+                format!("{u:.1}% (DISAGREES with the paired CI by > {} points)", crate::bars::MEDIAN_CI_DISAGREE_PTS)
+            }
+            (Some(u), _) => format!("{u:.1}%"),
+            (None, _) => "-".to_string(),
+        };
+        writeln!(
+            out,
+            "{:>5} {:>6} {:>6} {:>6}  {:<32} {:<26} {:<9} {unpaired}",
+            w.sm_arch,
+            w.m,
+            w.n,
+            w.k,
+            w.kernel.impl_,
+            paired.map_or("no paired test".to_string(), |p| p.text()),
+            dispatch.as_str()
+        )?;
+    }
+    writeln!(out)?;
+    Ok(out)
+}
+
 pub fn cmd_report(db: &Path, arch: Option<i64>, sel: &Selection, baseline: Option<&str>) -> Result<()> {
     let con = connect(db)?;
+    print!("{}", winners_text(&con, arch)?);
+    println!("Every impl, unpaired medians (secondary; the paired figures above are of record):");
     print!("{}", report_text(&con, arch, sel, baseline.unwrap_or(default_baseline(sel)))?);
     print!("{}", roof_text(&con, arch, sel)?);
     Ok(())
@@ -1782,6 +1841,15 @@ mod tests {
             )
             .unwrap();
         assert_eq!(w, ("a".to_string(), "paired".to_string(), Some(0.91)));
+        // v7: the paired median of record and the dispatch are stored with the winner.
+        let (med, disp): (Option<f64>, Option<String>) = con
+            .query_row("SELECT lt_ratio_median, dispatch FROM winners", [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        assert_eq!((med, disp.as_deref()), (Some(0.9), Some("aegis")));
+        let v = &crate::view::winners(&con, Some(121)).unwrap()[0];
+        assert_eq!(v.kernel_pct(), Some(crate::bars::PairedPct { median: 0.9, ci_lo: 0.89, ci_hi: 0.91 }));
+        assert_eq!(v.dispatch, Some(crate::tune::Dispatch::Aegis));
+        drop(con);
         std::fs::remove_file(&p).unwrap();
     }
 

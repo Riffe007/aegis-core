@@ -59,7 +59,8 @@ struct Winner {
   int M, N, K;
   const char* impl;  // aegis::gemm registry name (the tuned config, also when not dispatched)
   Dispatch dispatch = Dispatch::Aegis;
-  double pct_of_cublaslt = 0;      // winner median vs cublaslt_best (unpaired), %
+  double pct_of_cublaslt = 0;      // kernel % of cublaslt_best: 100 x the paired median ratio (aegis-perf >= 0.6.0;
+                                   // older headers: the unpaired median); 0 = no paired test
   double lt_ci_lo = 0, lt_ci_hi = 0;  // paired CI of cublaslt_best / winner time; 0 = none
   LtAlgoConfig lt = {};               // cublaslt_best's algorithm at this exact shape
 };

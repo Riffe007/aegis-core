@@ -125,7 +125,13 @@ docs/               LOG.md (dated run log), analysis/ (consolidated analyses, e.
    fuzz_nightly: 50,000 cases).
 3. **The baseline is cuBLAS, not naive.** Report results as % of
    `cublaslt_best` (protocol v2; % of plain `cublas` alongside) on the same
-   shape, device and cache mode.
+   shape, device and cache mode. **The paired ratio and its 95% CI are the
+   number of record** (`aegis_perf::bars`): winners headers, `report`, `tune`
+   and LOG lead with the kernel's paired % of cublaslt_best and its CI; an
+   unpaired median is secondary and always labelled "unpaired", and where it
+   lies more than `bars::MEDIAN_CI_DISAGREE_PTS` (2) points outside the CI it
+   is flagged. Ties, the dispatch floor and the bars use the CI. Never publish
+   a median alone as % of baseline.
 4. **One impl per file, registered in one place.** Every launchable impl is an
    entry in `aegis::gemm::registry()` (`src/gemm/registry.cu`); `bench_gemm`
    dispatches through it and `bench_gemm --list` prints it. A templated tier

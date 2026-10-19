@@ -2736,3 +2736,44 @@ Checked on CPU only (no GPU job: private lock file, `AEGIS_KERNEL_LOG` an empty 
 - On `main` (bf1f417, which predates the build identity): `status=FAIL build identity: bench_gemm
   says nothing, expected bf1f417... clean`, exit 1. Until this branch is merged, a nightly from
   main HEAD fails this way rather than measure an unidentified build.
+
+## 2026-10-18 — The paired ratio is the number of record; medians are secondary
+
+**Rule** (`aegis_perf::bars`, CLAUDE.md rule 3; core-request #4, item 4):
+- Wherever a paired test exists, a kernel's % of cublaslt_best is the paired figure: 100 x the
+  median of the paired ratio cublaslt_best time / kernel time, with its 95% bootstrap CI.
+- The unpaired median (cublaslt_best median / kernel median, from separate windows) is shown
+  only labelled "unpaired".
+- They disagree when the unpaired median lies more than `bars::MEDIAN_CI_DISAGREE_PTS` (2
+  percentage points) outside the CI. A disagreement is flagged where the number is shown, and
+  the CI still decides ties, the dispatch floor and the bars.
+- The 2 points are the threshold AEGIS Custos already applied (labelled provisional there),
+  so nothing moves for its readers. The cases that prompted the rule:
+  - 512x4864x896: unpaired 82.2%, paired CI 78.5-79.0%. The header's 82% read as above the
+    80% floor while dispatch used the CI.
+  - 256^3 in an earlier tune: 98.2% against 89.9-90.2%.
+
+**Where:**
+- `winners` stores the pick's paired median (`lt_ratio_median`) and its dispatch (`dispatch`,
+  from `tune::dispatch` on the paired CI; schema v7). `view::Winner` gains
+  `lt_ratio_median`, `dispatch` and `kernel_pct()`.
+- `emit-header`:
+  - Field 5 of each row is now the paired median % (0 without a paired test).
+    `aegis::detail::Winner::pct_of_cublaslt` reads nothing from it.
+  - The comment leads with `kernel X% (lo-hi%) of cublaslt_best (paired)`, then the unpaired
+    median, then `% of cuBLAS (unpaired)`.
+  - The runner-up tie CI is relabelled `[tie test runner-up / winner ...]`.
+- `report` prints a winners table first (kernel paired % and CI, dispatch, unpaired median,
+  flagged), then the every-impl median matrix under "unpaired medians (secondary)".
+- `tune`'s table leads with `kernel %Lt (paired)` and labels its median columns "unpaired".
+
+**On a copy of the live DB** (snapshot via `.backup`, migrated v5 -> v6 in scratch with the repro-branch binary, whose v6 is v7 after the merge, winners
+recomputed, nothing written to the live DB):
+- All 14 winners have a paired CI.
+- One disagreement: 512x4864x896, unpaired 82.2% vs paired 78.8% (78.5-79.0%), dispatch
+  cuBLASLt.
+- The decode rows read 105.4%, 105.7%, 100.0% (tie), 114.5%, 101.7% and 101.0%.
+- These are the in-process CIs of tune b3ab0da1de2a, which ran an uncommitted tree
+  (correction entry above), so they are not evidence yet.
+- The committed `winners/sm_121.h` is not regenerated here. That happens after the tag, from
+  the migrated live DB.

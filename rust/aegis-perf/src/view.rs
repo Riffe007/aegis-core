@@ -349,8 +349,21 @@ pub struct Winner {
     pub ratio_ci: Option<(f64, f64)>,
     /// cublaslt_best / pick, 95% CI (paired test).
     pub lt_ratio_ci: Option<(f64, f64)>,
+    /// cublaslt_best / pick, the paired median (schema v7; None before, or no paired test).
+    pub lt_ratio_median: Option<f64>,
+    /// Where aegis::matmul sends the shape, as stored by `winners` (schema v7;
+    /// None for winners computed before v7: emit-header then applies tune::dispatch).
+    pub dispatch: Option<crate::tune::Dispatch>,
     /// The paired tests of this shape in the winner's run (runner-up, cublaslt_best).
     pub paired: Vec<Paired>,
+}
+
+impl Winner {
+    /// The kernel's % of cublaslt_best of record (bars.rs): the paired median and CI.
+    pub fn kernel_pct(&self) -> Option<crate::bars::PairedPct> {
+        let (ci_lo, ci_hi) = self.lt_ratio_ci?;
+        Some(crate::bars::PairedPct { median: self.lt_ratio_median?, ci_lo, ci_hi })
+    }
 }
 
 fn ci(lo: Option<f64>, hi: Option<f64>) -> Option<(f64, f64)> {
@@ -362,7 +375,8 @@ pub fn winners(con: &Connection, arch: Option<i64>) -> Result<Vec<Winner>> {
     let mut stmt = con.prepare(
         "SELECT w.sm_arch, w.op, w.dtype, w.shape_bucket, w.kernel_id, w.run_id, r.git_sha, w.median_us, \
                 w.warm_median_us, w.pct_of_cublas, w.pct_of_cublaslt_best, w.tied, w.tie_set, w.pick_reason, \
-                w.protocol_version, w.tie_method, w.ratio_ci_lo, w.ratio_ci_hi, w.lt_ratio_ci_lo, w.lt_ratio_ci_hi \
+                w.protocol_version, w.tie_method, w.ratio_ci_lo, w.ratio_ci_hi, w.lt_ratio_ci_lo, w.lt_ratio_ci_hi, \
+                w.lt_ratio_median, w.dispatch \
          FROM winners w LEFT JOIN runs r USING(run_id) WHERE (?1 IS NULL OR w.sm_arch = ?1) ORDER BY w.rowid",
     )?;
     let raw = stmt
@@ -374,11 +388,12 @@ pub fn winners(con: &Connection, arch: Option<i64>) -> Result<Vec<Winner>> {
                 (r.get::<_, i64>(11)? != 0, r.get::<_, Option<String>>(12)?, r.get::<_, Option<String>>(13)?),
                 (r.get::<_, i64>(14)?, r.get::<_, Option<String>>(15)?),
                 (r.get::<_, Option<f64>>(16)?, r.get::<_, Option<f64>>(17)?, r.get::<_, Option<f64>>(18)?, r.get::<_, Option<f64>>(19)?),
+                (r.get::<_, Option<f64>>(20)?, r.get::<_, Option<String>>(21)?),
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let mut out = Vec::with_capacity(raw.len());
-    for ((sm_arch, op, dtype, shape_bucket), (kernel_id, run_id, git_sha), (median_us, warm, pct_cb, pct_lt), (tied, set, reason), (protocol_version, tie_method), (rlo, rhi, llo, lhi)) in raw {
+    for ((sm_arch, op, dtype, shape_bucket), (kernel_id, run_id, git_sha), (median_us, warm, pct_cb, pct_lt), (tied, set, reason), (protocol_version, tie_method), (rlo, rhi, llo, lhi), (lt_median, dispatch)) in raw {
         let d: Vec<i64> = shape_bucket.split('x').map(str::parse).collect::<Result<_, _>>().with_context(|| format!("shape_bucket {shape_bucket}"))?;
         let [m, n, k] = d[..] else { anyhow::bail!("shape_bucket {shape_bucket}: expected MxNxK") };
         let kernel = kernel(con, &kernel_id)?.with_context(|| format!("winner kernel {kernel_id} not in kernels"))?;
@@ -409,6 +424,8 @@ pub fn winners(con: &Connection, arch: Option<i64>) -> Result<Vec<Winner>> {
             tie_method,
             ratio_ci: ci(rlo, rhi),
             lt_ratio_ci: ci(llo, lhi),
+            lt_ratio_median: lt_median,
+            dispatch: dispatch.as_deref().and_then(crate::tune::Dispatch::parse),
             paired,
         });
     }
