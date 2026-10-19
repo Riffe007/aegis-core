@@ -2478,7 +2478,7 @@ HEVC, VP8, VP9, AV1. NVENC: H264, HEVC, AV1.
 
   Both are within 3%.
 - **Winners:** with tune b306efb675b0 counted, the perf DB's winners differ from the committed
-  sm_121.h on 5 shapes. The scratch header has, for example:
+  sm_121.h on 4 shapes ("5" in the first version of this entry was a miscount). The scratch header has, for example:
   - 1x896x4864 `gemv_tc_16x64x32_1x4_s8_ksm` (105.6% of cublaslt_best);
   - 512x896x4864 `mma_tma_128x128x64_2x4_s3` (86.1%);
   - 1x4864x896 `gemv_tc_16x128x64_1x4_s4_ksm` (100.5%);
@@ -2593,3 +2593,28 @@ HEVC, VP8, VP9, AV1. NVENC: H264, HEVC, AV1.
 - **Hardening:** ThreadSanitizer build of the test, 3 runs, 0 warnings
   (`artifacts/sanitizer/hw-step8/`). CPU-only code, so no GPU launch path changed and there was
   nothing for memcheck to cover.
+
+## 2026-10-18 — Paused here
+
+- **aegis-hw is complete.** Part 1 is steps 1-4 (device-sized launches, discovery API /
+  C ABI 1.3, device profiles, capability-aware dispatch). Hardening 1-5 is FP32 cuBLASLt
+  reductions, the kernel-log guard, `aegis_*`-only exports, host dispatch measured, and the
+  tag aegis-perf-v0.6.0. Part 2 is steps 6-8 (calibrate, telemetry and sustained mode, the CPU
+  thread pool).
+- Tagged `aegis-perf-v0.7.0` at 4f5a60a and pushed it: aegis-perf 0.7.0, perf DB schema v6.
+- **Next session, in order:**
+  1. paired-ab on the shapes where calibrate's winners (tune b306efb675b0) differ from the
+     committed `winners/sm_121.h`. That is 4 shapes, not the 5 written in the step 6 entry and
+     the step 8 report, which miscounted the diff:
+     - 1x896x4864: gemv_tc_16x64x32_1x4_s8_ksm vs. committed gemv_tc_16x64x64_1x4_s5_ksm;
+     - 512x896x4864: mma_tma_128x128x64_2x4_s3 vs. mma_pipe_64x64x32_2x2_s3;
+     - 1x4864x896: gemv_tc_16x128x64_1x4_s4_ksm vs. gemv_tc_16x128x32_1x4_s6_ksm;
+     - 16x4864x896: gemv_tc_16x64x64_1x4_s4_ksm vs. gemv_tc_16x128x32_1x4_s6_ksm.
+     The scratch header is in `results/calibrate-scratch-20261018/winners/`. Adopt only the
+     CI-confirmed wins, through tune + emit-header, never by hand-editing the header.
+  2. Stream-K for 2048^3.
+  3. Phase D: fused epilogues (bias, SiLU, GELU, residual add).
+- **Still open:**
+  - calibrate runs with clocks unlocked until `sudo -n nvidia-smi` works without a password;
+  - GB10 reports no NVML throttle reasons (clock sag is the signal);
+  - the orin-nano fixture is synthetic until a Nano is connected.
