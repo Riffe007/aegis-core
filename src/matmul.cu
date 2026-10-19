@@ -126,6 +126,8 @@ struct LtPlan {
   void* workspace = nullptr;  // from this stream's workspace cache (split-K partials of the algorithm)
   size_t workspace_bytes = 0;
   std::string source;  // "stored", "heuristic", or "heuristic (stored ... rejected: ...)"
+  detail::LtAlgoConfig config;  // the algorithm's config attributes (lt::read_config)
+  mutable bool use_cublas = false;  // no cuBLASLt algorithm with an FP32 split-K reduction: cuBLAS runs it
 };
 
 // The heuristic's workspace limit: the same as cublaslt_best's (src/bench/harness.cu),
@@ -137,6 +139,29 @@ unsigned alignment(const void* p, long long stride_elems, int batch) {
   unsigned long long v = reinterpret_cast<unsigned long long>(p) | 256ull;
   if (batch > 1) v |= static_cast<unsigned long long>(stride_elems) * sizeof(__half);
   return static_cast<unsigned>(v & (~v + 1));
+}
+
+// Does every operand meet `algo`'s minimum alignment (CUBLASLT_ALGO_CAP_MIN_ALIGNMENT_*,
+// and 16 B)? For stored algorithms only; the heuristic takes the alignments as preferences.
+// cuBLASLt's A is our B, its B our A; C and D are our C. An operand's alignment is
+// its pointer's and batch stride's (the key) and its leading dimension's in bytes.
+bool aligned_for(const cublasLtMatmulAlgo_t& algo, const LtKey& k, const gemm::GemmParams& p) {
+  auto with_ld = [](unsigned a, long long ld) { return std::min(a, alignment(nullptr, ld, 2)); };
+  const unsigned have[] = {with_ld(k.align_b, p.ldb), with_ld(k.align_a, p.lda), with_ld(k.align_c, p.ldc),
+                           with_ld(k.align_c, p.ldc)};
+  const cublasLtMatmulAlgoCapAttributes_t cap[] = {
+      CUBLASLT_ALGO_CAP_MIN_ALIGNMENT_A_BYTES, CUBLASLT_ALGO_CAP_MIN_ALIGNMENT_B_BYTES,
+      CUBLASLT_ALGO_CAP_MIN_ALIGNMENT_C_BYTES, CUBLASLT_ALGO_CAP_MIN_ALIGNMENT_D_BYTES};
+  for (int i = 0; i < 4; ++i) {
+    uint32_t need = 0;
+    size_t w = 0;
+    if (cublasLtMatmulAlgoCapGetAttribute(&algo, cap[i], &need, sizeof need, &w) != CUBLAS_STATUS_SUCCESS) return false;
+    // At least 16 B as well: the tune ran the algorithm on 256 B-aligned, packed
+    // operands, and the caps are not enough (algo 67 reports 2 B for C, then fails
+    // with C at 6 B: fuzz --large-k seed 62 case 129).
+    if (have[i] < std::max<uint32_t>(need, 16)) return false;
+  }
+  return true;
 }
 
 cudaError_t cublaslt_fail(const char* what, cublasStatus_t s) {
@@ -199,9 +224,21 @@ cudaError_t make_lt_plan(cublasLtHandle_t lt, const gemm::GemmParams& p, LtPlan&
         stage = "workspace limit";
         st = CUBLAS_STATUS_NOT_SUPPORTED;
       }
+      // cublasLtMatmulAlgoCheck sees no pointers: an algorithm it accepts can still
+      // fail in cublasLtMatmul (status 15) on a misaligned operand. Each operand's
+      // alignment (pointer, batch stride, leading dimension) against the algorithm's minimum.
+      if (st == CUBLAS_STATUS_SUCCESS && !aligned_for(plan.algo, k, p)) {
+        stage = "operand alignment below the algorithm's minimum";
+        st = CUBLAS_STATUS_NOT_SUPPORTED;
+      }
+      if (st == CUBLAS_STATUS_SUCCESS && !lt::reduction_ok(lt::read_config(plan.algo))) {
+        stage = "split-K reduction scheme (partials in FP16)";
+        st = CUBLAS_STATUS_NOT_SUPPORTED;
+      }
     }
     if (st == CUBLAS_STATUS_SUCCESS) {
       plan.source = "stored";
+      plan.config = lt::read_config(plan.algo);
       return use_workspace(check.workspaceSize);
     }
     plan.source = "heuristic (stored algo " + std::to_string(k.stored->id) + " rejected: " + stage +
@@ -222,14 +259,28 @@ cudaError_t make_lt_plan(cublasLtHandle_t lt, const gemm::GemmParams& p, LtPlan&
       CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_A_BYTES, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_B_BYTES,
       CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_C_BYTES, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_D_BYTES};
   for (int i = 0; i < 4; ++i) cublasLtMatmulPreferenceSetAttribute(pref, which[i], &al[i], sizeof al[i]);
-  cublasLtMatmulHeuristicResult_t res{};
+  // Only FP32 split-K reductions (lt::kReductionMask); the result is checked
+  // again below, so a heuristic that ignored the mask could not slip one through.
+  const uint32_t mask = lt::kReductionMask;
+  cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK, &mask, sizeof mask);
+  constexpr int kAsk = 8;
+  cublasLtMatmulHeuristicResult_t res[kAsk] = {};
   int found = 0;
-  s = cublasLtMatmulAlgoGetHeuristic(lt, plan.op, plan.a, plan.b, plan.c, plan.c, pref, 1, &res, &found);
+  s = cublasLtMatmulAlgoGetHeuristic(lt, plan.op, plan.a, plan.b, plan.c, plan.c, pref, kAsk, res, &found);
   cublasLtMatmulPreferenceDestroy(pref);
   if (s != CUBLAS_STATUS_SUCCESS) return cublaslt_fail("cublasLtMatmulAlgoGetHeuristic", s);
-  if (found < 1) return cublaslt_fail("cublasLtMatmulAlgoGetHeuristic (no algorithm)", CUBLAS_STATUS_NOT_SUPPORTED);
-  plan.algo = res.algo;
-  return use_workspace(res.workspaceSize);
+  for (int i = 0; i < found; ++i) {
+    if (res[i].state != CUBLAS_STATUS_SUCCESS || !lt::reduction_ok(lt::read_config(res[i].algo))) continue;
+    plan.algo = res[i].algo;
+    plan.config = lt::read_config(plan.algo);
+    return use_workspace(res[i].workspaceSize);
+  }
+  // None of the heuristic's algorithms keeps FP32 partials (seen with misaligned
+  // operands at K > 14000): the plan runs cuBLAS, whose reductions are FP32 too
+  // (CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION). Decided once per plan.
+  plan.use_cublas = true;
+  plan.source = "cublas (" + std::to_string(found) + " heuristic algorithms, none with an FP32 split-K reduction)";
+  return cudaSuccess;
 }
 
 void destroy(LtPlan& plan) {
@@ -295,8 +346,17 @@ cudaError_t cublaslt_gemm(const gemm::GemmParams& p, cudaStream_t stream, const 
   cublasLtHandle_t lt = nullptr;
   const LtPlan* plan = nullptr;
   if (const cudaError_t e = lt_plan(p, stream, stored, &lt, &plan); e != cudaSuccess) return e;
+  if (plan->use_cublas) return cublas_gemm_general(p, stream);
   const cublasStatus_t s = cublasLtMatmul(lt, plan->op, &p.alpha, p.B, plan->a, p.A, plan->b, &p.beta, p.C, plan->c,
                                           p.C, plan->c, &plan->algo, plan->workspace, plan->workspace_bytes, stream);
+  if (s == CUBLAS_STATUS_NOT_SUPPORTED) {
+    // Refused before launch (nothing written): the plan runs cuBLAS from now on. A
+    // safety net; aligned_for and the heuristic's alignment preferences should prevent it.
+    plan->use_cublas = true;
+    std::fprintf(stderr, "aegis::matmul: %dx%dx%d: cublasLtMatmul refused the plan's algorithm (%s); using cuBLAS\n",
+                 p.M, p.N, p.K, plan->source.c_str());
+    return cublas_gemm_general(p, stream);
+  }
   return s == CUBLAS_STATUS_SUCCESS ? cudaSuccess : cublaslt_fail("cublasLtMatmul", s);
 }
 
@@ -410,10 +470,27 @@ std::span<const Winner> winners_table() { return winners_for(current_arch()); }
 
 const Winner* winner_for(int M, int N, int K) { return choice_for(M, N, K).winner; }
 
-std::string cublaslt_plan_source(const gemm::GemmParams& p, cudaStream_t stream, const LtAlgoConfig* stored) {
+std::string cublaslt_plan_source(const gemm::GemmParams& p, cudaStream_t stream, const LtAlgoConfig* stored,
+                                 LtAlgoConfig* config) {
   cublasLtHandle_t lt = nullptr;
   const LtPlan* plan = nullptr;
-  return lt_plan(p, stream, stored, &lt, &plan) == cudaSuccess ? plan->source : std::string();
+  if (lt_plan(p, stream, stored, &lt, &plan) != cudaSuccess) return std::string();
+  if (config) *config = plan->config;
+  return plan->source;
+}
+
+bool lt_reduction_ok(const LtAlgoConfig& c) { return lt::reduction_ok(c); }
+
+cudaError_t matmul_forced(const gemm::GemmParams& p, Choice::Kind kind, const LtAlgoConfig* stored, cudaStream_t stream) {
+  if (const cudaError_t e = gemm::validate(p); e != cudaSuccess)
+    return fail(e, "aegis::matmul: invalid GEMM parameters");
+  if (gemm::is_empty(p)) return cudaSuccess;
+  if (p.alpha == 0.f) return scale_c(p, stream);
+  switch (kind) {
+    case Choice::Kind::Cublaslt: return cublaslt_gemm(p, stream, stored);
+    case Choice::Kind::Cublas: return cublas_gemm_general(p, stream);
+    default: return matmul(p, stream);
+  }
 }
 
 }  // namespace aegis::detail

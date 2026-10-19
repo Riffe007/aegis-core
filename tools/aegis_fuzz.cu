@@ -2,17 +2,25 @@
 //
 //   aegis_fuzz [--cases 2000] [--seed 1] [--case I] [--impls naive,regblock_,mma_,mma_pipe_,matmul]
 //              [--max-dim 4096] [--calibrate] [--verbose] [--corrupt] [--poison] [--cpu-ref-only]
-//              [--explain] [--decode]
+//              [--explain] [--decode] [--large-k]
 //
 // Case i draws everything from mt19937_64(seed * 1000003 + i), so a failure
 // is reproduced alone with --seed S --case I. Per case:
 //   impl     a registered impl with a general entry (run) whose name starts
-//            with one of --impls, or "matmul" (aegis::matmul dispatch)
+//            with one of --impls, or "matmul" (aegis::matmul dispatch), or
+//            "matmul_lt" / "matmul_cublas": aegis::matmul's argument handling
+//            with the GEMM forced onto its cuBLASLt path (dispatch floor /
+//            filtered rows; half the cases pass a stored algorithm of a
+//            Cublaslt winner as the hint, half ask the heuristic) or its
+//            cuBLAS fallback (no winner)
 //   shape    each of M, N, K in 1..max-dim: 30% a prime, 25% 1..64, 20% a
 //            multiple of 8, else log-uniform; M*N*K*batch capped at 2^32
 //            (naive: 2^27)
 //            --decode: M in 1..16 (85%) or 17..40, K drawn the same way up to
 //            16384 (GEMV and split-K: slices, odd split counts, K tails)
+//            --large-k: K in 14000..20000 (40% a prime), M 1..64, N up to
+//            max-dim, M*N*K <= 2^30; every case against the FP64 CPU reference
+//            (long-K split-K reductions: partials must stay in FP32)
 //   layouts  A, B each row- or column-major
 //   ld       minimal, or padded by 1..17 elements (50%)
 //   pointers offset by 1..7 elements (20% per operand): misaligned paths
@@ -72,6 +80,7 @@ using aegis::gemm::KernelEntry;
 using aegis::gemm::Layout;
 
 constexpr int kDecodeMaxK = 16384;
+constexpr int kLargeKMin = 14000, kLargeKMax = 20000;
 
 struct Args {
   long long cases = 2000;
@@ -81,6 +90,7 @@ struct Args {
   int max_dim = 4096;
   bool calibrate = false, verbose = false, corrupt = false, poison = false, cpu_ref_only = false, explain = false;
   bool decode = false;  // --decode: M 1..16 (85%) or 17..40, K up to kDecodeMaxK
+  bool large_k = false;  // --large-k: K in kLargeKMin..kLargeKMax, FP64 reference
 };
 
 std::vector<std::string> split(const std::string& s) {
@@ -116,6 +126,7 @@ Args parse(int argc, char** argv) {
     else if (k == "--cpu-ref-only") a.cpu_ref_only = true;
     else if (k == "--explain") a.explain = true;
     else if (k == "--decode") a.decode = true;
+    else if (k == "--large-k") a.large_k = true;
     else { std::fprintf(stderr, "unknown arg %s\n", k.c_str()); std::exit(2); }
   }
   if (a.explain && (a.cpu_ref_only || a.only_case < 0)) {
@@ -136,10 +147,13 @@ std::vector<int> primes_upto(int n) {
   return p;
 }
 
-// A target: a registry entry with run(), or aegis::matmul (entry == nullptr).
+// A target: a registry entry with run(), or aegis::matmul (entry == nullptr),
+// possibly forced onto one of its library paths.
 struct Target {
   std::string name;
   const KernelEntry* entry;
+  aegis::detail::Choice::Kind forced = aegis::detail::Choice::Kind::Aegis;  // Aegis: plain matmul
+  bool library() const { return !entry; }  // aegis::matmul in some form (cuBLAS-backed paths)
 };
 
 int draw_dim(std::mt19937_64& rng, int max_dim, const std::vector<int>& primes) {
@@ -176,7 +190,8 @@ struct Case {
 // The case depends only on (seed, case, targets, max_dim, calibrate): never on
 // the reference mode, so --cpu-ref-only and --explain reproduce a case exactly.
 Case make_case(std::mt19937_64& rng, const std::vector<Target>& targets, int max_dim,
-               const std::vector<int>& primes, bool calibrate, bool decode, const std::vector<int>& kprimes) {
+               const std::vector<int>& primes, bool calibrate, bool decode, const std::vector<int>& kprimes,
+               bool large_k) {
   std::uniform_real_distribution<double> u(0, 1);
   Case c;
   c.target = targets[std::uniform_int_distribution<size_t>(0, targets.size() - 1)(rng)];
@@ -184,6 +199,18 @@ Case make_case(std::mt19937_64& rng, const std::vector<Target>& targets, int max
   p.batch = u(rng) < 0.15 ? std::uniform_int_distribution<int>(2, 4)(rng) : 1;
   const double cap = c.target.name == "naive" ? std::ldexp(1.0, 27) : std::ldexp(1.0, 32);
   for (;;) {
+    if (large_k) {  // long-K reductions: split-K partial sums over 14000+ products
+      if (u(rng) < 0.4) {
+        const auto lo = std::lower_bound(kprimes.begin(), kprimes.end(), kLargeKMin);
+        p.K = *(lo + std::uniform_int_distribution<long>(0, long(kprimes.end() - lo) - 1)(rng));
+      } else {
+        p.K = std::uniform_int_distribution<int>(kLargeKMin, kLargeKMax)(rng);
+      }
+      p.M = u(rng) < 0.6 ? std::uniform_int_distribution<int>(1, 16)(rng) : std::uniform_int_distribution<int>(17, 64)(rng);
+      p.N = draw_dim(rng, max_dim, primes);
+      if (double(p.M) * p.N * p.K * p.batch <= std::ldexp(1.0, 30)) break;
+      continue;
+    }
     if (decode) {  // GEMV and split-K paths: small M, long K (odd split slices, K tails)
       p.M = u(rng) < 0.85 ? std::uniform_int_distribution<int>(1, 16)(rng) : std::uniform_int_distribution<int>(17, 40)(rng);
       p.N = draw_dim(rng, max_dim, primes);
@@ -356,11 +383,19 @@ int main(int argc, char** argv) {
   }
   // aegis::matmul stays a target in every mode (the case stream must not depend
   // on the mode); --cpu-ref-only skips its cases (its fallback is cuBLAS).
-  if (std::find(a.impls.begin(), a.impls.end(), "matmul") != a.impls.end())
-    targets.push_back({"matmul", nullptr});
+  auto listed = [&](const char* n) { return std::find(a.impls.begin(), a.impls.end(), n) != a.impls.end(); };
+  using Kind = aegis::detail::Choice::Kind;
+  if (listed("matmul")) targets.push_back({"matmul", nullptr});
+  if (listed("matmul_lt")) targets.push_back({"matmul_lt", nullptr, Kind::Cublaslt});
+  if (listed("matmul_cublas")) targets.push_back({"matmul_cublas", nullptr, Kind::Cublas});
+  // Stored-algorithm hints for matmul_lt: the Cublaslt winners' recorded algorithms.
+  std::vector<const aegis::detail::LtAlgoConfig*> stored;
+  for (const auto& w : aegis::detail::winners_table())
+    if (w.dispatch == aegis::detail::Dispatch::Cublaslt && w.lt.id >= 0) stored.push_back(&w.lt);
   if (targets.empty()) { std::fprintf(stderr, "no targets\n"); return 2; }
   const std::vector<int> primes = primes_upto(a.max_dim);
-  const std::vector<int> kprimes = a.decode ? primes_upto(kDecodeMaxK) : std::vector<int>{};
+  const std::vector<int> kprimes =
+      a.large_k ? primes_upto(kLargeKMax) : a.decode ? primes_upto(kDecodeMaxK) : std::vector<int>{};
   aegis::bench::LtReference lt;
   cudaStream_t stream;
   AEGIS_CUDA_CHECK(cudaStreamCreate(&stream));
@@ -375,8 +410,11 @@ int main(int argc, char** argv) {
   const long long last = a.only_case >= 0 ? a.only_case + 1 : a.cases;
   for (long long ci = first; ci < last; ++ci) {
     std::mt19937_64 rng(a.seed * 1000003ull + (unsigned long long)ci);
-    Case c = make_case(rng, targets, a.max_dim, primes, a.calibrate, a.decode, kprimes);
-    if (a.cpu_ref_only && !c.target.entry) {
+    Case c = make_case(rng, targets, a.max_dim, primes, a.calibrate, a.decode, kprimes, a.large_k);
+    // matmul_lt: a stored hint on odd cases (drawn after the case, so the stream is unchanged).
+    const aegis::detail::LtAlgoConfig* hint =
+        c.target.forced == Kind::Cublaslt && !stored.empty() && ci % 2 ? stored[size_t(ci / 2) % stored.size()] : nullptr;
+    if (a.cpu_ref_only && c.target.library()) {
       ++skipped;
       continue;
     }
@@ -394,7 +432,9 @@ int main(int argc, char** argv) {
     dp.A = device_copy(c.g.A, c.off_a, &ba, a.poison);
     dp.B = device_copy(c.g.B, c.off_b, &bb, a.poison);
     dp.C = device_copy(c.g.C0, c.off_c, &bc, a.poison);
-    const cudaError_t e = c.target.entry ? c.target.entry->run(dp, stream) : aegis::matmul(dp, stream);
+    const cudaError_t e = c.target.entry                    ? c.target.entry->run(dp, stream)
+                          : c.target.forced == Kind::Aegis ? aegis::matmul(dp, stream)
+                                                           : aegis::detail::matmul_forced(dp, c.target.forced, hint, stream);
     const cudaError_t s = e == cudaSuccess ? cudaStreamSynchronize(stream) : e;
     std::vector<__half> out(c.g.C0.size());
     if (s == cudaSuccess && !out.empty())
@@ -404,7 +444,7 @@ int main(int argc, char** argv) {
     // alpha == 0 (C = beta*C) is always checked on the CPU: cuBLASLt applies the
     // BLAS convention inconsistently there (some algorithms propagate NaN from A*B).
     // --cpu-ref-only and --explain: the FP64 CPU reference for every case, any size.
-    const bool use_cpu = a.cpu_ref_only || a.explain || macs <= std::ldexp(1.0, 24) || hp.alpha == 0.f;
+    const bool use_cpu = a.cpu_ref_only || a.explain || a.large_k || macs <= std::ldexp(1.0, 24) || hp.alpha == 0.f;
     std::vector<double> ref;
     std::vector<__half> lt_out;
     if (use_cpu) {
@@ -479,8 +519,15 @@ int main(int argc, char** argv) {
     if (!ok) {
       ++failures;
       std::printf("FAIL case %lld (--seed %llu --case %lld): %s\n  %s%s\n", ci, a.seed, ci, c.describe().c_str(),
-                  s != cudaSuccess ? cudaGetErrorString(s) : cmp.first_failure.c_str(),
+                  s != cudaSuccess ? (std::string(cudaGetErrorString(s)) + (c.target.library() ? std::string(": ") + aegis::matmul_last_error() : "")).c_str()
+                                  : cmp.first_failure.c_str(),
                   use_cpu ? "" : (!a.corrupt && s == cudaSuccess ? " [FP64 reference, after cuBLASLt]" : " [cuBLASLt reference]"));
+      if (c.target.forced == Kind::Cublaslt) {
+        aegis::detail::LtAlgoConfig used;
+        const std::string src = aegis::detail::cublaslt_plan_source(dp, stream, hint, &used);
+        std::printf("  cuBLASLt plan: %s, algo %d splitk %d reduction %d (hint: %s)\n", src.c_str(), used.id, used.splitk,
+                    used.reduction, hint ? ("stored algo " + std::to_string(hint->id)).c_str() : "none");
+      }
     } else if (a.verbose) {
       std::printf("ok   case %lld: %s  max_ratio %.3f%s\n", ci, c.describe().c_str(), cmp.max_ratio,
                   use_cpu ? "" : " [lt]");

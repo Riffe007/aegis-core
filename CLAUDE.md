@@ -52,6 +52,7 @@ tools/sass_dump.sh                                # SASS + register usage per ke
 microbench/run_all.sh                             # hardware probes -> perf DB microbench table (takes the GPU lock)
 ./build/aegis_fuzz --cases 2000 --seed 1          # randomized correctness vs FP64 / cuBLASLt (ctest fuzz_2000)
 ./build/aegis_fuzz --decode --poison --impls gemv_,matmul  # M <= 16 (some 17..40), K up to 16384 (ctest fuzz_decode)
+./build/aegis_fuzz --large-k --poison --impls matmul_lt     # K 14000..20000 vs FP64; matmul_lt / matmul_cublas force the fallback paths (ctest fuzz_large_k)
 cmake --build build --target fuzz_nightly         # 50,000 fuzz cases
 tools/sanitize.sh                                 # ctest suite under compute-sanitizer memcheck/racecheck/initcheck/synccheck
 tools/ncu_gemm.sh IMPL M N K; tools/ncu_summary.sh artifacts/ncu/*.ncu-rep   # Nsight profile + key metrics
@@ -423,6 +424,12 @@ only to compare with old rows (`--protocol 1`).
     Every row filtered out: cuBLASLt, with the row's tuned algorithm as the hint.
     No row: cuBLAS.
   - `detail::choose(table, M, N, K, caps)` is the testable core (ctest `hw_dispatch`).
+- **Library fallbacks keep FP32 partials (2026-10-18).**
+  - cuBLAS: `CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION`.
+  - cuBLASLt: splitk 1 or `COMPUTE_TYPE` only, never INPLACE or OUTPUT_TYPE
+    (`lt::reduction_ok`, heuristic mask; ctest `lt_reduction`, `fuzz_large_k`).
+  - A stored cuBLASLt algorithm runs only on operands aligned to at least 16 B that meet its
+    alignment caps (`cublasLtMatmulAlgoCheck` ignores pointers).
 - **Device profiles (aegis-hw step 3, `src/hw/profile.h`).**
   - `include/aegis/arch/sm_<arch>.json` is compiled into the library (CMake) and used
     only when its sm_arch, sm_count, device name and l2_bytes all match the detected

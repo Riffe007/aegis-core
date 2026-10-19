@@ -47,6 +47,18 @@ inline Config read_config(const cublasLtMatmulAlgo_t& algo) {
   return c;
 }
 
+// Split-K reduction schemes aegis::matmul may run (cublasLt.h,
+// cublasLtReductionScheme_t). COMPUTE_TYPE keeps the partials in FP32 in the
+// workspace and reduces them in a separate step. OUTPUT_TYPE stores them as
+// FP16, and INPLACE adds them up in the output buffer "and output data type":
+// both round every partial to FP16 before the sum, the error that failed fuzz
+// case 1360 (seed 41) on the cuBLAS path. So: one K pass (splitk 1, no
+// reduction) or COMPUTE_TYPE, nothing else.
+inline constexpr uint32_t kReductionMask = CUBLASLT_REDUCTION_SCHEME_COMPUTE_TYPE;
+inline bool reduction_ok(const Config& c) {
+  return c.splitk <= 1 || c.reduction == int(CUBLASLT_REDUCTION_SCHEME_COMPUTE_TYPE);
+}
+
 // FP16 in/out, FP32 compute and scale: the only GEMM AEGIS asks cuBLASLt for.
 inline cublasStatus_t rebuild(cublasLtHandle_t lt, const Config& c, cublasLtMatmulAlgo_t* algo) {
   if (c.id < 0) return CUBLAS_STATUS_INVALID_VALUE;

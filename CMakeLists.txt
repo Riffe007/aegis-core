@@ -315,6 +315,20 @@ set_tests_properties(hw_profile_row_label PROPERTIES ENVIRONMENT AEGIS_PROFILE_E
 # Decode fuzz: the GEMV family and aegis::matmul, M 1..40 (mostly <= 16), K up
 # to 16384, every layout, boundaries, alpha/beta, poisoned memory.
 add_test(NAME fuzz_decode COMMAND aegis_fuzz --cases 2000 --seed 41 --poison --decode --impls gemv_,matmul)
+# Long-K fuzz (K 14000..20000, FP64 reference): aegis::matmul's cuBLASLt path forced
+# (dispatch floor / filtered rows; odd cases pass a stored algorithm as the hint), then
+# plain aegis::matmul and its cuBLAS fallback. Split-K partials must stay FP32. With
+# FP16 partials allowed, seed 62 fails cases 44, 150, 430, 586 (in range) on numerics (LOG 2026-10-18).
+add_test(NAME fuzz_large_k COMMAND aegis_fuzz --cases 600 --seed 62 --poison --large-k --impls matmul_lt)
+add_test(NAME fuzz_large_k_paths COMMAND aegis_fuzz --cases 300 --seed 61 --poison --large-k
+         --impls matmul,matmul_cublas)
+# A stored algorithm the alignment caps accept that cublasLtMatmul refuses (C at 6 B).
+add_test(NAME fuzz_lt_stored_alignment COMMAND aegis_fuzz --seed 62 --case 129 --poison --large-k --impls matmul_lt)
+# cuBLASLt fallback numerics: stored and heuristic algorithms keep FP32 split-K partials.
+add_executable(test_lt_reduction tests/test_lt_reduction.cu)
+target_link_libraries(test_lt_reduction PRIVATE aegis aegis_bench_harness)
+target_include_directories(test_lt_reduction PRIVATE src)
+add_test(NAME lt_reduction COMMAND test_lt_reduction)
 
 # GPU lock (CLAUDE.md rule 15): every test except the compile-only sm87_gate
 # touches the GPU, is labelled "gpu" and requires the gpu_lock_guard fixture,

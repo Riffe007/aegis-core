@@ -175,6 +175,10 @@ inline constexpr int kLtMaxAlgos = 8;
 struct LtBest {
   std::unique_ptr<LtPlan> plan;
   int best = -1;  // index into plan->algos; -1: no algorithm passed
+  // The fastest passing algorithm aegis::matmul may run (lt::reduction_ok:
+  // splitk 1 or an FP32 split-K reduction); == best unless best keeps FP16 partials.
+  int dispatch = -1;
+  double dispatch_median_us = 0;
   int candidates = 0, passed = 0;
   Check check;
   Timing timing;

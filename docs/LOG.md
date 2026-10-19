@@ -2294,3 +2294,58 @@ HEVC, VP8, VP9, AV1. NVENC: H264, HEVC, AV1.
   until the Nano is tuned.
 - **Hardening:** memcheck `test_hw_dispatch`, `test_matmul`, `aegis_fuzz` (100 decode cases with
   gemv_ and matmul; 100 cases of matmul, dims <= 512), 0 errors (`artifacts/sanitizer/hw-step4/`).
+
+## 2026-10-18 — hardening 1: cuBLASLt fallback numerics
+
+- **Rule:** aegis::matmul's cuBLASLt path (dispatch floor, rows filtered by capability) runs
+  only split-K reductions that keep partials in FP32: splitk 1, or
+  `CUBLASLT_REDUCTION_SCHEME_COMPUTE_TYPE`. `INPLACE` is forbidden too, not just
+  `OUTPUT_TYPE`: cublasLt.h says it reduces "using the output buffer (and output data type)",
+  i.e. FP16 partials (`src/lt_algo.h` `reduction_ok`).
+  - Stored algorithms that fail the rule are rejected. The heuristic is asked with
+    `CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK` = COMPUTE_TYPE, and each result is checked
+    again.
+  - If no compliant algorithm is offered, the plan runs cuBLAS
+    (DISALLOW_REDUCED_PRECISION_REDUCTION, as the no-winner fallback since 2026-10-18).
+- **Stored algorithms:** none violated, so no re-selection and no paired-ab were needed.
+  The two Cublaslt rows, 4096^3 (algo 67) and 512x4864x896 (algo 21), are splitk 1. The only
+  split-K row anywhere in the table is 16x896x4864 (algo 21, splitk 3, COMPUTE_TYPE), an
+  Aegis row whose algorithm is only a hint. For future tunes, the harness also records the
+  fastest passing compliant algorithm when cublaslt_best's own is not
+  (`"lt":{..., "dispatch":{...}}`), and emit-header writes that one.
+- **What the mask changes (ctest `lt_reduction`):** at long K the unmasked heuristic mostly
+  offers FP16 partials, and its first choice was INPLACE at
+  - 24x1872x14747 (algo 24, splitk 19; 7 of its top 8 have FP16 partials);
+  - 64x2048x14009 (algo 24, splitk 33).
+  Masked, these run algo 24 with splitk 24 / 20, COMPUTE_TYPE. The routed shapes' plans
+  (4096^3, 512x4864x896 and their nearest-M shapes) were already compliant and are
+  unchanged.
+- **Pre-existing bug found by the new fuzz: stored algorithm vs. alignment.**
+  `cublasLtMatmulAlgoCheck` sees no pointers. A stored algorithm it accepted then failed in
+  `cublasLtMatmul` (status 15) on a misaligned operand; at 4096^3 with an offset pointer,
+  aegis::matmul returned an error. Even the algorithm's alignment caps are not enough: algo 67
+  reports 2 B for C and fails with C at 6 B (seed 62 case 129).
+  - Fix: stored algorithms run only when every operand (pointer, batch stride, ld) is at least
+    16 B aligned and meets the caps; otherwise the heuristic, which takes the alignments as
+    preferences.
+  - Safety net: a NOT_SUPPORTED from cublasLtMatmul switches that plan to cuBLAS (it never
+    fired in the runs below).
+- **Fuzz:**
+  - `aegis_fuzz --large-k`: K 14000..20000, M 1..64, M*N*K <= 2^30, every case against FP64.
+  - New targets `matmul_lt` (the cuBLASLt path forced; odd cases pass a Cublaslt winner's
+    stored algorithm as the hint) and `matmul_cublas` (the no-winner fallback forced),
+    through `detail::matmul_forced`.
+  - Results, 0 failures each:
+    - ctest `fuzz_large_k`: 600 cases, matmul_lt, seed 62;
+    - `fuzz_large_k_paths`: 300 cases, matmul + matmul_cublas;
+    - `fuzz_lt_stored_alignment`: case 129;
+    - 1,500 cases of seed 62.
+  - Control, FP16 partials allowed again (the mask and the check off):
+    - seed 62, matmul_lt: 10 failures in the first 900 cases. Five are numeric (cases 44, 150,
+      430, 586, 841: FP16 partials); the other five are the alignment bug (they fail
+      with the rule on and pass after the alignment fix);
+    - seed 61, 300 cases (matmul_lt max error 0.997x tolerance vs. 0.416x with the rule):
+      0 failures.
+    So the ctest uses seed 62.
+- **Hardening:** ctest 307/307 including sm87_gate. memcheck `test_lt_reduction`, 24 large-K
+  fuzz cases (all three paths) and case 129: 0 errors (`artifacts/sanitizer/hardening-1/`).

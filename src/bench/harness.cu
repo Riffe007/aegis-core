@@ -990,6 +990,11 @@ LtBest Harness::cublaslt_best(Problem& p, const TimingOptions& o, int only_rank)
       r.check = c;
       r.timing = t;
     }
+    if (lt::reduction_ok(lt::read_config(r.plan->algos[size_t(i)].algo)) &&
+        (r.dispatch < 0 || t.median_us < r.dispatch_median_us)) {
+      r.dispatch = i;
+      r.dispatch_median_us = t.median_us;
+    }
   }
   if (r.best >= 0) run_once(r.impl(), p);  // p.C holds the reported algorithm's result
   return r;
@@ -1003,7 +1008,17 @@ std::string Harness::lt_json(const LtBest& b) {
   char buf[128];
   std::snprintf(buf, sizeof buf, ",\"workspace\":%zu,\"heuristic_rank\":%d,\"candidates\":%d,\"passed\":%d}", al.workspace,
                 al.rank, b.candidates, b.passed);
-  return ",\"lt\":{" + lt::config_json(lt::read_config(al.algo)) + buf;
+  // cublaslt_best keeps an FP16 split-K reduction: the algorithm dispatch may run
+  // instead (tune.rs lt_config prefers it), with its own time.
+  std::string dispatch;
+  if (b.dispatch >= 0 && b.dispatch != b.best) {
+    char t[64];
+    std::snprintf(t, sizeof t, ",\"median_us\":%.3f}", b.dispatch_median_us);
+    dispatch = ",\"dispatch\":{" + lt::config_json(lt::read_config(b.plan->algos[size_t(b.dispatch)].algo)) + t;
+  }
+  std::string s = ",\"lt\":{" + lt::config_json(lt::read_config(al.algo)) + buf;
+  s.pop_back();  // the closing brace
+  return s + dispatch + "}";
 }
 
 }  // namespace aegis::bench

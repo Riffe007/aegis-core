@@ -219,9 +219,12 @@ pub fn dispatch(lt_ci: Option<(f64, f64)>, pct_lt: Option<f64>) -> Dispatch {
 /// winners.lt_algo (JSON, src/lt_algo.h config_json) as an
 /// aegis::detail::LtAlgoConfig initializer `{id, tile, stages, splitk,
 /// reduction, swizzle, custom, inner_shape, cluster_shape}`; None without an
-/// algo_id.
+/// algo_id. When cublaslt_best's algorithm keeps FP16 split-K partials, the
+/// harness adds `dispatch`: the fastest passing algorithm with an FP32
+/// reduction (src/lt_algo.h reduction_ok), which is the one emitted.
 pub fn lt_config(json: &str) -> Result<Option<String>> {
-    let v: Value = serde_json::from_str(json).context("winners.lt_algo")?;
+    let top: Value = serde_json::from_str(json).context("winners.lt_algo")?;
+    let v = if top["dispatch"].is_object() { &top["dispatch"] } else { &top };
     let Some(id) = v["algo_id"].as_i64() else { return Ok(None) };
     let f = |k: &str, d: i64| v[k].as_i64().unwrap_or(d);
     Ok(Some(format!(
@@ -391,5 +394,8 @@ mod tests {
         let j = r#"{"algo_id":21,"tile_id":15,"stages_id":12,"splitk":3,"reduction":2,"swizzle":0,"custom":0,"inner_shape":0,"cluster_shape":0,"workspace":172032}"#;
         assert_eq!(lt_config(j).unwrap().as_deref(), Some("{21, 15, 12, 3, 2, 0, 0, 0, 0}"));
         assert_eq!(lt_config("{}").unwrap(), None);
+        // cublaslt_best with FP16 partials (OUTPUT_TYPE): the compliant `dispatch` algorithm is emitted.
+        let j = r#"{"algo_id":21,"splitk":4,"reduction":4,"dispatch":{"algo_id":67,"tile_id":412,"stages_id":35,"splitk":1,"reduction":0,"median_us":9.5}}"#;
+        assert_eq!(lt_config(j).unwrap().as_deref(), Some("{67, 412, 35, 1, 0, 0, 0, 0, 0}"));
     }
 }

@@ -16,7 +16,12 @@
 // winner / cublaslt_best lies entirely below 0.80 (upper bound < 0.80; without
 // a paired CI, the unpaired median ratio) is emitted with dispatch Cublaslt,
 // and its shapes (exact or nearest-M) run cuBLASLt instead of the kernel:
-// the heuristic's first algorithm (workspace limit 32 MiB, as cublaslt_best)
+// the stored algorithm cublaslt_best picked at the winner's exact shape (used
+// only when every operand is at least 16 B aligned and meets the algorithm's
+// alignment caps), else the heuristic's first algorithm (workspace limit 32 MiB,
+// as cublaslt_best). Either way only split-K reductions with FP32 partials
+// (splitk 1 or COMPUTE_TYPE; never INPLACE or OUTPUT_TYPE, which add FP16
+// partials); no such algorithm: cuBLAS, whose reductions are FP32 too. Chosen
 // per (shape, layouts, ld, batch, strides, pointer alignment, stream), picked
 // on the first such call on a host thread and cached with its descriptors and
 // workspace (split-K algorithms need one; it comes from the per-stream
@@ -82,8 +87,20 @@ std::span<const Winner> winners_table();
 // Which algorithm this thread's cuBLASLt plan for (p, stream, stored) runs:
 // "stored", "heuristic", or "heuristic (stored algo N rejected: ...)"; builds
 // the plan if needed ("" and matmul_last_error() on failure). aegis::matmul
-// passes the exact-shape winner's lt; a test may pass any config.
-std::string cublaslt_plan_source(const gemm::GemmParams& p, cudaStream_t stream, const LtAlgoConfig* stored);
+// passes the exact-shape winner's lt; a test may pass any config. `config`:
+// the attributes of the algorithm the plan runs.
+std::string cublaslt_plan_source(const gemm::GemmParams& p, cudaStream_t stream, const LtAlgoConfig* stored,
+                                 LtAlgoConfig* config = nullptr);
+// The cuBLASLt path runs only split-K reductions that keep partials in FP32:
+// splitk 1, or CUBLASLT_REDUCTION_SCHEME_COMPUTE_TYPE (src/lt_algo.h). A stored
+// algorithm that fails this is rejected and the (masked) heuristic used.
+bool lt_reduction_ok(const LtAlgoConfig& c);
+// For tests and the fuzzer: aegis::matmul's argument handling (validate, empty,
+// alpha == 0) with the GEMM forced onto one path: Cublaslt (the floor / filtered
+// path, `stored` as the algorithm hint), Cublas (the no-winner fallback), or
+// Aegis (plain aegis::matmul).
+cudaError_t matmul_forced(const gemm::GemmParams& p, Choice::Kind kind, const LtAlgoConfig* stored,
+                          cudaStream_t stream);
 }  // namespace detail
 
 cudaError_t matmul(const __half* A, const __half* B, __half* C, int M, int N, int K,
