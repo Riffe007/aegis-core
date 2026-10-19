@@ -302,8 +302,22 @@ pub fn cmd_regress(db: &Path, run: &str, header: &Path) -> Result<()> {
             c.dispatch = d.clone();
         }
     }
+    if let Some(r) = crate::view::run(&con, run)? {
+        println!("run {run}: {}; header {}", run_identity(&r), header.display());
+    }
     println!("{}", text(run, disturbed, &checks));
     Ok(())
+}
+
+/// "kind nightly, build <40 hex> (clean)": what a run is and what measured it (schema v7).
+pub fn run_identity(r: &crate::view::Run) -> String {
+    let build = match (&r.build_sha, r.build_dirty) {
+        (Some(s), Some(false)) => format!("{s} (clean)"),
+        (Some(s), _) => format!("{s} (DIRTY: not evidence)"),
+        (None, _) => format!("unknown (before schema v7; tree at ingest {})", r.git_sha.as_deref().unwrap_or("?")),
+    };
+    let marked = if r.allow_dirty { ", stored with --allow-dirty (excluded by default)" } else { "" };
+    format!("kind {}, build {build}{marked}", r.kind.map_or("unknown", |k| k.as_str()))
 }
 
 #[cfg(test)]

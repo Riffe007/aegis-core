@@ -58,7 +58,8 @@ tools/sanitize.sh                                 # ctest suite under compute-sa
 tools/ncu_gemm.sh IMPL M N K; tools/ncu_summary.sh artifacts/ncu/*.ncu-rep   # Nsight profile + key metrics
 rust/target/release/aegis-perf paired-ab --a OLD/bench_gemm --b build/bench_gemm --impl X --shape M N K  # A/B across builds
 ./build/bench_gemm --build-info                   # this build's commit and dirty flag (every result row carries them)
-tools/nightly.sh                                  # nightly (user timer 03:00; --install): 50k fuzz, regression sweep, DB backup -> results/nightly.log
+tools/nightly.sh                                  # nightly (user timer 03:00; --install): builds main HEAD clean in ../aegis-nightly,
+                                                  # then 50k fuzz, regression sweep (runs.kind nightly), DB backup -> results/nightly.log
                                                   # summary lines: status=OK / FAIL / SKIPPED reason="..."
 tools/kernel_log_guard.sh --since TIME            # new Xid / NVRM lines? (profiler lines inside logged sessions ignored)
 rust/target/release/aegis-perf regress --run R   # winners-header shapes: % of cublaslt_best in run R vs the newest earlier clean run;

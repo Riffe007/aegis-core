@@ -4,10 +4,13 @@
 #   tools/nightly.sh             run now (what the timer runs)
 #   tools/nightly.sh --install   install and enable the user timer
 #   tools/nightly.sh --preflight-only   lock + kernel-log guard, then stop (status=PREFLIGHT_OK); for tests
+#   tools/nightly.sh --build-only       ... + build main HEAD in the nightly worktree, check its identity (status=BUILD_OK)
 #
 # Paths (tests override them): AEGIS_NIGHTLY_SUMMARY (results/nightly.log),
 # AEGIS_NIGHTLY_DIR (results/nightly), AEGIS_KERNEL_LOG (a short-unix kernel
 # log file instead of journalctl), AEGIS_PROFILER_SESSIONS.
+# AEGIS_NIGHTLY_TREE (../aegis-nightly) and AEGIS_NIGHTLY_BRANCH (main): what is
+# built and measured; AEGIS_NIGHTLY_CMAKE_ARGS: extra configure arguments.
 #
 # 1. Takes the GPU lock (rule 15) and runs the preflight and the idle guard
 #    (Benchmark policy). Lock held, GPU busy or preflight failed: one line in
@@ -15,6 +18,11 @@
 #    is not an error, but it is never silent). Kernel log: any new Xid / NVRM
 #    line blocks, except the profiler's known messages inside a logged
 #    profiler session (tools/kernel_log_guard.sh).
+# 1b. Builds the current HEAD of main, clean, in its own worktree (never the
+#    main working tree's build/), and checks that bench_gemm --build-info names
+#    exactly that commit with a clean tree; a failed build or a mismatch is a
+#    FAIL night. Every step below runs that build, with that commit's shapes
+#    and winners header; its runs are stored as kind "nightly".
 # 2. aegis_fuzz, 50,000 cases (seed = the date, so every night differs),
 #    under tools/gpu_job.sh and the in-process GPU budget (rule 13).
 # 3. Regression sweep of the tracked shape set (shapes/default.txt): the
@@ -38,6 +46,8 @@ cd "$ROOT"
 NDIR="${AEGIS_NIGHTLY_DIR:-$ROOT/results/nightly}"
 PREFLIGHT_ONLY=0
 [[ "${1:-}" == "--preflight-only" ]] && PREFLIGHT_ONLY=1
+BUILD_ONLY=0
+[[ "${1:-}" == "--build-only" ]] && BUILD_ONLY=1
 if [[ "${1:-}" == "--install" ]]; then
   dir="$HOME/.config/systemd/user"
   mkdir -p "$dir"
@@ -55,10 +65,6 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 SUMMARY="${AEGIS_NIGHTLY_SUMMARY:-$ROOT/results/nightly.log}"
 mkdir -p "$NDIR"
 DETAIL="$NDIR/$STAMP.log"
-PERF="$ROOT/rust/target/release/aegis-perf"
-BENCH="$ROOT/build/bench_gemm"
-FUZZ="$ROOT/build/aegis_fuzz"
-HEADER="$ROOT/include/aegis/winners/sm_121.h"
 BACKUPS="$HOME/backups"
 KEEP=14
 
@@ -100,6 +106,50 @@ if ((PREFLIGHT_ONLY)); then
   exit 0
 fi
 
+# Build: the current HEAD of main (AEGIS_NIGHTLY_BRANCH), clean, in the nightly's
+# own worktree (AEGIS_NIGHTLY_TREE, default ../aegis-nightly). Never the main
+# working tree's build/: a session may have left it at another commit, or built
+# it from uncommitted work. Everything below runs from that tree: its bench_gemm,
+# aegis_fuzz and aegis-perf, its shapes, its committed winners header.
+NBRANCH="${AEGIS_NIGHTLY_BRANCH:-main}"
+NTREE="${AEGIS_NIGHTLY_TREE:-$(dirname "$ROOT")/aegis-nightly}"
+export PATH="$PATH:/usr/local/cuda/bin:$HOME/.cargo/bin"
+head_sha="$(git -C "$ROOT" rev-parse --verify -q "$NBRANCH^{commit}")" || skip "no branch $NBRANCH"
+if [[ ! -e "$NTREE/.git" ]]; then
+  git -C "$ROOT" worktree add -q --detach "$NTREE" "$head_sha" || skip "cannot create the nightly worktree $NTREE"
+fi
+[[ -z "$(git -C "$NTREE" status --porcelain --untracked-files=no)" ]] ||
+  skip "the nightly worktree $NTREE has local changes; it is the nightly's own: git -C $NTREE checkout -f --detach $NBRANCH"
+git -C "$NTREE" checkout -q --detach "$head_sha" || skip "cannot check out $head_sha in $NTREE"
+echo "== build $NBRANCH HEAD $head_sha in $NTREE (log $DETAIL.build)"
+# shellcheck disable=SC2086  # AEGIS_NIGHTLY_CMAKE_ARGS: extra configure arguments, word-split on purpose
+if ! { cmake -S "$NTREE" -B "$NTREE/build" -DCMAKE_BUILD_TYPE=Release ${AEGIS_NIGHTLY_CMAKE_ARGS:-} &&
+       cmake --build "$NTREE/build" -j &&
+       cargo build --release --manifest-path "$NTREE/rust/Cargo.toml" -p aegis-perf; } >"$DETAIL.build" 2>&1; then
+  tail -20 "$DETAIL.build"
+  summary "status=FAIL build of $NBRANCH $head_sha failed; log $DETAIL.build"
+  exit 1
+fi
+PERF="$NTREE/rust/target/release/aegis-perf"
+BENCH="$NTREE/build/bench_gemm"
+FUZZ="$NTREE/build/aegis_fuzz"
+HEADER="$NTREE/include/aegis/winners/sm_121.h"
+# The binaries must name exactly that commit, clean (src/bench/build_info.h).
+build_info="$("$BENCH" --build-info 2>/dev/null)"
+if [[ "$(jq -r .build_sha <<<"$build_info" 2>/dev/null)" != "$head_sha" ||
+      "$(jq -r .build_dirty <<<"$build_info" 2>/dev/null)" != false ]]; then
+  summary "status=FAIL build identity: bench_gemm says ${build_info:-nothing}, expected $head_sha clean; log $DETAIL"
+  echo "== build identity mismatch: $build_info"
+  exit 1
+fi
+echo "== build: $build_info"
+if ((BUILD_ONLY)); then
+  summary "status=BUILD_OK $NBRANCH $head_sha clean in $NTREE"
+  exit 0
+fi
+export AEGIS_PERFDB="${AEGIS_PERFDB:-$ROOT/results/aegis_perf.db}"
+cd "$NTREE"
+
 # Preflight (Benchmark policy "Before any run").
 for f in "$PERF" "$BENCH" "$FUZZ" "$HEADER"; do
   [[ -e "$f" ]] || skip "missing $f"
@@ -122,7 +172,7 @@ failed=0
 # 2. Fuzz.
 seed="$(date +%Y%m%d)"
 echo "== aegis_fuzz --cases 50000 --seed $seed --poison"
-"$ROOT/tools/gpu_job.sh" "$FUZZ" --cases 50000 --seed "$seed" --poison > "$NDIR/fuzz-$STAMP.txt"
+"$NTREE/tools/gpu_job.sh" "$FUZZ" --cases 50000 --seed "$seed" --poison > "$NDIR/fuzz-$STAMP.txt"
 fuzz_rc=$?
 fuzz_line="$(grep '^aegis_fuzz:' "$NDIR/fuzz-$STAMP.txt" | tail -1)"
 echo "$fuzz_line (exit $fuzz_rc)"
@@ -137,8 +187,9 @@ fi
 
 # 3. Regression sweep: the dispatched impls of the committed header + baselines.
 mapfile -t impls < <(sed -n 's/^ *{[0-9]*, *[0-9]*, *[0-9]*, *"\([^"]*\)"[,}].*/\1/p' "$HEADER" | sort -u)
-echo "== aegis-perf sweep --shapes shapes/default.txt --no-winners --impls cublas cublaslt_best aegis_matmul ${impls[*]}"
-sweep_out="$("$PERF" sweep --shapes shapes/default.txt --no-winners --impls cublas cublaslt_best aegis_matmul "${impls[@]}" 2>&1)"
+echo "== aegis-perf sweep --nightly --shapes shapes/default.txt --no-winners --impls cublas cublaslt_best aegis_matmul ${impls[*]}"
+sweep_out="$("$PERF" sweep --nightly --build-dir "$NTREE/build" --results-dir "$ROOT/results" \
+  --shapes shapes/default.txt --no-winners --impls cublas cublaslt_best aegis_matmul "${impls[@]}" 2>&1)"
 sweep_rc=$?
 echo "$sweep_out"
 run_id="$(sed -n 's/^results: .* (run \([0-9a-f]*\))$/\1/p' <<<"$sweep_out" | tail -1)"
@@ -158,7 +209,7 @@ fi
 # 4. Backup (consistent copy of a live DB), keep the 14 newest.
 mkdir -p "$BACKUPS"
 backup="$BACKUPS/aegis_perf-$DAY.db"
-if sqlite3 "$ROOT/results/aegis_perf.db" ".backup '$backup'" &&
+if sqlite3 "$AEGIS_PERFDB" ".backup '$backup'" &&
    [[ "$(sqlite3 "$backup" 'PRAGMA integrity_check')" == ok ]]; then
   ls -1t "$BACKUPS"/aegis_perf-*.db | tail -n +$((KEEP + 1)) | xargs -r rm -f --
   backup_txt="backup $backup ($(ls -1 "$BACKUPS"/aegis_perf-*.db | wc -l) kept)"
@@ -168,5 +219,5 @@ else
 fi
 
 # 5. One line.
-summary "status=$( ((failed)) && echo FAIL || echo OK ) idle ${idle_pct}%; $fuzz_txt; $sweep_txt; $backup_txt; log $DETAIL"
+summary "status=$( ((failed)) && echo FAIL || echo OK ) build ${head_sha:0:12} ($NBRANCH, clean); idle ${idle_pct}%; $fuzz_txt; $sweep_txt; $backup_txt; log $DETAIL"
 exit $failed

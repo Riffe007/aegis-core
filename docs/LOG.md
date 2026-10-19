@@ -2699,3 +2699,40 @@ aegis-perf-v0.6.0 first).
   `--allow-dirty` rows are marked and out of `Selection::ranking()`; microbench ingest checks its
   build; the pre-v7 -> v7 backfill; paired-ab rejects a `--sha` the binary contradicts; a dirty
   paired-ab does not confirm a regression.
+
+## 2026-10-18 — The nightly builds main HEAD, clean, and says so
+
+**What it ran before.** `tools/nightly.sh` built nothing. It ran whatever `build/` and
+`rust/target/release/aegis-perf` the main working tree held at 03:00, with the winners header in
+that tree. Its only record of the build was a `git describe` of the tree at 03:00, and the run's
+`git_sha` came from the same place.
+- The three nightlies with sweeps (d1504a45376d, b34425e97d6d, eb5bcee294d4; 2026-10-15 to -17)
+  log `aegis-perf-v0.2.0-3-g9157a34` with no `-dirty`, and runs.git_sha `9157a34`.
+- Main HEAD was 9157a34 for all three nights (no commit between 2026-10-14 21:15 and 2026-10-17
+  14:11), so those sweeps measured HEAD's header. Whether `build/` was built from it is not
+  recorded anywhere.
+- After 2026-10-17 the tree was regularly mid-change during the day. A nightly then would have
+  measured a session's uncommitted build. The 2026-10-18 night was skipped (kernel-log guard).
+
+**Now** (stage 1b, after the lock and the kernel-log guard):
+- **Build.** The nightly checks out the current HEAD of `main` (`AEGIS_NIGHTLY_BRANCH`), detached,
+  in its own worktree (`AEGIS_NIGHTLY_TREE`, default `../aegis-nightly`, created on first use),
+  and builds it there: CMake build plus `cargo build -p aegis-perf`. A tree with local changes
+  is a skipped night; a failed build is a FAIL night.
+- **Identity.** `bench_gemm --build-info` must name exactly that commit with a clean tree, or
+  the night FAILs.
+- **Run.** Fuzz, sweep and regress run from that tree, with its shapes and its committed header.
+  The DB and results stay in the main tree (`AEGIS_PERFDB`, `--results-dir`).
+- **Kind.** The sweep is stored as `runs.kind = nightly` (`aegis-perf sweep --nightly`; the
+  build check refuses a dirty build anyway), with `runs.build_sha` = that commit. The header it
+  was checked against is that commit's `include/aegis/winners/sm_121.h`.
+- **Summary.** The summary line names the build (`status=OK build <sha12> (main, clean); ...`).
+  `aegis-perf regress` prints the run's kind, build and header first (`regress::run_identity`).
+- **`--build-only`.** Lock, kernel-log guard, build and identity check, then stop.
+
+Checked on CPU only (no GPU job: private lock file, `AEGIS_KERNEL_LOG` an empty file,
+`-DCMAKE_CUDA_ARCHITECTURES=121` so CMake queries no device):
+- `--build-only` on this branch (9158ea9): `status=BUILD_OK ... 9158ea9f11a7... clean`.
+- On `main` (bf1f417, which predates the build identity): `status=FAIL build identity: bench_gemm
+  says nothing, expected bf1f417... clean`, exit 1. Until this branch is merged, a nightly from
+  main HEAD fails this way rather than measure an unidentified build.
