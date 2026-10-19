@@ -24,6 +24,15 @@ MANIFEST="$ROOT/results/manifest-$HOST.json"
 PERF="$ROOT/rust/target/release/aegis-perf"
 [[ -x "$PERF" ]] || { echo "missing $PERF" >&2; exit 1; }
 
+# Build identity (Benchmark policy): a dirty or unknown build is refused before
+# the load runs unless ALLOW_DIRTY=1 (its rows are marked allow_dirty).
+INGEST_BUILD=()
+if [[ "${ALLOW_DIRTY:-0}" == 1 ]]; then
+  INGEST_BUILD+=(--allow-dirty)
+elif [[ "$(jq -r '.build_dirty == false and .build_sha != null' <<<"$("$ROOT/build/bench_gemm" --build-info 2>/dev/null || echo '{}')")" != true ]]; then
+  echo "$(basename "$0"): refusing to run: build/ is from a dirty or unknown tree (bench_gemm --build-info); commit and rebuild, or set ALLOW_DIRTY=1 (rows are marked)" >&2
+  exit 5
+fi
 IDLE_JSON="$("$ROOT/build/bench_gemm" --idle-check)" || { echo "run_throttle_profile.sh: idle guard refused (GPU busy)" >&2; exit 3; }
 [[ -f "$MANIFEST" ]] || "$ROOT/build/aegis_manifest" > "$MANIFEST"
 source "$ROOT/tools/idle_watch.sh"
@@ -31,7 +40,7 @@ idle_watch_start "$ROOT/build/bench_gemm" "$OUT.watch.json"
 "$ROOT/build/microbench/mb_throttle_profile" --seconds "$SECONDS_RUN" --samples "$SAMPLES" --profile "$PROFILE" > "$OUT"
 idle_watch_stop
 "$PERF" ingest-microbench "$OUT" --manifest "$MANIFEST" --idle-source "$(jq -r .source <<<"$IDLE_JSON")" \
-  --idle-util-pct "$(jq -r .mean_pct <<<"$IDLE_JSON")" --watch "$OUT.watch.json"
+  --idle-util-pct "$(jq -r .mean_pct <<<"$IDLE_JSON")" "${INGEST_BUILD[@]}" --watch "$OUT.watch.json"
 if [[ "$(tail -1 "$OUT.watch.json" | jq -r '.disturbed // false')" == true ]]; then
   echo "run_throttle_profile.sh: run disturbed; the profile is not written to include/aegis/arch/throttle" >&2
   exit 4

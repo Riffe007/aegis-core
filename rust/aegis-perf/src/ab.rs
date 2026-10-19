@@ -10,16 +10,21 @@
 //! background load) out of the ratio.
 //!
 //! Every result is stored in the perf DB (`paired_results`, see schema.sql)
-//! and printed. Each build's commit: `--sha-a` / `--sha-b`, else the HEAD of
-//! the git tree that contains the binary (`-dirty` if it has uncommitted
-//! tracked changes; NULL outside a tree). A binary built before the tree moved
-//! on would be mislabelled: pass the SHA explicitly for saved binaries.
+//! and printed. Each build's identity comes from the binary itself
+//! (`bench_gemm --build-info`: the full commit and whether its tree was dirty
+//! when it was built), so a saved binary keeps its own. A dirty or unknown
+//! build (a binary from before schema v7) is refused unless `--allow-dirty`;
+//! such a result is marked and excluded by default. `--sha-a` / `--sha-b` must
+//! match a binary that knows its build; for one that does not, they only label
+//! it (legacy `sha_a` / `sha_b`), and the result needs `--allow-dirty`.
 use std::path::Path;
 use std::process::Command;
 
 use anyhow::{bail, Context, Result};
 use rusqlite::params;
 use serde_json::Value;
+
+use crate::db::BuildId;
 
 pub struct AbArgs<'a> {
     pub db: &'a Path,
@@ -35,10 +40,20 @@ pub struct AbArgs<'a> {
     pub allow_busy: bool,
     pub sha_a: Option<&'a str>,
     pub sha_b: Option<&'a str>,
+    /// Store a result from a dirty or unknown build (marked, excluded by default).
+    pub allow_dirty: bool,
 }
 
-/// One bench_gemm run: (median_us, protocol_version).
-fn run_once(bench: &Path, impl_: &str, (m, n, k): (i64, i64, i64), reps: u32, cache: &str) -> Result<(f64, i64, Option<String>)> {
+/// One bench_gemm run.
+struct Once {
+    median_us: f64,
+    protocol: i64,
+    profile: Option<String>,
+    sm_arch: Option<i64>,
+    dtype: Option<String>,
+}
+
+fn run_once(bench: &Path, impl_: &str, (m, n, k): (i64, i64, i64), reps: u32, cache: &str) -> Result<Once> {
     let out = crate::gpujob::command(bench)?
         .args(["--impl", impl_, "--m", &m.to_string(), "--n", &n.to_string(), "--k", &k.to_string()])
         .args(["--reps", &reps.to_string(), "--warmup", "3", "--cache", cache])
@@ -49,15 +64,19 @@ fn run_once(bench: &Path, impl_: &str, (m, n, k): (i64, i64, i64), reps: u32, ca
     }
     let line = String::from_utf8_lossy(&out.stdout);
     let v: Value = serde_json::from_str(line.trim().lines().last().unwrap_or(""))?;
-    Ok((
-        v["median_us"].as_f64().context("bench_gemm row without median_us")?,
-        v["protocol_version"].as_i64().unwrap_or(1),
-        v["profile"].as_str().map(str::to_string),
-    ))
+    Ok(Once {
+        median_us: v["median_us"].as_f64().context("bench_gemm row without median_us")?,
+        protocol: v["protocol_version"].as_i64().unwrap_or(1),
+        profile: v["profile"].as_str().map(str::to_string),
+        sm_arch: v["sm_arch"].as_i64(),
+        dtype: v["dtype"].as_str().map(str::to_string),
+    })
 }
 
-/// The commit of the git tree containing `bench` (`-dirty` with uncommitted
-/// tracked changes), or None outside a tree.
+/// The commit of the git tree containing `bench` now (`-dirty` with uncommitted
+/// tracked changes), or None outside a tree. Not the binary's build: the tree
+/// may have moved on since. Used only to label a binary that cannot name its
+/// own build ([`crate::db::build_of`] is None).
 pub fn build_sha(bench: &Path) -> Option<String> {
     let path = std::fs::canonicalize(bench).ok()?;
     let dir = path.ancestors().skip(1).find(|d| d.join(".git").exists())?;
@@ -131,19 +150,33 @@ pub struct NewPairedResult {
     /// The device profile both builds ran under ("measured" / "unmeasured"); "mixed" if
     /// their rows disagree; None if no row carried one (builds before schema v5).
     pub profile: Option<String>,
+    /// Each build's identity (schema v7); None: the binary cannot name it.
+    pub build_a: Option<BuildId>,
+    pub build_b: Option<BuildId>,
+    /// Stored with --allow-dirty (a dirty or unknown build): excluded by default.
+    pub allow_dirty: bool,
+    /// Where it ran: runs.device_id's convention (the manifest's device_id, else the host).
+    pub device_id: Option<String>,
+    pub sm_arch: Option<i64>,
+    pub dtype: Option<String>,
 }
 
 /// Insert one result; returns its id.
 pub fn store(con: &rusqlite::Connection, r: &NewPairedResult) -> Result<i64> {
     let (m, n, k) = r.shape;
+    let sha = |b: &Option<BuildId>| b.as_ref().map(|b| b.sha.clone());
+    let dirty = |b: &Option<BuildId>| b.as_ref().map(|b| b.dirty as i64);
     con.execute(
         "INSERT INTO paired_results (sha_a, sha_b, shape, impl_a, impl_b, ratio, ci_lo, ci_hi, n, protocol_version, \
-         cache_mode, idle_reading, clocks_locked, started_at, finished_at, disturbed, disturbed_detail, profile) \
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+         cache_mode, idle_reading, clocks_locked, started_at, finished_at, disturbed, disturbed_detail, profile, \
+         build_sha_a, build_sha_b, build_dirty_a, build_dirty_b, allow_dirty, device_id, sm_arch, dtype) \
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         params![
             r.sha_a, r.sha_b, format!("{m}x{n}x{k}"), r.impl_a, r.impl_b, r.ratio, r.ci_lo, r.ci_hi, r.n as i64,
             r.protocol_version, r.cache_mode, r.idle_reading, r.clocks_locked as i64, r.started_at, r.finished_at,
             r.disturbed.map(i64::from), r.disturbed_detail, r.profile,
+            sha(&r.build_a), sha(&r.build_b), dirty(&r.build_a), dirty(&r.build_b), r.allow_dirty as i64,
+            r.device_id, r.sm_arch, r.dtype,
         ],
     )?;
     Ok(con.last_insert_rowid())
@@ -153,17 +186,47 @@ fn now() -> String {
     chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.6f+00:00").to_string()
 }
 
+/// One side's build: the binary's own identity (checked against an explicit
+/// `--sha-*`), and the legacy label (`sha_a` / `sha_b`: 12 hex digits, -dirty).
+fn side(bench: &Path, given: Option<&str>) -> Result<(Option<BuildId>, Option<String>)> {
+    match (crate::db::build_of(bench)?, given) {
+        (Some(b), Some(g)) if !b.sha.starts_with(&g.trim_end_matches("-dirty").to_ascii_lowercase()) => {
+            bail!("{}: built from {}, not {g}", bench.display(), b.label())
+        }
+        (Some(b), _) => {
+            let label = b.label();
+            Ok((Some(b), Some(label)))
+        }
+        (None, Some(g)) => Ok((None, Some(g.to_string()))),
+        (None, None) => Ok((None, build_sha(bench))),
+    }
+}
+
+/// One value if every row agrees; `what` names it in the error.
+fn agreed<T: PartialEq + Clone + std::fmt::Debug>(what: &str, v: &[Option<T>]) -> Result<Option<T>> {
+    match v.first() {
+        Some(x) if v.iter().all(|y| y == x) => Ok(x.clone()),
+        Some(_) => bail!("builds A and B report different {what} ({v:?}); not comparable"),
+        None => Ok(None),
+    }
+}
+
 pub fn cmd_paired_ab(a: &AbArgs) -> Result<()> {
+    // Build identity first: a dirty or unknown build is refused before any GPU work.
+    let (build_a, sha_a) = side(a.a, a.sha_a)?;
+    let (build_b, sha_b) = side(a.b, a.sha_b)?;
+    crate::db::check_build(&format!("paired-ab build A ({})", a.a.display()), build_a.as_ref(), a.allow_dirty)?;
+    crate::db::check_build(&format!("paired-ab build B ({})", a.b.display()), build_b.as_ref(), a.allow_dirty)?;
+    let marked = a.allow_dirty && [&build_a, &build_b].iter().any(|b| b.as_ref().is_none_or(|b| b.dirty));
     let _gpu = crate::gpujob::lock(&format!("aegis-perf paired-ab {} vs {}", a.impl_a, a.impl_b))?;
     // Blocking idle guard (Benchmark policy), with build B's bench_gemm.
     let idle = crate::sweep::idle_guard(a.b, a.allow_busy)?;
-    let sha_a = a.sha_a.map(str::to_string).or_else(|| build_sha(a.a));
-    let sha_b = a.sha_b.map(str::to_string).or_else(|| build_sha(a.b));
     let started_at = now();
     let watch = crate::watch::Watch::start(a.b)?;
     let (mut ta, mut tb, mut ratios) = (Vec::new(), Vec::new(), Vec::new());
     let mut protocols = Vec::new();
     let mut profiles: Vec<Option<String>> = Vec::new();
+    let (mut archs, mut dtypes) = (Vec::new(), Vec::new());
     for i in 0..a.pairs {
         // Alternate which side runs first so neither always follows the other.
         let (x, y) = if i % 2 == 0 {
@@ -173,17 +236,21 @@ pub fn cmd_paired_ab(a: &AbArgs) -> Result<()> {
             let y = run_once(a.b, a.impl_b, a.shape, a.reps, a.cache)?;
             (run_once(a.a, a.impl_a, a.shape, a.reps, a.cache)?, y)
         };
-        ta.push(x.0);
-        tb.push(y.0);
-        ratios.push(y.0 / x.0);
-        protocols.extend([x.1, y.1]);
-        profiles.extend([x.2, y.2]);
+        ta.push(x.median_us);
+        tb.push(y.median_us);
+        ratios.push(y.median_us / x.median_us);
+        protocols.extend([x.protocol, y.protocol]);
+        profiles.extend([x.profile, y.profile]);
+        archs.extend([x.sm_arch, y.sm_arch]);
+        dtypes.extend([x.dtype, y.dtype]);
     }
     let finished_at = now();
     let report = watch.finish()?;
     if protocols.iter().any(|&p| p != protocols[0]) {
         bail!("builds A and B ran different timing protocols ({protocols:?}); not comparable");
     }
+    let sm_arch = agreed("sm_arch", &archs)?;
+    let dtype = agreed("dtype", &dtypes)?;
     let (med, lo, hi) = bootstrap(&ratios, 10_000, 0x5eed);
     let (m, n, k) = a.shape;
     let result = NewPairedResult {
@@ -209,6 +276,12 @@ pub fn cmd_paired_ab(a: &AbArgs) -> Result<()> {
             s if s.len() == 1 => s.into_iter().next().cloned(),
             _ => Some("mixed".to_string()),
         },
+        build_a: build_a.clone(),
+        build_b: build_b.clone(),
+        allow_dirty: marked,
+        device_id: Some(crate::db::device_id(Path::new("results"))),
+        sm_arch,
+        dtype,
     };
     let id = store(&crate::db::connect(a.db)?, &result)?;
     println!(
@@ -225,10 +298,15 @@ pub fn cmd_paired_ab(a: &AbArgs) -> Result<()> {
         a.pairs,
         if lo <= 1.0 && hi >= 1.0 { " (tie)" } else { "" }
     );
+    let full = |b: &Option<BuildId>, label: &Option<String>| match b {
+        Some(b) => format!("{}{}", b.sha, if b.dirty { " (dirty)" } else { "" }),
+        None => format!("{} (build unknown)", label.as_deref().unwrap_or("?")),
+    };
     println!(
-        "  sha A {} / B {}; idle guard: {} ({}, limit {}%){}; stored as paired_results id {id}",
-        sha_a.as_deref().unwrap_or("unknown"),
-        sha_b.as_deref().unwrap_or("unknown"),
+        "  build A {} / B {}{}; idle guard: {} ({}, limit {}%){}; stored as paired_results id {id}",
+        full(&build_a, &sha_a),
+        full(&build_b, &sha_b),
+        if marked { "; --allow-dirty: marked, excluded by default, not evidence" } else { "" },
         idle.mean_pct.map_or("unreadable".to_string(), |u| format!("{u:.1}%")),
         idle.source,
         idle.limit_pct,
@@ -241,7 +319,6 @@ pub fn cmd_paired_ab(a: &AbArgs) -> Result<()> {
     }
     Ok(())
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -262,5 +339,29 @@ mod tests {
         // Inside this repo: a 12-hex-digit commit, maybe -dirty.
         let sha = build_sha(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml").as_path()).unwrap();
         assert!(sha.len() >= 12 && sha[..12].chars().all(|c| c.is_ascii_hexdigit()), "{sha}");
+    }
+
+    /// A binary that names its build cannot be relabelled; one that cannot is only labelled.
+    #[test]
+    fn side_checks_an_explicit_sha_against_the_binary() {
+        let dir = std::env::temp_dir().join(format!("aegis-ab-side-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        let fake = |name: &str, body: &str| {
+            let p = dir.join(name);
+            std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            p
+        };
+        let knows = fake("knows", &format!("echo '{{\"build_sha\":\"{sha}\",\"build_dirty\":false}}'"));
+        let (b, label) = side(&knows, None).unwrap();
+        assert_eq!((b.unwrap().sha, label.as_deref()), (sha.to_string(), Some("0123456789ab")));
+        assert!(side(&knows, Some("0123456")).is_ok());
+        assert!(side(&knows, Some("fedcba9")).unwrap_err().to_string().contains("not fedcba9"));
+        let old = fake("old", "echo 'unknown arg --build-info' >&2; exit 2");
+        let (b, label) = side(&old, Some("2c6aabb9dd18")).unwrap();
+        assert_eq!((b, label.as_deref()), (None, Some("2c6aabb9dd18")));
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -38,11 +38,27 @@ pub struct Run {
     /// watched and clean; None not watched.
     pub disturbed: Option<bool>,
     pub disturbed_detail: Option<String>,
+    /// The full commit of the build that produced the run's rows (schema v7;
+    /// None before v7: `git_sha` then holds 7 hex digits of the tree at ingest).
+    pub build_sha: Option<String>,
+    /// Some(true): the build's tree had uncommitted changes; None: unknown (before v7).
+    pub build_dirty: Option<bool>,
+    /// Written with --allow-dirty (a dirty or unknown build): excluded by default.
+    pub allow_dirty: bool,
+    /// What the run is (`runs.kind`); None if the run stored no rows to tell.
+    pub kind: Option<crate::db::RunKind>,
+}
+
+impl Run {
+    /// Excluded by default for its build ([`crate::db::DIRTY_RUNS`]).
+    pub fn dirty(&self) -> bool {
+        self.allow_dirty || self.build_dirty == Some(true)
+    }
 }
 
 const RUN_COLS: &str = "run_id, device_id, sm_arch, gpu_name, cuda_ver, driver_ver, git_sha, power_mode, \
                         clocks_locked, temp_start_c, measured_bw_gbps, started_at, idle_util_pct, idle_source, \
-                        allow_busy, disturbed, disturbed_detail";
+                        allow_busy, disturbed, disturbed_detail, build_sha, build_dirty, allow_dirty, kind";
 
 fn run_row(r: &Row) -> rusqlite::Result<Run> {
     Ok(Run {
@@ -63,6 +79,10 @@ fn run_row(r: &Row) -> rusqlite::Result<Run> {
         allow_busy: r.get::<_, i64>(14)? != 0,
         disturbed: r.get::<_, Option<i64>>(15)?.map(|d| d != 0),
         disturbed_detail: r.get(16)?,
+        build_sha: r.get(17)?,
+        build_dirty: r.get::<_, Option<i64>>(18)?.map(|d| d != 0),
+        allow_dirty: r.get::<_, i64>(19)? != 0,
+        kind: r.get::<_, Option<String>>(20)?.as_deref().and_then(crate::db::RunKind::parse),
     })
 }
 
@@ -146,10 +166,13 @@ pub struct Measurement {
     pub device_id: String,
     pub git_sha: Option<String>,
     pub started_at: String,
+    /// The run's build (schema v7; see [`Run::build_sha`]).
+    pub build_sha: Option<String>,
+    pub build_dirty: Option<bool>,
 }
 
 /// Which measurements to read. The default is what every view shows unless
-/// asked otherwise: protocol v2, cold cache, idle GPU, every arch.
+/// asked otherwise: protocol v2, cold cache, idle GPU, clean build, every arch.
 #[derive(Clone, Debug)]
 pub struct MeasurementFilter {
     pub sel: Selection,
@@ -183,7 +206,7 @@ pub fn measurements(con: &Connection, f: &MeasurementFilter) -> Result<Vec<Measu
         "SELECT m.run_id, m.kernel_id, k.op, k.impl, m.dtype, m.m, m.n, m.k, m.median_us, m.p10_us, m.p90_us, \
                 m.reps, m.checked, m.pass, m.max_abs_err, m.rel_err, m.power_w, m.protocol_version, m.batch_n, \
                 m.timer_res_ns, m.cache_mode, m.buffer_sets, m.window_ms, m.allow_busy, m.idle_util_pct, \
-                r.sm_arch, r.device_id, r.git_sha, r.started_at \
+                r.sm_arch, r.device_id, r.git_sha, r.started_at, r.build_sha, r.build_dirty \
          FROM measurements m JOIN runs r USING(run_id) JOIN kernels k USING(kernel_id) WHERE 1 = 1",
     );
     q += &f.sel.sql();
@@ -249,6 +272,8 @@ pub fn measurements(con: &Connection, f: &MeasurementFilter) -> Result<Vec<Measu
                 device_id: r.get(26)?,
                 git_sha: r.get(27)?,
                 started_at: r.get(28)?,
+                build_sha: r.get(29)?,
+                build_dirty: r.get::<_, Option<i64>>(30)?.map(|d| d != 0),
             })
         })?
         .collect::<rusqlite::Result<_>>()?;
@@ -269,13 +294,16 @@ pub struct Paired {
     pub tied: bool,
 }
 
-/// Paired tests of one shape in one run (protocol v2, cold, idle GPU).
+/// Paired tests of one shape in one run (protocol v2, cold, idle GPU, not a
+/// dirty-build run).
 pub fn paired(con: &Connection, run_id: &str, (m, n, k): (i64, i64, i64)) -> Result<Vec<Paired>> {
-    let mut stmt = con.prepare(
+    let mut stmt = con.prepare(&format!(
         "SELECT run_id, a_impl, b_impl, role, pairs, ratio_median, ratio_ci_lo, ratio_ci_hi, tied FROM paired \
          WHERE run_id = ? AND m = ? AND n = ? AND k = ? \
-           AND protocol_version = 2 AND cache_mode = 'cold' AND allow_busy = 0 AND coalesce(disturbed, 0) = 0",
-    )?;
+           AND protocol_version = 2 AND cache_mode = 'cold' AND allow_busy = 0 AND coalesce(disturbed, 0) = 0 \
+           AND run_id NOT IN ({})",
+        crate::db::DIRTY_RUNS
+    ))?;
     let rows = stmt
         .query_map(params![run_id, m, n, k], |r| {
             Ok(Paired {
@@ -482,11 +510,40 @@ pub struct PairedResult {
     /// The idle guard during the run (see [`Run::disturbed`]).
     pub disturbed: Option<bool>,
     pub disturbed_detail: Option<String>,
+    /// The device profile both builds ran under (schema v5; None before).
+    pub profile: Option<String>,
+    /// Each build's full commit (schema v7; None before v7 or when the binary
+    /// could not name its build: then only `sha_a` / `sha_b` label it).
+    pub build_sha_a: Option<String>,
+    pub build_sha_b: Option<String>,
+    /// Some(true): that build's tree was dirty; None unknown. Before v7, from
+    /// the "-dirty" suffix of sha_a / sha_b.
+    pub build_dirty_a: Option<bool>,
+    pub build_dirty_b: Option<bool>,
+    /// Stored with --allow-dirty: excluded by default.
+    pub allow_dirty: bool,
+    /// Where it ran (schema v7; None before).
+    pub device_id: Option<String>,
+    pub sm_arch: Option<i64>,
+    pub dtype: Option<String>,
 }
 
 impl PairedResult {
     pub fn tied(&self) -> bool {
         self.ci_lo <= 1.0 && self.ci_hi >= 1.0
+    }
+    /// Reproducible from a commit: both builds known (full SHA) and clean, not --allow-dirty.
+    pub fn clean(&self) -> bool {
+        !self.allow_dirty
+            && self.build_sha_a.is_some()
+            && self.build_sha_b.is_some()
+            && self.build_dirty_a == Some(false)
+            && self.build_dirty_b == Some(false)
+    }
+    /// Excluded by default: either build dirty, or written with --allow-dirty.
+    /// (A pre-v7 result with clean 12-digit SHAs is not dirty, but not clean() either.)
+    pub fn dirty(&self) -> bool {
+        self.allow_dirty || self.build_dirty_a == Some(true) || self.build_dirty_b == Some(true)
     }
     /// Above the idle guard's limit (or unreadable): not evidence for a performance claim.
     pub fn busy(&self) -> bool {
@@ -500,22 +557,33 @@ pub struct PairedResultFilter {
     /// impl_a or impl_b.
     pub impl_: Option<String>,
     pub shape: Option<(i64, i64, i64)>,
-    /// sha_a or sha_b starts with this.
+    /// sha_a or sha_b (or build_sha_a / build_sha_b) starts with this.
     pub sha: Option<String>,
+    /// Exact device_id / sm_arch / dtype (results from before v7 have none and never match).
+    pub device_id: Option<String>,
+    pub sm_arch: Option<i64>,
+    pub dtype: Option<String>,
+    /// Also return dirty results ([`PairedResult::dirty`]); excluded by default.
+    pub include_dirty: bool,
 }
 
-/// Stored paired-ab results, oldest first.
+/// Stored paired-ab results, oldest first. Dirty ones only with `include_dirty`.
 pub fn paired_results(con: &Connection, f: &PairedResultFilter) -> Result<Vec<PairedResult>> {
     let shape = f.shape.map(|(m, n, k)| format!("{m}x{n}x{k}"));
     let sha = f.sha.as_ref().map(|s| format!("{}%", s.replace('%', "")));
     let mut stmt = con.prepare(
         "SELECT id, sha_a, sha_b, shape, impl_a, impl_b, ratio, ci_lo, ci_hi, n, protocol_version, cache_mode, \
-                idle_reading, clocks_locked, started_at, finished_at, disturbed, disturbed_detail FROM paired_results \
+                idle_reading, clocks_locked, started_at, finished_at, disturbed, disturbed_detail, profile, \
+                build_sha_a, build_sha_b, build_dirty_a, build_dirty_b, allow_dirty, device_id, sm_arch, dtype \
+         FROM paired_results \
          WHERE (?1 IS NULL OR impl_a = ?1 OR impl_b = ?1) AND (?2 IS NULL OR shape = ?2) \
-           AND (?3 IS NULL OR sha_a LIKE ?3 OR sha_b LIKE ?3) ORDER BY started_at, id",
+           AND (?3 IS NULL OR sha_a LIKE ?3 OR sha_b LIKE ?3 OR build_sha_a LIKE ?3 OR build_sha_b LIKE ?3) \
+           AND (?4 IS NULL OR device_id = ?4) AND (?5 IS NULL OR sm_arch = ?5) AND (?6 IS NULL OR dtype = ?6) \
+           AND (?7 OR (allow_dirty = 0 AND coalesce(build_dirty_a, 0) = 0 AND coalesce(build_dirty_b, 0) = 0)) \
+         ORDER BY started_at, id",
     )?;
     let rows = stmt
-        .query_map(params![f.impl_, shape, sha], |r| {
+        .query_map(params![f.impl_, shape, sha, f.device_id, f.sm_arch, f.dtype, f.include_dirty], |r| {
             let shape: String = r.get(3)?;
             let dims: Vec<i64> = shape.split('x').filter_map(|d| d.parse().ok()).collect();
             let dim = |i: usize| dims.get(i).copied().unwrap_or(0);
@@ -540,6 +608,15 @@ pub fn paired_results(con: &Connection, f: &PairedResultFilter) -> Result<Vec<Pa
                 finished_at: r.get(15)?,
                 disturbed: r.get::<_, Option<i64>>(16)?.map(|d| d != 0),
                 disturbed_detail: r.get(17)?,
+                profile: r.get(18)?,
+                build_sha_a: r.get(19)?,
+                build_sha_b: r.get(20)?,
+                build_dirty_a: r.get::<_, Option<i64>>(21)?.map(|d| d != 0),
+                build_dirty_b: r.get::<_, Option<i64>>(22)?.map(|d| d != 0),
+                allow_dirty: r.get::<_, i64>(23)? != 0,
+                device_id: r.get(24)?,
+                sm_arch: r.get(25)?,
+                dtype: r.get(26)?,
             })
         })?
         .collect::<rusqlite::Result<_>>()?;
@@ -610,7 +687,7 @@ mod tests {
         let rows = measurements(&con, &MeasurementFilter::default()).unwrap();
         let got: Vec<(String, f64)> = rows.iter().map(|r| (r.run_id.clone(), r.median_us)).collect();
         assert_eq!(got, vec![("r1".to_string(), 10.0), ("r2".to_string(), 8.0)]);
-        let v1 = MeasurementFilter { sel: Selection { protocol: 1, cache: "cold".into(), include_busy: false }, ..Default::default() };
+        let v1 = MeasurementFilter { sel: Selection { protocol: 1, cache: "cold".into(), include_busy: false, include_dirty: false }, ..Default::default() };
         assert_eq!(measurements(&con, &v1).unwrap().len(), 1);
         let sha = MeasurementFilter { git_sha: Some("bbb".into()), ..Default::default() };
         assert_eq!(measurements(&con, &sha).unwrap()[0].impl_, "cublaslt_best");
@@ -654,12 +731,15 @@ mod tests {
     fn paired_results_round_trip_and_filters() {
         let p = std::env::temp_dir().join(format!("aegis-view-pr-{}.db", std::process::id()));
         let _ = std::fs::remove_file(&p);
+        const A: &str = "2c6aabb9dd18e5a3b1f00c1b2d3e4f5a6b7c8d9e";
+        const B: &str = "def4560000000000000000000000000000000000";
         {
             let con = db::connect(&p).unwrap();
-            let r = |sha_b: &str, impl_: &str, shape: (i64, i64, i64), idle: Option<f64>, lo: f64, hi: f64| {
+            let r = |dirty_b: bool, impl_: &str, shape: (i64, i64, i64), idle: Option<f64>, lo: f64, hi: f64| {
+                let build_b = db::BuildId::new(B, dirty_b).unwrap();
                 crate::ab::NewPairedResult {
-                    sha_a: Some("2c6aabb9dd18".into()),
-                    sha_b: Some(sha_b.into()),
+                    sha_a: Some(A[..12].into()),
+                    sha_b: Some(build_b.label()),
                     shape,
                     impl_a: impl_.into(),
                     impl_b: impl_.into(),
@@ -675,24 +755,39 @@ mod tests {
                     finished_at: "2026-10-15T00:05:00+00:00".into(),
                     disturbed: None,
                     disturbed_detail: None,
-                    profile: None,
+                    profile: Some("measured".into()),
+                    build_a: Some(db::BuildId::new(A, false).unwrap()),
+                    build_b: Some(build_b),
+                    allow_dirty: dirty_b,
+                    device_id: Some("spark".into()),
+                    sm_arch: Some(121),
+                    dtype: Some("f16f32f16".into()),
                 }
             };
-            crate::ab::store(&con, &r("abc123-dirty", "mma_a", (4096, 4096, 4096), Some(2.9), 0.983, 1.016)).unwrap();
-            crate::ab::store(&con, &r("def456", "mma_b", (2048, 2048, 2048), Some(0.4), 1.002, 1.014)).unwrap();
+            crate::ab::store(&con, &r(true, "mma_a", (4096, 4096, 4096), Some(2.9), 0.983, 1.016)).unwrap();
+            crate::ab::store(&con, &r(false, "mma_b", (2048, 2048, 2048), Some(0.4), 1.002, 1.014)).unwrap();
         }
         let con = db::connect_ro(&p).unwrap();
-        let all = paired_results(&con, &PairedResultFilter::default()).unwrap();
+        // Default: the dirty-build result is left out.
+        let clean = paired_results(&con, &PairedResultFilter::default()).unwrap();
+        assert_eq!(clean.len(), 1);
+        let c = &clean[0];
+        assert!(c.clean() && !c.dirty() && !c.tied() && !c.busy());
+        assert_eq!((c.build_sha_a.as_deref(), c.build_sha_b.as_deref(), c.sha_b.as_deref()), (Some(A), Some(B), Some("def456000000")));
+        assert_eq!((c.device_id.as_deref(), c.sm_arch, c.dtype.as_deref(), c.profile.as_deref()), (Some("spark"), Some(121), Some("f16f32f16"), Some("measured")));
+        let all = paired_results(&con, &PairedResultFilter { include_dirty: true, ..Default::default() }).unwrap();
         assert_eq!(all.len(), 2);
         assert_eq!((all[0].m, all[0].n, all[0].k, all[0].pairs), (4096, 4096, 4096, 30));
+        assert!(all[0].dirty() && !all[0].clean() && all[0].allow_dirty && all[0].build_dirty_b == Some(true));
         assert!(all[0].tied() && all[0].busy(), "2.9% > 2%: busy");
-        assert!(!all[1].tied() && !all[1].busy());
-        let by_impl = PairedResultFilter { impl_: Some("mma_b".into()), ..Default::default() };
-        assert_eq!(paired_results(&con, &by_impl).unwrap().len(), 1);
-        let by_shape = PairedResultFilter { shape: Some((4096, 4096, 4096)), ..Default::default() };
-        assert_eq!(paired_results(&con, &by_shape).unwrap()[0].sha_b.as_deref(), Some("abc123-dirty"));
-        let by_sha = PairedResultFilter { sha: Some("2c6aabb".into()), ..Default::default() };
-        assert_eq!(paired_results(&con, &by_sha).unwrap().len(), 2);
+        assert_eq!(all[0].sha_b.as_deref(), Some("def456000000-dirty"));
+        let f = |g: PairedResultFilter| paired_results(&con, &PairedResultFilter { include_dirty: true, ..g }).unwrap().len();
+        assert_eq!(f(PairedResultFilter { impl_: Some("mma_b".into()), ..Default::default() }), 1);
+        assert_eq!(f(PairedResultFilter { shape: Some((4096, 4096, 4096)), ..Default::default() }), 1);
+        assert_eq!(f(PairedResultFilter { sha: Some("2c6aabb".into()), ..Default::default() }), 2);
+        assert_eq!(f(PairedResultFilter { sha: Some("def4560000000000".into()), ..Default::default() }), 2, "full SHA prefix");
+        assert_eq!(f(PairedResultFilter { sm_arch: Some(87), ..Default::default() }), 0);
+        assert_eq!(f(PairedResultFilter { device_id: Some("spark".into()), dtype: Some("f16f32f16".into()), ..Default::default() }), 2);
         std::fs::remove_file(&p).unwrap();
     }
 }

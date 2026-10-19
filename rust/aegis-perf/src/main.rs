@@ -42,6 +42,12 @@ enum Cmd {
         run_id: Option<String>,
         #[arg(long)]
         temp_start: Option<f64>,
+        /// What the run is: tune, sweep, nightly, microbench or ingest.
+        #[arg(long, default_value = "ingest")]
+        kind: String,
+        /// Store rows from a dirty or unknown build (marked allow_dirty, excluded by default).
+        #[arg(long)]
+        allow_dirty: bool,
     },
     /// Add microbench probe results (microbench/run_all.sh output).
     IngestMicrobench {
@@ -62,6 +68,12 @@ enum Cmd {
         /// disturbed is stored on the run and every row.
         #[arg(long)]
         watch: Option<PathBuf>,
+        /// The build the probes came from: its bench_gemm --build-info.
+        #[arg(long, default_value = "build")]
+        build_dir: PathBuf,
+        /// Store rows from a dirty or unknown build (marked allow_dirty, excluded by default).
+        #[arg(long)]
+        allow_dirty: bool,
     },
     /// Mark a microbench run's rows invalidated (known bad; hidden everywhere).
     Invalidate {
@@ -95,6 +107,9 @@ enum Cmd {
         /// Also show rows measured on a busy GPU (--allow-busy) or disturbed mid-run.
         #[arg(long)]
         include_busy: bool,
+        /// Also show rows from dirty builds (--allow-dirty runs).
+        #[arg(long)]
+        include_dirty: bool,
         /// Baseline for the % cells: cublas or cublaslt_best (default: cublaslt_best
         /// for protocol 2, cublas for protocol 1).
         #[arg(long)]
@@ -117,6 +132,9 @@ enum Cmd {
         /// (e.g. the previous winner), when it is not already the runner-up.
         #[arg(long)]
         pair_with: Option<String>,
+        /// Tune a dirty or unknown build anyway (rows marked allow_dirty, excluded by default).
+        #[arg(long)]
+        allow_dirty: bool,
         #[arg(long, default_value = "build")]
         build_dir: PathBuf,
         #[arg(long, default_value = "results")]
@@ -136,6 +154,9 @@ enum Cmd {
         /// Pass --allow-busy to every step (rows are marked; not evidence).
         #[arg(long)]
         allow_busy: bool,
+        /// Run a dirty or unknown build anyway (rows marked allow_dirty, excluded by default).
+        #[arg(long)]
+        allow_dirty: bool,
         #[arg(long, default_value = "build")]
         build_dir: PathBuf,
         #[arg(long, default_value = "results")]
@@ -193,12 +214,16 @@ enum Cmd {
         /// Run even if the idle guard finds the GPU busy (> 2% utilization); the result is marked.
         #[arg(long)]
         allow_busy: bool,
-        /// Commit of build A (default: HEAD of the git tree containing it, -dirty if modified).
+        /// Commit of build A: checked against the binary's own (bench_gemm --build-info);
+        /// only a label for a binary that cannot name its build.
         #[arg(long)]
         sha_a: Option<String>,
-        /// Commit of build B (same default).
+        /// Commit of build B (same rules).
         #[arg(long)]
         sha_b: Option<String>,
+        /// Store a result from a dirty or unknown build (marked allow_dirty, excluded by default).
+        #[arg(long)]
+        allow_dirty: bool,
     },
     /// Measured machine parameters (L2/DRAM latency, DRAM bandwidth, mma peak)
     /// -> include/aegis/arch/sm_<arch>.json, for the cost model.
@@ -239,6 +264,12 @@ enum Cmd {
         /// Ingest only; do not recompute the winners table (nightly regression sweep).
         #[arg(long)]
         no_winners: bool,
+        /// This is the nightly regression sweep (runs.kind = nightly; tools/nightly.sh).
+        #[arg(long)]
+        nightly: bool,
+        /// Sweep a dirty or unknown build anyway (rows marked allow_dirty, excluded by default).
+        #[arg(long)]
+        allow_dirty: bool,
         /// Run even if the idle guard finds the GPU busy (> 2% utilization); rows are marked.
         #[arg(long)]
         allow_busy: bool,
@@ -262,16 +293,20 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Init => db::cmd_init(&cli.db),
-        Cmd::Ingest { results, manifest, run_id, temp_start } => {
-            db::cmd_ingest(&cli.db, &results, manifest.as_deref(), run_id, temp_start).map(|_| ())
+        Cmd::Ingest { results, manifest, run_id, temp_start, kind, allow_dirty } => {
+            let kind = db::RunKind::parse(&kind).ok_or_else(|| anyhow::anyhow!("unknown --kind {kind}"))?;
+            let opts = db::IngestOpts { kind, allow_dirty };
+            db::cmd_ingest(&cli.db, &results, manifest.as_deref(), run_id, temp_start, opts).map(|_| ())
         }
-        Cmd::IngestMicrobench { results, manifest, run_id, idle_util_pct, idle_source, allow_busy, watch } => {
+        Cmd::IngestMicrobench { results, manifest, run_id, idle_util_pct, idle_source, allow_busy, watch, build_dir, allow_dirty } => {
             let idle = db::RunIdle { pct: idle_util_pct, source: idle_source, allow_busy };
             let report = match &watch {
                 Some(p) => Some(watch::parse(&std::fs::read_to_string(p)?)?),
                 None => None,
             };
-            let run_id = db::cmd_ingest_microbench(&cli.db, &results, manifest.as_deref(), run_id, &idle)?;
+            let build = db::build_of(&build_dir.join("bench_gemm"))?;
+            let run_id =
+                db::cmd_ingest_microbench(&cli.db, &results, manifest.as_deref(), run_id, &idle, build.as_ref(), allow_dirty)?;
             if let Some(r) = report {
                 db::mark_disturbed(&db::connect(&cli.db)?, &run_id, &r)?;
             }
@@ -286,10 +321,10 @@ fn main() -> Result<()> {
             }
             db::cmd_winners(&cli.db, arch, reg.as_ref())
         }
-        Cmd::Report { arch, protocol, cache, include_busy, baseline } => {
-            db::cmd_report(&cli.db, arch, &db::Selection { protocol, cache, include_busy }, baseline.as_deref())
+        Cmd::Report { arch, protocol, cache, include_busy, include_dirty, baseline } => {
+            db::cmd_report(&cli.db, arch, &db::Selection { protocol, cache, include_busy, include_dirty }, baseline.as_deref())
         }
-        Cmd::Tune { shapes, seed, prefix, allow_busy, pair_with, build_dir, results_dir } => tune::cmd_tune(&tune::TuneArgs {
+        Cmd::Tune { shapes, seed, prefix, allow_busy, pair_with, allow_dirty, build_dir, results_dir } => tune::cmd_tune(&tune::TuneArgs {
             db: &cli.db,
             build: &build_dir,
             results: &results_dir,
@@ -298,6 +333,7 @@ fn main() -> Result<()> {
             prefix,
             allow_busy,
             pair_with,
+            allow_dirty,
         }),
         Cmd::Hw { device, root, no_cuda, no_nvml, no_video, build_dir } => {
             let exe = build_dir.join("aegis_hw");
@@ -323,7 +359,7 @@ fn main() -> Result<()> {
             print!("{}", String::from_utf8_lossy(&out.stdout));
             Ok(())
         }
-        Cmd::Calibrate { dry_run, out_dir, shapes, allow_busy, build_dir, results_dir } => {
+        Cmd::Calibrate { dry_run, out_dir, shapes, allow_busy, allow_dirty, build_dir, results_dir } => {
             calibrate::cmd_calibrate(&calibrate::CalibrateArgs {
                 db: &cli.db,
                 build: &build_dir,
@@ -332,12 +368,13 @@ fn main() -> Result<()> {
                 out_dir: &out_dir,
                 dry_run,
                 allow_busy,
+                allow_dirty,
             })
         }
         Cmd::EmitHeader { arch, out, results_dir } => {
             tune::cmd_emit_header(&cli.db, arch, &results_dir, out.as_deref())
         }
-        Cmd::PairedAb { a, b, impl_, impl_b, shape, pairs, reps, cache, allow_busy, sha_a, sha_b } => {
+        Cmd::PairedAb { a, b, impl_, impl_b, shape, pairs, reps, cache, allow_busy, sha_a, sha_b, allow_dirty } => {
             ab::cmd_paired_ab(&ab::AbArgs {
             db: &cli.db,
             a: &a,
@@ -351,6 +388,7 @@ fn main() -> Result<()> {
             allow_busy,
             sha_a: sha_a.as_deref(),
             sha_b: sha_b.as_deref(),
+            allow_dirty,
             })
         }
         Cmd::EmitArch { arch, ptr_chase, out, results_dir } => {
@@ -360,7 +398,7 @@ fn main() -> Result<()> {
             let out = out.unwrap_or_else(|| PathBuf::from(format!("results/roofline-sm{arch}.svg")));
             roofline::cmd_roofline(&cli.db, arch, &out, arch_file.as_deref())
         }
-        Cmd::Sweep { impls, quick, shapes, no_winners, allow_busy, build_dir, results_dir } => sweep::cmd_sweep(&sweep::SweepArgs {
+        Cmd::Sweep { impls, quick, shapes, no_winners, nightly, allow_dirty, allow_busy, build_dir, results_dir } => sweep::cmd_sweep(&sweep::SweepArgs {
             db: &cli.db,
             build: &build_dir,
             results: &results_dir,
@@ -369,6 +407,8 @@ fn main() -> Result<()> {
             shapes: shapes.as_deref(),
             allow_busy,
             no_winners,
+            kind: if nightly { db::RunKind::Nightly } else { db::RunKind::Sweep },
+            allow_dirty,
         })
         .map(|_| ()),
         Cmd::Regress { run, header } => regress::cmd_regress(&cli.db, &run, &header),

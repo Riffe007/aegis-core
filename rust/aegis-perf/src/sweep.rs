@@ -155,6 +155,10 @@ pub struct SweepArgs<'a> {
     pub allow_busy: bool,
     /// Do not recompute the winners table (nightly regression sweeps).
     pub no_winners: bool,
+    /// Sweep or Nightly (runs.kind).
+    pub kind: db::RunKind,
+    /// Sweep a dirty or unknown build anyway (rows marked allow_dirty, excluded by default).
+    pub allow_dirty: bool,
 }
 
 /// Read a shape file: one "M N K" per line, blank lines and # comments skipped.
@@ -179,6 +183,7 @@ pub fn cmd_sweep(a: &SweepArgs) -> Result<String> {
     if !bench.exists() {
         bail!("{} not found; run cmake --build build first", bench.display());
     }
+    db::check_build("sweep", db::build_of(&bench)?.as_ref(), a.allow_dirty)?;
     std::fs::create_dir_all(results)?;
     let _gpu = crate::gpujob::lock("aegis-perf sweep")?;
     let host = db::hostname();
@@ -228,7 +233,7 @@ pub fn cmd_sweep(a: &SweepArgs) -> Result<String> {
     drop(f);
     let report = watch.finish()?;
 
-    let run_id = db::cmd_ingest(db, &out, Some(&manifest), None, None)?;
+    let run_id = db::cmd_ingest(db, &out, Some(&manifest), None, None, db::IngestOpts { kind: a.kind, allow_dirty: a.allow_dirty })?;
     db::mark_disturbed(&db::connect(db)?, &run_id, &report)?;
     if !a.no_winners {
         db::cmd_winners(db, None, Some(&db::registry_of(&a.build.join("bench_gemm"))?))?;

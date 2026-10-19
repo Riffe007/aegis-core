@@ -6,7 +6,7 @@
 //! run-to-run noise (2026-10-16/17: 16x4864x896 99.4 -> 96.1 -> 99.3%). It is a
 //! regression (Production bar: the regression gate's 3%) only when confirmed:
 //! - two consecutive nightlies: this run and the previous one, itself a sweep
-//!   (a run without paired tests, like the nightly's), are both more than 3%
+//!   (runs.kind sweep or nightly), are both more than 3%
 //!   below the run before the previous one, or
 //! - a paired-ab (`paired_results`, same impl on both sides, clean) started
 //!   after the previous run, with the B build at least 3% slower by median and
@@ -56,14 +56,15 @@ pub fn header_dispatch(text: &str) -> Vec<((i64, i64, i64), String)> {
 
 pub use crate::db::DISPATCH_IMPL;
 
-/// Clean v2 cold median of `impl_` at a shape in one run (passing rows only).
+/// Clean v2 cold median of `impl_` at a shape in one run (passing rows only;
+/// none from a dirty-build run).
 fn median_in(con: &Connection, run: &str, impl_: &str, (m, n, k): (i64, i64, i64)) -> Result<Option<f64>> {
     Ok(con
         .query_row(
-            "SELECT min(x.median_us) FROM measurements x JOIN kernels kc USING(kernel_id) \
+            &format!("SELECT min(x.median_us) FROM measurements x JOIN kernels kc USING(kernel_id) \
              WHERE x.run_id = ?1 AND kc.impl = ?2 AND x.m = ?3 AND x.n = ?4 AND x.k = ?5 AND x.pass = 1 \
                AND x.protocol_version = 2 AND x.cache_mode = 'cold' AND x.allow_busy = 0 \
-               AND coalesce(x.disturbed, 0) = 0",
+               AND coalesce(x.disturbed, 0) = 0 AND x.run_id NOT IN ({})", crate::db::DIRTY_RUNS),
             params![run, impl_, m, n, k],
             |r| r.get::<_, Option<f64>>(0),
         )
@@ -131,13 +132,15 @@ impl ShapeCheck {
     }
 }
 
-/// The newest clean paired-ab of `impl_` against itself (two builds) at `shape`,
+/// The newest clean paired-ab of `impl_` against itself (two builds, neither dirty
+/// nor --allow-dirty) at `shape`,
 /// started after run `prev`, that shows B at least 3% slower with a CI entirely above 1.0.
 fn paired_slowdown(con: &Connection, prev: &str, impl_: &str, (m, n, k): (i64, i64, i64)) -> Result<Option<(i64, f64, f64, f64)>> {
     Ok(con
         .query_row(
             "SELECT p.id, p.ratio, p.ci_lo, p.ci_hi FROM paired_results p \
              WHERE p.shape = ?1 AND p.impl_a = ?2 AND p.impl_b = ?2 AND coalesce(p.disturbed, 0) = 0 \
+               AND p.allow_dirty = 0 AND coalesce(p.build_dirty_a, 0) = 0 AND coalesce(p.build_dirty_b, 0) = 0 \
                AND p.started_at > (SELECT started_at FROM runs WHERE run_id = ?3) \
              ORDER BY p.started_at DESC LIMIT 1",
             params![format!("{m}x{n}x{k}"), impl_, prev],
@@ -145,6 +148,17 @@ fn paired_slowdown(con: &Connection, prev: &str, impl_: &str, (m, n, k): (i64, i
         )
         .optional()?
         .filter(|&(_, ratio, lo, _)| ratio >= 1.0 + REGRESSION && lo > 1.0))
+}
+
+/// A sweep or nightly run (runs.kind, schema v7); a run without a kind (it
+/// stored no rows) counts as one when it has no paired tie tests, as before v7.
+pub fn is_sweep(con: &Connection, run: &str) -> Result<bool> {
+    let kind: Option<String> =
+        con.query_row("SELECT kind FROM runs WHERE run_id = ?", [run], |r| r.get(0)).optional()?.flatten();
+    Ok(match kind.as_deref().and_then(crate::db::RunKind::parse) {
+        Some(k) => k.is_sweep(),
+        None => !con.prepare("SELECT 1 FROM paired WHERE run_id = ?")?.exists([run])?,
+    })
 }
 
 pub fn check(con: &Connection, run: &str, winners: &[(i64, i64, i64, String)]) -> Result<Vec<ShapeCheck>> {
@@ -180,7 +194,7 @@ pub fn check(con: &Connection, run: &str, winners: &[(i64, i64, i64, String)]) -
             None => None,
         };
         let before_is_sweep = match &before {
-            Some((prev, _)) => !con.prepare("SELECT 1 FROM paired WHERE run_id = ?")?.exists([prev])?,
+            Some((prev, _)) => is_sweep(con, prev)?,
             None => false,
         };
         let dispatch_pct = pct_in(con, run, DISPATCH_IMPL, shape)?;
@@ -338,5 +352,56 @@ mod tests {
         assert!(p.regressed() && !p.watch());
         // No pct: nothing.
         assert!(!ShapeCheck { pct: None, before: run(99.0), ..Default::default() }.regressed());
+    }
+
+    /// A paired-ab confirms a slowdown only from clean builds: the same result
+    /// from a dirty build (or stored with --allow-dirty) confirms nothing.
+    #[test]
+    fn dirty_paired_ab_confirms_nothing() {
+        let p = std::env::temp_dir().join(format!("aegis-regress-dirty-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        let con = crate::db::connect(&p).unwrap();
+        con.execute_batch("INSERT INTO runs (run_id, device_id, sm_arch, started_at, kind) VALUES ('prev', 'd', 121, '2026-01-01', 'nightly');")
+            .unwrap();
+        let store = |dirty: bool| {
+            let sha = "0123456789abcdef0123456789abcdef01234567";
+            crate::ab::store(
+                &con,
+                &crate::ab::NewPairedResult {
+                    sha_a: None,
+                    sha_b: None,
+                    shape: (16, 4864, 896),
+                    impl_a: "x".into(),
+                    impl_b: "x".into(),
+                    ratio: 1.05,
+                    ci_lo: 1.03,
+                    ci_hi: 1.07,
+                    n: 30,
+                    protocol_version: 2,
+                    cache_mode: "cold".into(),
+                    idle_reading: Some(0.1),
+                    clocks_locked: false,
+                    started_at: "2026-01-02".into(),
+                    finished_at: "2026-01-02".into(),
+                    disturbed: Some(false),
+                    disturbed_detail: None,
+                    profile: None,
+                    build_a: Some(crate::db::BuildId::new(sha, false).unwrap()),
+                    build_b: Some(crate::db::BuildId::new(sha, dirty).unwrap()),
+                    allow_dirty: dirty,
+                    device_id: None,
+                    sm_arch: Some(121),
+                    dtype: None,
+                },
+            )
+            .unwrap()
+        };
+        store(true);
+        assert_eq!(paired_slowdown(&con, "prev", "x", (16, 4864, 896)).unwrap(), None);
+        let id = store(false);
+        assert_eq!(paired_slowdown(&con, "prev", "x", (16, 4864, 896)).unwrap().map(|c| c.0), Some(id));
+        assert!(is_sweep(&con, "prev").unwrap(), "runs.kind nightly");
+        drop(con);
+        std::fs::remove_file(&p).ok();
     }
 }

@@ -100,8 +100,20 @@ file(GLOB AEGIS_WINNER_HEADERS CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/include/aeg
 set_source_files_properties(src/matmul.cu PROPERTIES OBJECT_DEPENDS "${AEGIS_WINNER_HEADERS}")
 target_link_libraries(aegis PUBLIC aegis_kernels CUDA::cudart CUDA::cublas CUDA::cublasLt Threads::Threads ${CMAKE_DL_LIBS})
 
+# The build's identity (commit, dirty tree), regenerated on every build and carried
+# by every result row (src/bench/build_info.h; perf DB runs.build_sha / build_dirty).
+set(AEGIS_BUILD_INFO ${CMAKE_BINARY_DIR}/generated/build_info.cpp)
+execute_process(COMMAND ${CMAKE_COMMAND} -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${AEGIS_BUILD_INFO}
+                        -P ${CMAKE_SOURCE_DIR}/cmake/build_info.cmake)
+add_custom_target(aegis_build_info ALL
+  COMMAND ${CMAKE_COMMAND} -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${AEGIS_BUILD_INFO}
+          -P ${CMAKE_SOURCE_DIR}/cmake/build_info.cmake
+  BYPRODUCTS ${AEGIS_BUILD_INFO}
+  COMMENT "build identity (commit, dirty tree)")
+
 # The timing protocol (src/bench/harness.h), shared by bench_gemm and aegis_tune.
-add_library(aegis_bench_harness STATIC src/bench/harness.cu src/bench/reference.cu)
+add_library(aegis_bench_harness STATIC src/bench/harness.cu src/bench/reference.cu ${AEGIS_BUILD_INFO})
+add_dependencies(aegis_bench_harness aegis_build_info)
 target_include_directories(aegis_bench_harness PUBLIC src)
 target_link_libraries(aegis_bench_harness PUBLIC aegis_kernels CUDA::cudart CUDA::cublas CUDA::cublasLt
                                            PRIVATE ${CMAKE_DL_LIBS})

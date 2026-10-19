@@ -37,6 +37,9 @@ pub struct CalibrateArgs<'a> {
     pub out_dir: &'a Path,
     pub dry_run: bool,
     pub allow_busy: bool,
+    /// Run a dirty or unknown build anyway: every step is told (--allow-dirty, ALLOW_DIRTY=1)
+    /// and its rows are marked allow_dirty, excluded by default.
+    pub allow_dirty: bool,
 }
 
 /// The device as discovery reports it.
@@ -203,6 +206,8 @@ pub fn cmd_calibrate(a: &CalibrateArgs) -> Result<()> {
     if a.dry_run {
         return Ok(());
     }
+    // A dirty or unknown build is refused before any GPU work (schema v7, build identity).
+    db::check_build("calibrate", db::build_of(&a.build.join("bench_gemm"))?.as_ref(), a.allow_dirty)?;
 
     // 1. The GPU lock for every step; children inherit it (AEGIS_GPU_LOCK_HELD), and
     // in-process steps (tune) see it through the same variable.
@@ -249,6 +254,9 @@ pub fn cmd_calibrate(a: &CalibrateArgs) -> Result<()> {
         if a.allow_busy {
             env_busy.env("ALLOW_BUSY", "1");
         }
+        if a.allow_dirty {
+            env_busy.env("ALLOW_DIRTY", "1");
+        }
         let t0 = Instant::now();
         run_step("microbench", &mut env_busy)?;
         let (run, disturbed, detail) = newest_run(a.db)?;
@@ -258,7 +266,12 @@ pub fn cmd_calibrate(a: &CalibrateArgs) -> Result<()> {
         record("microbench", t0, json!({"run_id": run, "disturbed": disturbed, "disturbed_detail": detail}))?;
         if let Some(f) = locked_mhz {
             let t0 = Instant::now();
-            run_step("latency_locked", Command::new("microbench/run_latency_locked.sh").arg(f.to_string()))?;
+            let mut locked = Command::new("microbench/run_latency_locked.sh");
+            locked.arg(f.to_string());
+            if a.allow_dirty {
+                locked.env("ALLOW_DIRTY", "1");
+            }
+            run_step("latency_locked", &mut locked)?;
             record("latency_locked", t0, json!({"mhz": f}))?;
         }
         Ok(())
@@ -279,6 +292,7 @@ pub fn cmd_calibrate(a: &CalibrateArgs) -> Result<()> {
         prefix: None,
         allow_busy: a.allow_busy,
         pair_with: None,
+        allow_dirty: a.allow_dirty,
     })?;
     let (run, disturbed, detail) = newest_run(a.db)?;
     if disturbed == Some(1) {

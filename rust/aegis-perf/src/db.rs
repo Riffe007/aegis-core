@@ -1,4 +1,4 @@
-//! Perf DB commands: schema, ingest, winners, report.
+//! Perf DB command: schema, ingest, winners, report.
 //!
 //! Originally a line-for-line port of the (deleted) Python perfdb tool; kernel
 //! ids, row selection and report text are unchanged so existing DBs stay valid.
@@ -30,9 +30,12 @@ pub const SCHEMA: &str = include_str!("schema.sql");
 /// 6: telemetry (opt-in, src/hw/telemetry.h) on measurements: max_temp_c,
 ///    throttle_reasons (NVML clock-event reasons that slow the clocks, "a|b"; "" none),
 ///    clock_event_reasons (every reason bit seen), sm_clock_min_mhz / sm_clock_max_mhz.
+/// 7: build identity: runs.build_sha (40 hex) / build_dirty / allow_dirty / kind;
+///    paired_results.build_sha_a/_b, build_dirty_a/_b, allow_dirty, device_id,
+///    sm_arch, dtype.
 /// Bump it with every migration in migrate(). connect() backs the DB up
 /// (VACUUM INTO <db>.bak-v<old>-<date>) before migrating an older one.
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 7;
 
 /// The DB's schema version: None when it has no schema_version table (a v1
 /// DB, or not yet created).
@@ -185,7 +188,137 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("measurements", "clock_event_reasons", "TEXT"),
     ("measurements", "sm_clock_min_mhz", "INTEGER"),
     ("measurements", "sm_clock_max_mhz", "INTEGER"),
+    // v7: build identity. build_sha: the full commit the build was made from (its
+    // rows' "build_sha", src/bench/build_info.h); build_dirty: 1 its tree had
+    // uncommitted tracked changes, 0 clean, NULL unknown (runs before v7).
+    // allow_dirty: written with --allow-dirty (a dirty or unknown build): marked
+    // and excluded by default (Selection, view, regress), like allow_busy.
+    ("runs", "build_sha", "TEXT"),
+    ("runs", "build_dirty", "INTEGER"),
+    ("runs", "allow_dirty", "INTEGER NOT NULL DEFAULT 0"),
+    // What the run is (RunKind): tune, sweep, nightly, microbench, ingest.
+    ("runs", "kind", "TEXT"),
+    ("paired_results", "build_sha_a", "TEXT"),
+    ("paired_results", "build_sha_b", "TEXT"),
+    ("paired_results", "build_dirty_a", "INTEGER"),
+    ("paired_results", "build_dirty_b", "INTEGER"),
+    ("paired_results", "allow_dirty", "INTEGER NOT NULL DEFAULT 0"),
+    ("paired_results", "device_id", "TEXT"),
+    ("paired_results", "sm_arch", "INTEGER"),
+    ("paired_results", "dtype", "TEXT"),
 ];
+
+/// Runs whose rows are excluded by default for their build: written with
+/// --allow-dirty, or from a build known to be dirty.
+pub const DIRTY_RUNS: &str = "SELECT run_id FROM runs WHERE allow_dirty = 1 OR coalesce(build_dirty, 0) = 1";
+
+/// What a run is (runs.kind, schema v7).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunKind {
+    /// aegis-perf tune (aegis_tune: every config, paired tie tests).
+    Tune,
+    /// aegis-perf sweep run by hand.
+    Sweep,
+    /// The nightly regression sweep (tools/nightly.sh: aegis-perf sweep --kind nightly).
+    Nightly,
+    /// microbench/run_all.sh, run_latency_locked.sh (ingest-microbench).
+    Microbench,
+    /// aegis-perf ingest of a results file.
+    Ingest,
+}
+
+impl RunKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RunKind::Tune => "tune",
+            RunKind::Sweep => "sweep",
+            RunKind::Nightly => "nightly",
+            RunKind::Microbench => "microbench",
+            RunKind::Ingest => "ingest",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<RunKind> {
+        [RunKind::Tune, RunKind::Sweep, RunKind::Nightly, RunKind::Microbench, RunKind::Ingest]
+            .into_iter()
+            .find(|k| k.as_str() == s)
+    }
+
+    /// A sweep-like run (a subset of configs, no paired tie tests): sweep or nightly.
+    pub fn is_sweep(self) -> bool {
+        matches!(self, RunKind::Sweep | RunKind::Nightly)
+    }
+}
+
+/// A build's identity: the commit it was made from and whether its tree had
+/// uncommitted tracked changes when it was built (src/bench/build_info.h).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BuildId {
+    /// 40 hex digits.
+    pub sha: String,
+    pub dirty: bool,
+}
+
+impl BuildId {
+    pub fn new(sha: &str, dirty: bool) -> Result<BuildId> {
+        if sha.len() != 40 || !sha.chars().all(|c| c.is_ascii_hexdigit()) {
+            bail!("build sha '{sha}' is not a full 40-hex-digit commit");
+        }
+        Ok(BuildId { sha: sha.to_ascii_lowercase(), dirty })
+    }
+
+    /// The pre-v7 short form: 12 hex digits, "-dirty" if dirty (paired_results.sha_a/sha_b).
+    pub fn label(&self) -> String {
+        format!("{}{}", &self.sha[..12], if self.dirty { "-dirty" } else { "" })
+    }
+
+    /// runs.git_sha (7 hex digits, no dirty marker; kept for pre-v7 readers).
+    pub fn short(&self) -> &str {
+        &self.sha[..7]
+    }
+}
+
+/// The build a result row names ("build_sha", "build_dirty"); None when the row
+/// carries none (a binary from before schema v7, or a build outside a checkout).
+pub fn build_of_row(r: &Value) -> Result<Option<BuildId>> {
+    match r.get("build_sha").and_then(Value::as_str) {
+        None => Ok(None),
+        Some(sha) => Ok(Some(BuildId::new(sha, r.get("build_dirty").and_then(Value::as_bool).unwrap_or(true))?)),
+    }
+}
+
+/// The build of a bench_gemm binary (`bench_gemm --build-info`); None for a
+/// binary that predates the flag or was built outside a checkout.
+pub fn build_of(bench: &Path) -> Result<Option<BuildId>> {
+    let out = Command::new(bench)
+        .arg("--build-info")
+        .stderr(Stdio::null())
+        .output()
+        .with_context(|| format!("run {} --build-info", bench.display()))?;
+    if !out.status.success() {
+        return Ok(None);
+    }
+    let v: Value = serde_json::from_slice(&out.stdout).with_context(|| format!("{} --build-info", bench.display()))?;
+    build_of_row(&v)
+}
+
+/// Refuse to write results from a dirty or unknown build unless `allow_dirty`:
+/// a result counts only if a commit rebuilds what was measured.
+pub fn check_build(what: &str, build: Option<&BuildId>, allow_dirty: bool) -> Result<()> {
+    let problem = match build {
+        Some(b) if !b.dirty => return Ok(()),
+        Some(b) => format!("build {} has uncommitted changes", b.label()),
+        None => "the build's commit is unknown (a binary from before schema v7, or built outside a checkout)".to_string(),
+    };
+    if !allow_dirty {
+        bail!(
+            "{what}: refusing to store results: {problem}. Commit, rebuild and rerun, or pass --allow-dirty \
+             (rows are marked allow_dirty and excluded by default)"
+        );
+    }
+    eprintln!("{what}: --allow-dirty: {problem}; every row is marked allow_dirty and excluded by default");
+    Ok(())
+}
 
 /// Reference implementations: always eligible (they are what --check compares
 /// against), never winners.
@@ -207,12 +340,15 @@ pub struct Selection {
     pub cache: String,
     /// Include rows measured on a busy GPU (--allow-busy) or disturbed mid-run.
     pub include_busy: bool,
+    /// Include rows of runs from a dirty build or written with --allow-dirty
+    /// (DIRTY_RUNS). Runs from before schema v7 (build unknown) are included.
+    pub include_dirty: bool,
 }
 
 impl Selection {
-    /// What winners are picked from: protocol v2, cold, idle GPU.
+    /// What winners are picked from: protocol v2, cold, idle GPU, clean build.
     pub fn ranking() -> Self {
-        Selection { protocol: 2, cache: "cold".to_string(), include_busy: false }
+        Selection { protocol: 2, cache: "cold".to_string(), include_busy: false, include_dirty: false }
     }
 
     pub(crate) fn sql(&self) -> String {
@@ -222,6 +358,9 @@ impl Selection {
         }
         if !self.include_busy {
             s += " AND m.allow_busy = 0 AND coalesce(m.disturbed, 0) = 0";
+        }
+        if !self.include_dirty {
+            s += &format!(" AND m.run_id NOT IN ({DIRTY_RUNS})");
         }
         s
     }
@@ -240,6 +379,27 @@ fn migrate(con: &Connection) -> Result<()> {
                     "UPDATE runs SET \
                        idle_util_pct = (SELECT max(m.idle_util_pct) FROM measurements m WHERE m.run_id = runs.run_id), \
                        allow_busy = coalesce((SELECT max(m.allow_busy) FROM measurements m WHERE m.run_id = runs.run_id), 0)",
+                )?;
+            }
+            if (*table, *column) == ("runs", "kind") {
+                // v7 backfill, from what each run stored (every row, disturbed or
+                // not): paired tie tests = a tune, microbench rows = microbench,
+                // else a sweep (a nightly and a hand-run sweep look alike before v7).
+                con.execute_batch(
+                    "UPDATE runs SET kind = CASE \
+                       WHEN EXISTS (SELECT 1 FROM paired p WHERE p.run_id = runs.run_id) THEN 'tune' \
+                       WHEN EXISTS (SELECT 1 FROM microbench b WHERE b.run_id = runs.run_id) THEN 'microbench' \
+                       WHEN EXISTS (SELECT 1 FROM measurements m WHERE m.run_id = runs.run_id) THEN 'sweep' END",
+                )?;
+            }
+            if (*table, *column) == ("paired_results", "build_dirty_b") {
+                // v7 backfill: before v7 a dirty build was the "-dirty" suffix on
+                // sha_a / sha_b (12 hex digits; NULL = unknown). The full SHA is not
+                // recoverable, so build_sha_a / _b stay NULL.
+                con.execute_batch(
+                    "UPDATE paired_results SET \
+                       build_dirty_a = CASE WHEN sha_a IS NULL THEN NULL WHEN sha_a LIKE '%-dirty' THEN 1 ELSE 0 END, \
+                       build_dirty_b = CASE WHEN sha_b IS NULL THEN NULL WHEN sha_b LIKE '%-dirty' THEN 1 ELSE 0 END",
                 )?;
             }
         }
@@ -273,10 +433,6 @@ pub fn kernel_id(op: &str, impl_: &str, config: &Value) -> String {
 fn command_stdout(cmd: &str, args: &[&str]) -> Option<String> {
     let out = Command::new(cmd).args(args).stderr(Stdio::null()).output().ok()?;
     out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
-}
-
-fn git_sha() -> Option<String> {
-    command_stdout("git", &["rev-parse", "--short", "HEAD"]).map(|s| s.trim().to_string())
 }
 
 /// Jetson: nvpmodel mode. Elsewhere: None.
@@ -319,6 +475,16 @@ pub fn hostname() -> String {
     gethostname::gethostname().to_string_lossy().into_owned()
 }
 
+/// runs.device_id's convention: the device_id of results/manifest-<host>.json, else the host name.
+pub fn device_id(results: &Path) -> String {
+    let host = hostname();
+    std::fs::read_to_string(results.join(format!("manifest-{host}.json")))
+        .ok()
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+        .and_then(|v| v.get("device_id").and_then(Value::as_str).map(str::to_string))
+        .unwrap_or(host)
+}
+
 /// JSON -> SQLite value with the types Python's sqlite3 would bind.
 fn sql(v: Option<&Value>) -> SqlValue {
     match v {
@@ -338,8 +504,38 @@ fn get<'a>(r: &'a Value, key: &str) -> Result<&'a Value> {
 }
 
 const INSERT_RUN: &str = "INSERT INTO runs (run_id, device_id, sm_arch, gpu_name, cuda_ver, driver_ver, git_sha, \
-     power_mode, clocks_locked, temp_start_c, measured_bw_gbps, started_at, idle_util_pct, idle_source, allow_busy) \
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)";
+     power_mode, clocks_locked, temp_start_c, measured_bw_gbps, started_at, idle_util_pct, idle_source, allow_busy, \
+     build_sha, build_dirty, allow_dirty, kind) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)";
+
+/// How a run is stored: what it is, and whether a dirty or unknown build may
+/// write it (--allow-dirty; its rows are then marked and excluded by default).
+#[derive(Clone, Copy, Debug)]
+pub struct IngestOpts {
+    pub kind: RunKind,
+    pub allow_dirty: bool,
+}
+
+impl IngestOpts {
+    pub fn new(kind: RunKind) -> Self {
+        IngestOpts { kind, allow_dirty: false }
+    }
+}
+
+/// The build every row of a results file names; an error if rows disagree.
+fn build_of_rows(rows: &[&Value]) -> Result<Option<BuildId>> {
+    let mut builds = Vec::new();
+    for r in rows {
+        let b = build_of_row(r)?;
+        if !builds.contains(&b) {
+            builds.push(b);
+        }
+    }
+    match builds.len() {
+        0 => Ok(None),
+        1 => Ok(builds.pop().flatten()),
+        _ => bail!("rows of one results file name different builds: {builds:?}"),
+    }
+}
 
 /// A run's idle-guard reading (Benchmark policy: stored on every run row).
 #[derive(Clone, Debug, Default)]
@@ -392,6 +588,7 @@ pub fn cmd_ingest(
     manifest: Option<&Path>,
     run_id: Option<String>,
     temp_start: Option<f64>,
+    opts: IngestOpts,
 ) -> Result<String> {
     let text = std::fs::read_to_string(results).with_context(|| format!("read {}", results.display()))?;
     let all: Vec<Value> = text
@@ -404,6 +601,10 @@ pub fn cmd_ingest(
     if rows.is_empty() {
         bail!("no rows in results file");
     }
+    // The build that measured the rows (every row names it, schema v7): refused
+    // when dirty or unknown unless --allow-dirty.
+    let build = build_of_rows(&rows.iter().chain(&paired).collect::<Vec<_>>())?;
+    check_build(&format!("ingest {}", results.display()), build.as_ref(), opts.allow_dirty)?;
     let manifest: Value = match manifest {
         Some(p) => serde_json::from_str(&std::fs::read_to_string(p)?)?,
         None => Value::Object(Default::default()),
@@ -434,7 +635,7 @@ pub fn cmd_ingest(
             sql(first.get("device")),
             sql(first.get("cuda_runtime")),
             sql(first.get("cuda_driver")),
-            git_sha(),
+            build.as_ref().map(BuildId::short),
             power_mode(),
             SqlValue::Null,
             temp_start.or_else(gpu_temp_c),
@@ -443,6 +644,10 @@ pub fn cmd_ingest(
             idle.pct,
             idle.source,
             idle.allow_busy as i64,
+            build.as_ref().map(|b| b.sha.as_str()),
+            build.as_ref().map(|b| b.dirty as i64),
+            (opts.allow_dirty && build.as_ref().is_none_or(|b| b.dirty)) as i64,
+            opts.kind.as_str(),
         ],
     )?;
     for r in &rows {
@@ -523,13 +728,18 @@ type ShapeKey = (i64, String, String, i64, i64, i64); // arch, op, dtype, m, n, 
 
 /// Microbench probe lines (microbench/*): one run row with the device metadata
 /// of the first line, then (run_id, probe, param_json, value, unit) per line.
+/// `build`: the build the probes came from (probe lines carry none; the CLI
+/// takes it from the same build's `bench_gemm --build-info`).
 pub fn cmd_ingest_microbench(
     db: &Path,
     results: &Path,
     manifest: Option<&Path>,
     run_id: Option<String>,
     idle: &RunIdle,
+    build: Option<&BuildId>,
+    allow_dirty: bool,
 ) -> Result<String> {
+    check_build(&format!("ingest-microbench {}", results.display()), build, allow_dirty)?;
     let text = std::fs::read_to_string(results).with_context(|| format!("read {}", results.display()))?;
     let rows: Vec<Value> = text
         .lines()
@@ -557,9 +767,11 @@ pub fn cmd_ingest_microbench(
         INSERT_RUN,
         params![
             run_id, sql(Some(&device_id)), sql(Some(get(first, "sm_arch")?)), sql(first.get("device")),
-            sql(first.get("cuda_runtime")), sql(first.get("cuda_driver")), git_sha(), power_mode(),
+            sql(first.get("cuda_runtime")), sql(first.get("cuda_driver")), build.map(BuildId::short), power_mode(),
             clocks_locked, gpu_temp_c(), sql(manifest.get("measured_d2d_bw_gbps")), started_at,
             idle.pct, idle.source, idle.allow_busy as i64,
+            build.map(|b| b.sha.as_str()), build.map(|b| b.dirty as i64),
+            (allow_dirty && build.is_none_or(|b| b.dirty)) as i64, RunKind::Microbench.as_str(),
         ],
     )?;
     let mut probes: Vec<String> = Vec::new();
@@ -792,10 +1004,11 @@ fn tie_set<'a>(ours: &[&'a Latest], paired: &PairedMap) -> TieCall<'a> {
 type PairedMap = HashMap<(String, i64, i64, i64, String, String), (f64, f64)>;
 
 fn load_paired(con: &Connection) -> Result<PairedMap> {
-    let mut stmt = con.prepare(
+    let mut stmt = con.prepare(&format!(
         "SELECT run_id, m, n, k, a_impl, b_impl, ratio_ci_lo, ratio_ci_hi FROM paired \
-         WHERE protocol_version = 2 AND cache_mode = 'cold' AND allow_busy = 0 AND coalesce(disturbed, 0) = 0",
-    )?;
+         WHERE protocol_version = 2 AND cache_mode = 'cold' AND allow_busy = 0 AND coalesce(disturbed, 0) = 0 \
+           AND run_id NOT IN ({DIRTY_RUNS})"
+    ))?;
     let rows = stmt.query_map([], |r| {
         Ok(((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?), (r.get(6)?, r.get(7)?)))
     })?;
@@ -1022,7 +1235,12 @@ pub fn report_text(con: &Connection, arch: Option<i64>, sel: &Selection, baselin
     }
     let cache = if sel.protocol >= 2 { format!(", cache_mode={}", sel.cache) } else { String::new() };
     let busy = if sel.include_busy { "including" } else { "excluding" };
-    writeln!(out, "Rows: timing protocol v{}{cache}, {busy} --allow-busy and disturbed rows.", sel.protocol)?;
+    let dirty = if sel.include_dirty { "including" } else { "excluding" };
+    writeln!(
+        out,
+        "Rows: timing protocol v{}{cache}, {busy} --allow-busy and disturbed rows, {dirty} dirty-build (--allow-dirty) runs.",
+        sel.protocol
+    )?;
     Ok(out)
 }
 
@@ -1150,13 +1368,20 @@ mod tests {
         assert_eq!((p, busy, cache), (1, 0, None));
     }
 
+    /// A clean build (40 hex digits).
+    const CLEAN: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    fn clean() -> BuildId {
+        BuildId::new(CLEAN, false).unwrap()
+    }
+
     fn tmp(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!("aegis-perf-{name}-{}", std::process::id()))
     }
 
     fn row(idle: f64, busy: bool) -> String {
         format!(
-            r#"{{"op":"gemm","impl":"x","config":{{}},"shape":{{"M":8,"N":8,"K":8}},"dtype":"f16f32f16","median_us":1.0,"p10_us":1.0,"p90_us":1.0,"tflops":1.0,"gbps":1.0,"reps":1,"checked":true,"pass":true,"max_abs_err":0.0,"rel_err":0.0,"sm_arch":121,"protocol_version":2,"cache_mode":"cold","idle_util_pct":{idle},"idle_source":"nvml","allow_busy":{busy}}}"#
+            r#"{{"op":"gemm","impl":"x","config":{{}},"shape":{{"M":8,"N":8,"K":8}},"dtype":"f16f32f16","median_us":1.0,"p10_us":1.0,"p90_us":1.0,"tflops":1.0,"gbps":1.0,"reps":1,"checked":true,"pass":true,"max_abs_err":0.0,"rel_err":0.0,"sm_arch":121,"protocol_version":2,"cache_mode":"cold","idle_util_pct":{idle},"idle_source":"nvml","allow_busy":{busy},"build_sha":"{CLEAN}","build_dirty":false}}"#
         )
     }
 
@@ -1168,14 +1393,14 @@ mod tests {
         let _ = std::fs::remove_file(&db);
         let f = tmp("profile.jsonl");
         let labelled = row(0.1, false).replacen("\"op\":\"gemm\"", "\"op\":\"gemm\",\"profile\":\"unmeasured\"", 1);
-        let paired = r#"{"kind":"paired","op":"gemm","dtype":"f16f32f16","shape":{"M":8,"N":8,"K":8},"a":"x","b":"y","role":"runner_up","pairs":30,"ratio_median":1.0,"ratio_ci_lo":0.99,"ratio_ci_hi":1.01,"tied":true,"protocol_version":2,"cache_mode":"cold","profile":"measured"}"#;
+        let paired = r#"{"kind":"paired","op":"gemm","dtype":"f16f32f16","shape":{"M":8,"N":8,"K":8},"a":"x","b":"y","role":"runner_up","pairs":30,"ratio_median":1.0,"ratio_ci_lo":0.99,"ratio_ci_hi":1.01,"tied":true,"protocol_version":2,"cache_mode":"cold","profile":"measured","build_sha":"0123456789abcdef0123456789abcdef01234567","build_dirty":false}"#;
         std::fs::write(&f, format!("{labelled}\n{}\n{paired}\n", row(0.1, false))).unwrap();
-        cmd_ingest(&db, &f, None, Some("p".into()), None).unwrap();
+        cmd_ingest(&db, &f, None, Some("p".into()), None, IngestOpts::new(RunKind::Sweep)).unwrap();
         std::fs::remove_file(&f).ok();
         let mb = tmp("profile-mb.jsonl");
         std::fs::write(&mb, r#"{"probe":"p","param":{},"value":1.0,"unit":"ns","sm_arch":121,"profile":"unmeasured"}"#.to_string() + "\n").unwrap();
         let idle = RunIdle { pct: Some(0.1), source: Some("nvml".into()), allow_busy: false };
-        cmd_ingest_microbench(&db, &mb, None, Some("mb".into()), &idle).unwrap();
+        cmd_ingest_microbench(&db, &mb, None, Some("mb".into()), &idle, Some(&clean()), false).unwrap();
         std::fs::remove_file(&mb).ok();
         let con = connect(&db).unwrap();
         let labels: Vec<Option<String>> = con
@@ -1202,9 +1427,9 @@ mod tests {
         let idle = RunIdle { pct: Some(0.1), source: Some("nvml".into()), allow_busy: false };
         let line = r#"{"probe":"p","param":{"stat":"x"},"value":1.0,"unit":"s","sm_arch":121}"#.to_string() + "\n";
         for id in ["clean", "noisy"] {
-            let f = tmp(&format!("{id}.jsonl"));
+            let f = tmp(&format!("disturbed-mb-{id}.jsonl"));
             std::fs::write(&f, &line).unwrap();
-            cmd_ingest_microbench(&db, &f, None, Some(id.into()), &idle).unwrap();
+            cmd_ingest_microbench(&db, &f, None, Some(id.into()), &idle, Some(&clean()), false).unwrap();
             std::fs::remove_file(&f).ok();
         }
         let con = connect(&db).unwrap();
@@ -1231,7 +1456,7 @@ mod tests {
             1,
         );
         std::fs::write(&f, format!("{tel}\n{}\n", row(0.1, false))).unwrap();
-        cmd_ingest(&db, &f, None, Some("t".into()), None).unwrap();
+        cmd_ingest(&db, &f, None, Some("t".into()), None, IngestOpts::new(RunKind::Sweep)).unwrap();
         std::fs::remove_file(&f).ok();
         let con = connect(&db).unwrap();
         type Row = (Option<f64>, Option<String>, Option<String>, Option<i64>, Option<i64>, Option<f64>);
@@ -1246,7 +1471,7 @@ mod tests {
         assert_eq!(rows[0], (Some(61.0), Some("sw_power_cap".into()),
                              Some("sw_power_cap|applications_clocks_setting".into()), Some(2400), Some(2520), Some(71.5)));
         assert_eq!(rows[1], (None, None, None, None, None, None), "no telemetry: NULL");
-        assert_eq!(schema_version(&con).unwrap(), Some(6));
+        assert_eq!(schema_version(&con).unwrap(), Some(SCHEMA_VERSION));
         std::fs::remove_file(&db).ok();
     }
 
@@ -1259,13 +1484,13 @@ mod tests {
         for (id, idle, busy) in [("idle_run", 0.4, false), ("busy_run", 2.9, true)] {
             let f = tmp(&format!("{id}.jsonl"));
             std::fs::write(&f, row(idle, busy) + "\n").unwrap();
-            cmd_ingest(&db, &f, None, Some(id.into()), Some(40.0)).unwrap();
+            cmd_ingest(&db, &f, None, Some(id.into()), Some(40.0), IngestOpts::new(RunKind::Sweep)).unwrap();
             std::fs::remove_file(&f).ok();
         }
         let mb = tmp("mb.jsonl");
         std::fs::write(&mb, r#"{"probe":"p","param":{},"value":1.0,"unit":"ns","sm_arch":121}"#.to_string() + "\n").unwrap();
         let idle = RunIdle { pct: Some(0.7), source: Some("nvml".into()), allow_busy: false };
-        cmd_ingest_microbench(&db, &mb, None, Some("mb_run".into()), &idle).unwrap();
+        cmd_ingest_microbench(&db, &mb, None, Some("mb_run".into()), &idle, Some(&clean()), false).unwrap();
         std::fs::remove_file(&mb).ok();
         let con = connect(&db).unwrap();
         let get = |id: &str| -> (Option<f64>, Option<String>, i64) {
@@ -1289,8 +1514,8 @@ mod tests {
         let _ = std::fs::remove_file(&db);
         let f = tmp("disturbed.jsonl");
         std::fs::write(&f, row(0.0, false) + "\n").unwrap();
-        let bad = cmd_ingest(&db, &f, None, Some("bad".into()), None).unwrap();
-        let good = cmd_ingest(&db, &f, None, Some("good".into()), None).unwrap();
+        let bad = cmd_ingest(&db, &f, None, Some("bad".into()), None, IngestOpts::new(RunKind::Sweep)).unwrap();
+        let good = cmd_ingest(&db, &f, None, Some("good".into()), None, IngestOpts::new(RunKind::Sweep)).unwrap();
         std::fs::remove_file(&f).ok();
         let con = connect(&db).unwrap();
         let w = |d| crate::watch::WatchReport {
@@ -1433,7 +1658,7 @@ mod tests {
             let f = tmp(&format!("{id}-mb.jsonl"));
             std::fs::write(&f, r#"{"probe":"p","param":{},"value":1.0,"unit":"ns","sm_arch":121}"#.to_string() + "\n")
                 .unwrap();
-            cmd_ingest_microbench(&db, &f, None, Some(id.into()), &idle).unwrap();
+            cmd_ingest_microbench(&db, &f, None, Some(id.into()), &idle, Some(&clean()), false).unwrap();
             std::fs::remove_file(&f).ok();
             std::thread::sleep(std::time::Duration::from_millis(5)); // distinct started_at
         }
@@ -1478,7 +1703,7 @@ mod tests {
             ),
         )
         .unwrap();
-        cmd_ingest_microbench(&db, &f, None, Some("c".into()), &RunIdle::default()).unwrap();
+        cmd_ingest_microbench(&db, &f, None, Some("c".into()), &RunIdle::default(), Some(&clean()), false).unwrap();
         std::fs::remove_file(&f).ok();
         let con = connect_ro(&db).unwrap();
         let rows = crate::view::microbench(&con, 121).unwrap();
@@ -1648,6 +1873,156 @@ mod tests {
         cmd_winners(&p, Some(121), None).unwrap();
         assert_eq!(winner(), ("pick".to_string(), Some(0.87), Some(0.89)));
         std::fs::remove_file(&p).unwrap();
+    }
+
+    /// runs (run_id, git_sha, build_sha, build_dirty, allow_dirty, kind).
+    type RunBuildRow = (String, Option<String>, Option<String>, Option<i64>, i64, String);
+
+    /// A row from `build`: Some((sha, dirty)) names it, None is a binary from before v7.
+    fn row_from(build: Option<(&str, bool)>) -> String {
+        let r = row(0.1, false);
+        let cut = r.find(",\"build_sha\"").unwrap();
+        match build {
+            Some((sha, dirty)) => format!("{},\"build_sha\":\"{sha}\",\"build_dirty\":{dirty}}}", &r[..cut]),
+            None => format!("{}}}", &r[..cut]),
+        }
+    }
+
+    fn ingest_rows(db: &Path, id: &str, lines: &[String], opts: IngestOpts) -> Result<String> {
+        let f = tmp(&format!("{id}.jsonl"));
+        std::fs::write(&f, lines.join("\n") + "\n").unwrap();
+        let r = cmd_ingest(db, &f, None, Some(id.into()), None, opts);
+        std::fs::remove_file(&f).ok();
+        r
+    }
+
+    /// v7: a clean build is stored with its full SHA (git_sha keeps 7 digits);
+    /// a dirty or unknown build is refused, and with --allow-dirty stored,
+    /// marked and left out of every default selection.
+    #[test]
+    fn ingest_refuses_dirty_builds_unless_allowed() {
+        let db = tmp("dirty-build.db");
+        let _ = std::fs::remove_file(&db);
+        let sweep = IngestOpts::new(RunKind::Sweep);
+        let allow = IngestOpts { allow_dirty: true, ..sweep };
+        ingest_rows(&db, "clean", &[row_from(Some((CLEAN, false)))], sweep).unwrap();
+        for (id, b) in [("dirty", Some((CLEAN, true))), ("unknown", None)] {
+            let err = ingest_rows(&db, id, &[row_from(b)], sweep).unwrap_err().to_string();
+            assert!(err.contains("refusing to store results") && err.contains("--allow-dirty"), "{err}");
+            ingest_rows(&db, id, &[row_from(b)], allow).unwrap();
+        }
+        let err = ingest_rows(&db, "mixed", &[row_from(Some((CLEAN, false))), row_from(Some((CLEAN, true)))], allow)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("different builds"), "{err}");
+        assert!(ingest_rows(&db, "short", &[row_from(Some(("0123456", false)))], allow).is_err(), "7 digits: not a full SHA");
+
+        let con = connect_ro(&db).unwrap();
+        let runs: Vec<RunBuildRow> = con
+            .prepare("SELECT run_id, git_sha, build_sha, build_dirty, allow_dirty, kind FROM runs ORDER BY run_id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        let s = |x: &str| Some(x.to_string());
+        assert_eq!(
+            runs,
+            vec![
+                ("clean".into(), s("0123456"), s(CLEAN), Some(0), 0, "sweep".into()),
+                ("dirty".into(), s("0123456"), s(CLEAN), Some(1), 1, "sweep".into()),
+                ("unknown".into(), None, None, None, 1, "sweep".into()),
+            ]
+        );
+        let ranked = |sel: &Selection| -> Vec<String> {
+            con.prepare(&format!("SELECT m.run_id FROM measurements m WHERE 1 = 1{} ORDER BY m.run_id", sel.sql()))
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        assert_eq!(ranked(&Selection::ranking()), vec!["clean".to_string()]);
+        assert_eq!(ranked(&Selection { include_dirty: true, ..Selection::ranking() }).len(), 3);
+        let views = crate::view::runs(&con).unwrap();
+        let dirty: Vec<(&str, bool)> = views.iter().map(|r| (r.run_id.as_str(), r.dirty())).collect();
+        assert_eq!(dirty, vec![("clean", false), ("dirty", true), ("unknown", true)]);
+        assert_eq!(views[0].kind, Some(RunKind::Sweep));
+        drop(con);
+        std::fs::remove_file(&db).ok();
+    }
+
+    /// A microbench run takes its build from the caller (bench_gemm --build-info of the same build).
+    #[test]
+    fn microbench_ingest_checks_the_build() {
+        let db = tmp("mb-build.db");
+        let _ = std::fs::remove_file(&db);
+        let f = tmp("mb-build.jsonl");
+        std::fs::write(&f, r#"{"probe":"p","param":{},"value":1.0,"unit":"ns","sm_arch":121}"#.to_string() + "\n").unwrap();
+        let idle = RunIdle::default();
+        let dirty = BuildId::new(CLEAN, true).unwrap();
+        assert!(cmd_ingest_microbench(&db, &f, None, Some("d".into()), &idle, Some(&dirty), false).is_err());
+        assert!(cmd_ingest_microbench(&db, &f, None, Some("u".into()), &idle, None, false).is_err());
+        cmd_ingest_microbench(&db, &f, None, Some("ok".into()), &idle, Some(&clean()), false).unwrap();
+        std::fs::remove_file(&f).ok();
+        let con = connect_ro(&db).unwrap();
+        let r = crate::view::run(&con, "ok").unwrap().unwrap();
+        assert_eq!((r.build_sha.as_deref(), r.build_dirty, r.kind), (Some(CLEAN), Some(false), Some(RunKind::Microbench)));
+        drop(con);
+        std::fs::remove_file(&db).ok();
+    }
+
+    /// Migrating to v7: runs get a kind from what they stored (paired tie tests in any state
+    /// make a tune), and paired_results their dirty flags from the "-dirty" suffix.
+    #[test]
+    fn migrate_v7_backfills_kind_and_dirty_flags() {
+        let con = Connection::open_in_memory().unwrap();
+        con.execute_batch(SCHEMA).unwrap();
+        con.execute_batch(
+            "DROP TABLE runs; CREATE TABLE runs (run_id TEXT PRIMARY KEY, device_id TEXT NOT NULL, sm_arch INTEGER NOT NULL,
+               gpu_name TEXT, cuda_ver INTEGER, driver_ver INTEGER, git_sha TEXT, power_mode TEXT, clocks_locked INTEGER,
+               temp_start_c REAL, measured_bw_gbps REAL, started_at TEXT NOT NULL);
+             INSERT INTO runs (run_id, device_id, sm_arch, started_at) VALUES
+               ('tune', 'd', 121, '1'), ('sweep', 'd', 121, '2'), ('mb', 'd', 121, '3'), ('empty', 'd', 121, '4');
+             INSERT INTO kernels (kernel_id, op, impl, config_json) VALUES ('k', 'gemm', 'x', '{}');
+             INSERT INTO measurements (run_id, kernel_id, dtype) VALUES ('tune', 'k', 'f'), ('sweep', 'k', 'f');
+             INSERT INTO paired (run_id, op, dtype, a_impl, b_impl) VALUES ('tune', 'gemm', 'f', 'x', 'y');
+             INSERT INTO microbench (run_id, probe, param_json, unit) VALUES ('mb', 'p', '{}', 'ns');
+             DROP TABLE paired_results;
+             CREATE TABLE paired_results (id INTEGER PRIMARY KEY, sha_a TEXT, sha_b TEXT, shape TEXT NOT NULL,
+               impl_a TEXT NOT NULL, impl_b TEXT NOT NULL, ratio REAL NOT NULL, ci_lo REAL NOT NULL, ci_hi REAL NOT NULL,
+               n INTEGER NOT NULL, protocol_version INTEGER NOT NULL, cache_mode TEXT NOT NULL, idle_reading REAL,
+               clocks_locked INTEGER NOT NULL DEFAULT 0, started_at TEXT NOT NULL, finished_at TEXT NOT NULL);
+             INSERT INTO paired_results (id, sha_a, sha_b, shape, impl_a, impl_b, ratio, ci_lo, ci_hi, n, protocol_version,
+                                         cache_mode, started_at, finished_at) VALUES
+               (1, '0bd0f22a35a6-dirty', '0bd0f22a35a6-dirty', '1x1x1', 'a', 'a', 1, 1, 1, 30, 2, 'cold', 't', 't'),
+               (2, '6b9a3cc228d2', '6b9a3cc228d2-dirty', '1x1x1', 'a', 'a', 1, 1, 1, 30, 2, 'cold', 't', 't'),
+               (3, NULL, 'b0bedd58fbf9', '1x1x1', 'a', 'a', 1, 1, 1, 30, 2, 'cold', 't', 't');",
+        )
+        .unwrap();
+        migrate(&con).unwrap();
+        let kinds: Vec<(String, Option<String>)> = con
+            .prepare("SELECT run_id, kind FROM runs ORDER BY started_at")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        let s = |x: &str| Some(x.to_string());
+        assert_eq!(
+            kinds,
+            vec![("tune".into(), s("tune")), ("sweep".into(), s("sweep")), ("mb".into(), s("microbench")), ("empty".into(), None)]
+        );
+        let flags: Vec<(Option<i64>, Option<i64>, Option<String>)> = con
+            .prepare("SELECT build_dirty_a, build_dirty_b, build_sha_a FROM paired_results ORDER BY id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(flags, vec![(Some(1), Some(1), None), (Some(0), Some(1), None), (None, Some(0), None)]);
+        let runs_dirty: Option<i64> = con.query_row("SELECT build_dirty FROM runs WHERE run_id = 'tune'", [], |r| r.get(0)).unwrap();
+        assert_eq!(runs_dirty, None, "a pre-v7 run's build state is unknown, not guessed");
     }
 
     #[test]

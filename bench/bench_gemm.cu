@@ -6,6 +6,7 @@
 //              [--lt-rank R]           only the algorithm at heuristic rank R (no selection)
 //   bench_gemm --impl aegis_matmul ...  aegis::matmul (the dispatch, as a library caller sees it)
 //   bench_gemm --list                  registered impls as JSON lines
+//   bench_gemm --build-info            this build's identity: {"build_sha","build_dirty"}
 //   bench_gemm --idle-check [--allow-busy]   the idle guard alone (aegis-perf sweep and
 //                                      paired-ab, microbench/run_all.sh run it once
 //                                      first); exit 3 = busy. Prints {"ok","mean_pct",
@@ -34,6 +35,7 @@
 
 #include "aegis/gemm.h"
 #include "aegis/matmul.h"
+#include "bench/build_info.h"
 #include "bench/harness.h"
 
 namespace {
@@ -60,6 +62,7 @@ struct Args {
   std::string cache = "cold";
   bool check = false;
   bool list = false;
+  bool build_info = false;
   bool idle_check = false, allow_busy = false;
   int idle_watch_root = 0;    // --idle-watch --root PID
   bool idle_watch = false;
@@ -97,6 +100,7 @@ Args parse(int argc, char** argv) {
       }
     }
     else if (k == "--list") a.list = true;
+    else if (k == "--build-info") a.build_info = true;
     else if (k == "--idle-check") a.idle_check = true;
     else if (k == "--idle-watch") a.idle_watch = true;
     else if (k == "--root") a.idle_watch_root = std::atoi(next());
@@ -122,6 +126,10 @@ Args parse(int argc, char** argv) {
 int main(int argc, char** argv) {
   const Args a = parse(argc, argv);
 
+  if (a.build_info) {
+    std::printf("{%s}\n", aegis::bench::build_json().c_str());
+    return 0;
+  }
   // --list: one JSON line per registered impl (cuBLAS is always available too).
   if (a.list) {
     for (const auto& e : aegis::gemm::registry())

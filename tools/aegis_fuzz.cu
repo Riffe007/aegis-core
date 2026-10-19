@@ -69,6 +69,7 @@
 #include "aegis/common.cuh"
 #include "aegis/gemm.h"
 #include "aegis/matmul.h"
+#include "bench/build_info.h"
 #include "bench/gpu_budget.h"
 #include "bench/reference.h"
 
@@ -537,6 +538,8 @@ int main(int argc, char** argv) {
     aegis::budget::gpu_free(bc);
   }
   const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+  // The build, for the perf DB (aegis-perf ingest-fuzz); before the summary line, which stays last.
+  std::printf("aegis_fuzz build: {%s}\n", aegis::bench::build_json().c_str());
   std::printf("aegis_fuzz: %lld cases, %lld %s (%lld CPU-FP64 reference, %lld cuBLASLt; %lld with NaN/Inf, "
               "%lld misaligned%s), %.1f s, seed %llu\n",
               last - first, failures, a.corrupt ? "corruptions NOT caught" : "failures", cpu_ref, lt_ref, injected,

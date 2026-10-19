@@ -20,6 +20,15 @@ mkdir -p "$ROOT/results" "$SASS"
 
 # Blocking idle guard (Benchmark policy): refuse a busy GPU unless ALLOW_BUSY=1;
 # the reading is stored on the run row.
+# Build identity (Benchmark policy): a dirty or unknown build is refused before
+# any probe runs unless ALLOW_DIRTY=1 (its rows are marked allow_dirty).
+INGEST_BUILD=()
+if [[ "${ALLOW_DIRTY:-0}" == 1 ]]; then
+  INGEST_BUILD+=(--allow-dirty)
+elif [[ "$(jq -r '.build_dirty == false and .build_sha != null' <<<"$("$ROOT/build/bench_gemm" --build-info 2>/dev/null || echo '{}')")" != true ]]; then
+  echo "$(basename "$0"): refusing to run: build/ is from a dirty or unknown tree (bench_gemm --build-info); commit and rebuild, or set ALLOW_DIRTY=1 (rows are marked)" >&2
+  exit 5
+fi
 IDLE_ARGS=()
 [[ "${ALLOW_BUSY:-0}" == 1 ]] && IDLE_ARGS+=(--allow-busy)
 IDLE_JSON="$("$ROOT/build/bench_gemm" --idle-check "${IDLE_ARGS[@]}")" || {
@@ -53,6 +62,6 @@ idle_watch_stop
 
 PERF="$ROOT/rust/target/release/aegis-perf"
 [[ -x "$PERF" ]] || { echo "missing $PERF; cargo build --release --manifest-path rust/Cargo.toml" >&2; exit 1; }
-(cd "$ROOT" && "$PERF" ingest-microbench "$OUT" --manifest "$MANIFEST" "${INGEST_IDLE[@]}" --watch "$OUT.watch.json")
+(cd "$ROOT" && "$PERF" ingest-microbench "$OUT" --manifest "$MANIFEST" "${INGEST_IDLE[@]}" "${INGEST_BUILD[@]}" --watch "$OUT.watch.json")
 echo "results: $OUT" >&2
 exit $status

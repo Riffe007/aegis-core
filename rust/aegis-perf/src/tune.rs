@@ -25,6 +25,8 @@ pub struct TuneArgs<'a> {
     pub prefix: Option<String>,
     pub allow_busy: bool,
     pub pair_with: Option<String>,
+    /// Tune a dirty or unknown build anyway (rows marked allow_dirty, excluded by default).
+    pub allow_dirty: bool,
 }
 
 pub fn cmd_tune(a: &TuneArgs) -> Result<()> {
@@ -32,6 +34,8 @@ pub fn cmd_tune(a: &TuneArgs) -> Result<()> {
     if !exe.exists() {
         bail!("{} not found; run cmake --build build first", exe.display());
     }
+    // Refuse a dirty build before an hour of GPU time, not at ingest.
+    db::check_build("tune", db::build_of(&a.build.join("bench_gemm"))?.as_ref(), a.allow_dirty)?;
     let _gpu = crate::gpujob::lock(&format!("aegis-perf tune --shapes {}", a.shapes.display()))?;
     std::fs::create_dir_all(a.results)?;
     let host = db::hostname();
@@ -72,7 +76,7 @@ pub fn cmd_tune(a: &TuneArgs) -> Result<()> {
     }
     std::fs::write(&out_path, &out.stdout)?;
 
-    let run_id = db::cmd_ingest(a.db, &out_path, Some(&manifest), None, None)?;
+    let run_id = db::cmd_ingest(a.db, &out_path, Some(&manifest), None, None, db::IngestOpts { kind: db::RunKind::Tune, allow_dirty: a.allow_dirty })?;
     db::mark_disturbed(&db::connect(a.db)?, &run_id, &report)?;
     db::cmd_winners(a.db, None, Some(&db::registry_of(&a.build.join("bench_gemm"))?))?;
     println!("\nresults: {}", out_path.display());

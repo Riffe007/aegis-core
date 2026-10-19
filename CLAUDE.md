@@ -45,7 +45,7 @@ rust/target/release/aegis-perf sweep              # shape sweep -> results/*.jso
 rust/target/release/aegis-perf report             # % of cuBLAS per shape
 rust/target/release/aegis-perf tune               # aegis_tune: every config x shapes/default.txt -> winners
 rust/target/release/aegis-perf emit-header        # winners -> include/aegis/winners/sm_<arch>.h (commit it)
-rust/target/release/aegis-perf init               # create / migrate the perf DB (schema v6; backs up first: <db>.bak-v<old>-<date>)
+rust/target/release/aegis-perf init               # create / migrate the perf DB (schema v7; backs up first: <db>.bak-v<old>-<date>)
 rust/target/release/aegis-perf roofline --arch 121  # results/roofline-sm121.svg from measured roofs
 rust/target/release/aegis-perf emit-arch --arch 121  # include/aegis/arch/sm_121.json: measured L2/DRAM latency, DRAM bw, mma peak
 tools/sass_dump.sh                                # SASS + register usage per kernel
@@ -57,6 +57,7 @@ cmake --build build --target fuzz_nightly         # 50,000 fuzz cases
 tools/sanitize.sh                                 # ctest suite under compute-sanitizer memcheck/racecheck/initcheck/synccheck
 tools/ncu_gemm.sh IMPL M N K; tools/ncu_summary.sh artifacts/ncu/*.ncu-rep   # Nsight profile + key metrics
 rust/target/release/aegis-perf paired-ab --a OLD/bench_gemm --b build/bench_gemm --impl X --shape M N K  # A/B across builds
+./build/bench_gemm --build-info                   # this build's commit and dirty flag (every result row carries them)
 tools/nightly.sh                                  # nightly (user timer 03:00; --install): 50k fuzz, regression sweep, DB backup -> results/nightly.log
                                                   # summary lines: status=OK / FAIL / SKIPPED reason="..."
 tools/kernel_log_guard.sh --since TIME            # new Xid / NVRM lines? (profiler lines inside logged sessions ignored)
@@ -288,6 +289,18 @@ only to compare with old rows (`--protocol 1`).
   At the local desktop, run measurements under `tools/screen_off.sh`: with
   the screen on, the compositor's per-process GPU samples rise with our
   bursty work and the in-run watch marks the run disturbed (LOG 2026-10-17).
+- **Build identity (blocking).** Every result names the build that measured it:
+  `cmake/build_info.cmake` writes the commit and whether the tree had uncommitted
+  tracked changes into the bench harness on every build (`src/bench/build_info.h`;
+  `bench_gemm --build-info`), and every bench_gemm / aegis_tune row and aegis_fuzz
+  summary carries it. `aegis-perf tune`, `sweep` (the nightly too), `paired-ab`,
+  `ingest` and `ingest-microbench` (`run_all.sh`, `run_latency_locked.sh`) refuse a
+  dirty or unknown build before running unless `--allow-dirty` (`ALLOW_DIRTY=1`).
+  Stored: `runs.build_sha` (40 hex digits) / `build_dirty` / `allow_dirty`,
+  `paired_results.build_sha_a/_b` / `build_dirty_a/_b` / `allow_dirty`. Rows written
+  with `--allow-dirty` are excluded by default (winners, reports, regress, views) and
+  are not evidence: no commit rebuilds what they measured. Commit, rebuild, then measure.
+  A result counts toward a claim only from a clean build of a tagged or merged commit.
 - **Idle guard (blocking).** `aegis-perf sweep`, `tune` and `paired-ab` (and
   `aegis_tune`, `microbench/run_all.sh`) sample GPU utilization for 2 s first
   and abort above 2% mean (or when no source can tell) unless `--allow-busy`

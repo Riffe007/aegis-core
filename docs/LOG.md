@@ -2658,3 +2658,44 @@ are not rewritten.
 
 What would make it reproducible: build identity stored with every row and dirty trees refused
 (next entry), then re-measure from a tagged, clean build.
+
+## 2026-10-18 — Build identity: every result names a clean build, or is marked
+
+Schema v7 (numbered v6 on the repro branch, renumbered at the merge onto main, whose v6 is telemetry; migration in `db::migrate`; not applied to the live DB yet: it ships in
+aegis-perf-v0.6.0 first).
+
+- **The build names itself.** `cmake/build_info.cmake` runs on every build and writes the commit
+  (`git rev-parse HEAD`, 40 hex digits) and whether the tree had uncommitted tracked changes
+  (`git status --porcelain --untracked-files=no`) into `build/generated/build_info.cpp`, rewritten
+  only when that changes. It is part of the bench harness (`src/bench/build_info.h`), so:
+  - every bench_gemm and aegis_tune row, and every paired tie-test line, carries
+    `"build_sha"` and `"build_dirty"`;
+  - `bench_gemm --build-info` prints them;
+  - aegis_fuzz prints `aegis_fuzz build: {...}` before its summary line.
+  A binary keeps its own identity after the tree moves on. Before this, `runs.git_sha` was the
+  7-digit HEAD of the directory aegis-perf ran in, and paired-ab's SHA was the tree's state when
+  paired-ab ran, not when the binary was built.
+- **Refused unless --allow-dirty.** `tune`, `sweep` (the nightly too), `paired-ab`, `ingest` and
+  `ingest-microbench` refuse a dirty build, and an unknown one (a pre-v7 binary), before any GPU
+  work. `run_all.sh` and `run_latency_locked.sh` check `bench_gemm --build-info` before the first
+  probe (`ALLOW_DIRTY=1` to override). With `--allow-dirty` the rows are stored and marked.
+- **Stored.** `runs`: `build_sha`, `build_dirty`, `allow_dirty`, `kind` (tune, sweep, nightly,
+  microbench, ingest). `paired_results`: `build_sha_a/_b`, `build_dirty_a/_b`, `allow_dirty`, and
+  `device_id`, `sm_arch`, `dtype` (from the bench rows; both builds must agree). `git_sha` and
+  `sha_a` / `sha_b` keep their old forms for older readers.
+- **Excluded by default.** `db::DIRTY_RUNS` (allow_dirty or build_dirty = 1) is left out of
+  `Selection::ranking()` (winners, report, tune), the winners' paired CIs, `view::paired`,
+  `view::paired_results` (`PairedResultFilter::include_dirty`), and regress (a dirty run is not
+  measured; a dirty paired-ab confirms nothing). `report --include-dirty` shows them.
+- **Migration backfill.**
+  - `runs.kind` comes from what each run stored: paired tie tests (in any state) = tune,
+    microbench rows = microbench, else sweep. A nightly and a hand-run sweep look the same
+    before v7.
+  - `paired_results.build_dirty_a/_b` come from the "-dirty" suffix. The full SHAs and
+    `runs.build_dirty` stay NULL: unknown, not guessed.
+  - Pre-v7 runs are not excluded, since their state is unknown, but none of them counts as
+    clean (`PairedResult::clean()` needs both full SHAs and both flags 0).
+- **Tests** (aegis-perf, 41): ingest refuses dirty, unknown, mixed and short-SHA builds;
+  `--allow-dirty` rows are marked and out of `Selection::ranking()`; microbench ingest checks its
+  build; the pre-v7 -> v7 backfill; paired-ab rejects a `--sha` the binary contradicts; a dirty
+  paired-ab does not confirm a regression.
