@@ -2016,9 +2016,12 @@ new / old:
 | 16x4864x896 | 0.996 | 0.991-0.999 |
 | 16x896x4864 | 0.742 | 0.719-0.747 |
 
-**Verdict.** Every decode shape meets the decode bar, >= 100% of cublaslt_best (tie or win):
-- four kernel wins and two kernel ties (1x4864x896, 16x896x4864);
+**Verdict** (corrected 2026-10-18, see "Correction: the decode record"). Kernel vs cublaslt_best:
+- four kernel wins and two kernel ties (1x4864x896, 16x896x4864; their CIs reach 97.7% and 97.3%);
 - through dispatch, five wins and one tie (1x4864x896).
+
+A tie meets the decode bar ("a tie or a win"), but it is not >= 100% of cublaslt_best. None of these
+results is reproducible: both builds were 0bd0f22-dirty.
 
 **The 896x896 shapes** run at ~65-70% of the floor, and cuBLASLt at 58-66%. They are bound by
 launch overhead: fixed per-launch cost (launch, ramp, tail) against a ~6 µs transfer. Closing
@@ -2034,7 +2037,8 @@ sized from the SM count at run time, rather than per-config constants (aegis-hw,
 **Phase C is complete** (tag `aegis-perf-v0.5.0`, commit 9f3f41c):
 - deterministic split-K;
 - the decode GEMV family;
-- all six decode shapes at >= 100% of cublaslt_best and dispatched to AEGIS;
+- decode vs cublaslt_best: four kernel wins and two kernel ties, all six dispatched to AEGIS, from a
+  dirty build (corrected 2026-10-18: not reproducible; see "Correction: the decode record");
 - ctest 453/453 and the sm_87 gate pass;
 - memcheck and racecheck are clean on the decode kernels.
 
@@ -2618,3 +2622,39 @@ HEVC, VP8, VP9, AV1. NVENC: H264, HEVC, AV1.
   - calibrate runs with clocks unlocked until `sudo -n nvidia-smi` works without a password;
   - GB10 reports no NVML throttle reasons (clock sag is the signal);
   - the orin-nano fixture is synthetic until a Nano is connected.
+
+## 2026-10-18 — Correction: the decode record
+
+The Phase C close-out said "all six decode shapes at >= 100% of cublaslt_best" (LOG "Paused
+here"; commit 9f3f41c's subject: "every decode shape >= cublaslt_best"). The record is:
+
+- **Kernel vs cublaslt_best** (paired-ab, Phase C step 4): 4 wins and 2 ties. paired_results
+  ids 27, 30, 33, 36, 40, 43; % = 1 / ratio, CI inverted:
+
+  | shape | kernel % of cublaslt_best (CI) | call |
+  |---|---|---|
+  | 1x896x896 | 106.2% (105.2-106.7%) | win |
+  | 1x4864x896 | 100.2% (97.7-101.2%) | tie |
+  | 1x896x4864 | 105.3% (104.0-105.7%) | win |
+  | 16x896x896 | 114.8% (113.5-115.3%) | win |
+  | 16x4864x896 | 101.1% (100.6-102.3%) | win |
+  | 16x896x4864 | 100.3% (97.3-100.8%) | tie |
+
+  A tie meets the decode bar ("a tie or a win"). It is not >= 100%: the CI includes up to ~3%
+  slower.
+- **None of it is reproducible yet.**
+  - Every one of ids 26-44 has sha_a = sha_b = `0bd0f22a35a6-dirty`: the tree had uncommitted
+    changes (the new header among them), so no commit rebuilds what was measured.
+  - No `runs` row has build 0bd0f22. The decode tune those winners came from (c2b937d8adca)
+    records `1084490`, and `runs.git_sha` has no dirty marker, so it cannot say whether that tree
+    was clean either.
+  - The same holds after aegis-hw step 1. Its tune b3ab0da1de2a records `6b9a3cc` but ran the
+    uncommitted step-1 tree. Its paired-ab (ids 45-60) is `6b9a3cc228d2` vs
+    `6b9a3cc228d2-dirty`. The current header's decode winners are those of that tune.
+- Every paired result in the perf DB (ids 1-60) has a `-dirty` build on at least one side.
+
+Corrected in place: the Phase C step 4 verdict and the "Paused here" summary. Commit subjects
+are not rewritten.
+
+What would make it reproducible: build identity stored with every row and dirty trees refused
+(next entry), then re-measure from a tagged, clean build.
