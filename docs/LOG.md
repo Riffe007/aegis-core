@@ -2406,3 +2406,34 @@ HEVC, VP8, VP9, AV1. NVENC: H264, HEVC, AV1.
   now it reports 20 exported, 20 declared.
 - capi_static, capi_shared, the Rust bindings' tests (dynamic link) and sm87_gate pass;
   memcheck capi_test_shared: 0 errors.
+
+## 2026-10-18 — hardening 4: host-side dispatch cost of aegis::matmul
+
+- **Probe:** `microbench/launch_overhead.cu`, part 2 (`--host-only` runs it alone). Each sample
+  is steady_clock around one call, with no synchronization inside it; the stream is drained
+  after every launch, outside the sample. 20,000 samples after 2,000 warm-up per method.
+  - `host_dispatch` is `detail::matmul_host_path`: validation, the profile lookup, the
+    capability-filtered winner choice and, for the cuBLASLt path, the plan lookup (a cache
+    hit). It launches nothing.
+  - `host_enqueue_matmul` is the whole `aegis::matmul` call; `host_enqueue_kernel` is the
+    chosen kernel's `run()` alone.
+  - `host_clock` is the timer's own cost.
+  Part 1 now times the kernel matmul actually dispatches (the gemv_tc winners; it named a stale
+  mma_pipe impl), and skips the driver method when a launch captures more than one node.
+- **Run `3affcb7fc257`** (screen off, idle 0.0%, not disturbed), µs:
+
+  | Shape | Path | host_dispatch median / p99 | enqueue matmul | enqueue kernel |
+  |---|---|---|---|---|
+  | 1x896x896 | gemv_tc_16x64x64_1x4_s6_ksm | 0.224 / 0.240 | 1.936 | 1.744 |
+  | 16x4864x896 | gemv_tc_16x128x32_1x4_s6_ksm | 0.192 / 0.224 | 1.920 | 1.760 |
+  | 2048^3 | mma_tma_128x128x32_2x4_s3 | 0.160 / 0.192 | 2.000 | 1.888 |
+  | 4096^3 | cuBLASLt (floor, plan cache hit) | 0.160 / 0.240 | 4.048 | - |
+
+  The timer itself costs 0.032 µs.
+- **Verdict:** dispatch is 0.16–0.22 µs median and at most 0.24 µs p99, under the 1 µs bar,
+  so nothing was changed. The enqueue difference (matmul minus kernel) agrees: 0.11–0.19 µs.
+  The 4 µs enqueue at 4096^3 is cublasLtMatmul's own host path, not dispatch.
+- End to end, host to completion, part 1 (same run): 1x896x896 matmul 9.65 µs median vs.
+  runtime launch 9.46 µs; 1x4864x896 13.41 vs. 13.30; 1x896x4864 13.78 vs. 13.60.
+- **Hardening:** memcheck test_matmul (API errors off, as before) and 100 decode fuzz cases
+  (gemv_, matmul): 0 errors (`artifacts/sanitizer/hardening-4/`).

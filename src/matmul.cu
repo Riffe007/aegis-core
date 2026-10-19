@@ -481,6 +481,18 @@ std::string cublaslt_plan_source(const gemm::GemmParams& p, cudaStream_t stream,
 
 bool lt_reduction_ok(const LtAlgoConfig& c) { return lt::reduction_ok(c); }
 
+Choice::Kind matmul_host_path(const gemm::GemmParams& p, cudaStream_t stream) {
+  if (gemm::validate(p) != cudaSuccess || gemm::is_empty(p)) return Choice::Kind::Cublas;
+  hw::current_profile();
+  const Choice c = choice_for(p.M, p.N, p.K);
+  if (c.kind == Choice::Kind::Cublaslt) {
+    cublasLtHandle_t lt = nullptr;
+    const LtPlan* plan = nullptr;
+    lt_plan(p, stream, stored_for(c.winner, p), &lt, &plan);
+  }
+  return c.kind;
+}
+
 cudaError_t matmul_forced(const gemm::GemmParams& p, Choice::Kind kind, const LtAlgoConfig* stored, cudaStream_t stream) {
   if (const cudaError_t e = gemm::validate(p); e != cudaSuccess)
     return fail(e, "aegis::matmul: invalid GEMM parameters");

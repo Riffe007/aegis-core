@@ -101,6 +101,11 @@ bool lt_reduction_ok(const LtAlgoConfig& c);
 // Aegis (plain aegis::matmul).
 cudaError_t matmul_forced(const gemm::GemmParams& p, Choice::Kind kind, const LtAlgoConfig* stored,
                           cudaStream_t stream);
+// For the launch-overhead probe: aegis::matmul's host path up to the GEMM
+// launch, launching nothing. Validation, the profile lookup, the capability-
+// filtered winner choice and, for the cuBLASLt path, the plan lookup (a cache
+// hit after the first call). Returns the chosen path.
+Choice::Kind matmul_host_path(const gemm::GemmParams& p, cudaStream_t stream);
 }  // namespace detail
 
 cudaError_t matmul(const __half* A, const __half* B, __half* C, int M, int N, int K,
