@@ -67,6 +67,9 @@ rust/target/release/aegis-perf regress --run R   # winners-header shapes: % of c
 rust/target/release/aegis-perf hw                 # hardware discovery JSON (GPU, CPU clusters/ISA, memory, thermal, NVDEC/NVENC)
 rust/target/release/aegis-perf calibrate [--dry-run] [--out-dir DIR]  # this device: microbench (clocks locked if sudo -n can), tune, then
                                                   # DIR/arch/sm_<arch>.json + DIR/winners/sm_<arch>.h (default include/aegis); step times -> results/calibrate-history.jsonl
+rust/target/release/aegis-perf check-db           # can this binary read the DB (db::check: Ok / TooOld / TooNew / Missing)
+rust/target/release/aegis-perf ingest-fuzz FUZZ.txt --kind nightly   # aegis_fuzz output -> fuzz_runs / fuzz_cases (the nightly does it)
+rust/target/release/aegis-perf fuzz-verdict --fuzz-id F --case N --verdict V --ours-ulp X --ref-ulp Y --source DOC
 tools/record_hw_fixture.sh tests/fixtures/hw/NAME # record a device's sysfs for the discovery tests
 AEGIS_TELEMETRY=1 rust/target/release/aegis-perf tune   # opt-in telemetry: rows carry max_temp_c, throttle_reasons, power_w (perf DB v6); bench_gemm / aegis_tune --telemetry
 microbench/run_throttle_profile.sh [SECONDS]       # 5-min sustained-load time-to-throttle profile -> include/aegis/arch/throttle/sm_<arch>.json (commit it)
@@ -106,7 +109,7 @@ rust/               cargo workspace: aegis-sys, aegis-perf
 tools/              aegis_manifest.cu, aegis_tune.cu, sass_dump.sh
 results/            JSONL runs, device manifests, perf DB (gitignored)
 artifacts/          SASS dumps per arch, microbench SASS proofs (gitignored)
-docs/               LOG.md (dated run log), analysis/ (consolidated analyses, e.g. gemm-large.md)
+docs/               LOG.md (dated run log), analysis/ (consolidated analyses, e.g. gemm-large.md; diagnoses.json: per-shape diagnoses as data, aegis_perf::analysis)
 ```
 
 ## Rules (non-negotiable)

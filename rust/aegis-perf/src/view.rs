@@ -169,6 +169,57 @@ pub struct Measurement {
     /// The run's build (schema v7; see [`Run::build_sha`]).
     pub build_sha: Option<String>,
     pub build_dirty: Option<bool>,
+    /// cublaslt_best rows: the cuBLASLt algorithm it picked (schema v4; None on other impls).
+    pub lt_algo: Option<LtAlgo>,
+}
+
+/// The cuBLASLt algorithm cublaslt_best picked (`measurements.lt_algo`,
+/// `winners.lt_algo`; src/lt_algo.h), typed (core-request #7). None fields:
+/// not recorded by the build that measured it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LtAlgo {
+    pub algo_id: Option<i64>,
+    pub tile_id: Option<i64>,
+    pub stages_id: Option<i64>,
+    pub splitk: Option<i64>,
+    pub reduction: Option<i64>,
+    pub swizzle: Option<i64>,
+    pub custom: Option<i64>,
+    pub inner_shape: Option<i64>,
+    pub cluster_shape: Option<i64>,
+    /// Its rank among the heuristic's candidates, how many were timed, how many passed --check.
+    pub heuristic_rank: Option<i64>,
+    pub candidates: Option<i64>,
+    pub passed: Option<i64>,
+    /// Workspace bytes.
+    pub workspace: Option<i64>,
+}
+
+impl LtAlgo {
+    pub fn parse(json: &str) -> Result<LtAlgo> {
+        let v: serde_json::Value = serde_json::from_str(json).with_context(|| format!("lt_algo {json}"))?;
+        let f = |k: &str| v[k].as_i64();
+        Ok(LtAlgo {
+            algo_id: f("algo_id"),
+            tile_id: f("tile_id"),
+            stages_id: f("stages_id"),
+            splitk: f("splitk"),
+            reduction: f("reduction"),
+            swizzle: f("swizzle"),
+            custom: f("custom"),
+            inner_shape: f("inner_shape"),
+            cluster_shape: f("cluster_shape"),
+            heuristic_rank: f("heuristic_rank"),
+            candidates: f("candidates"),
+            passed: f("passed"),
+            workspace: f("workspace"),
+        })
+    }
+}
+
+fn lt_algo(json: Option<String>) -> rusqlite::Result<Option<LtAlgo>> {
+    json.map(|j| LtAlgo::parse(&j).map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, e.into())))
+        .transpose()
 }
 
 /// Which measurements to read. The default is what every view shows unless
@@ -206,7 +257,7 @@ pub fn measurements(con: &Connection, f: &MeasurementFilter) -> Result<Vec<Measu
         "SELECT m.run_id, m.kernel_id, k.op, k.impl, m.dtype, m.m, m.n, m.k, m.median_us, m.p10_us, m.p90_us, \
                 m.reps, m.checked, m.pass, m.max_abs_err, m.rel_err, m.power_w, m.protocol_version, m.batch_n, \
                 m.timer_res_ns, m.cache_mode, m.buffer_sets, m.window_ms, m.allow_busy, m.idle_util_pct, \
-                r.sm_arch, r.device_id, r.git_sha, r.started_at, r.build_sha, r.build_dirty \
+                r.sm_arch, r.device_id, r.git_sha, r.started_at, r.build_sha, r.build_dirty, m.lt_algo \
          FROM measurements m JOIN runs r USING(run_id) JOIN kernels k USING(kernel_id) WHERE 1 = 1",
     );
     q += &f.sel.sql();
@@ -274,6 +325,7 @@ pub fn measurements(con: &Connection, f: &MeasurementFilter) -> Result<Vec<Measu
                 started_at: r.get(28)?,
                 build_sha: r.get(29)?,
                 build_dirty: r.get::<_, Option<i64>>(30)?.map(|d| d != 0),
+                lt_algo: lt_algo(r.get(31)?)?,
             })
         })?
         .collect::<rusqlite::Result<_>>()?;
@@ -354,6 +406,9 @@ pub struct Winner {
     /// Where aegis::matmul sends the shape, as stored by `winners` (schema v7;
     /// None for winners computed before v7: emit-header then applies tune::dispatch).
     pub dispatch: Option<crate::tune::Dispatch>,
+    /// cublaslt_best's algorithm at this shape in the winner's run (what the dispatch
+    /// floor rebuilds; schema v4).
+    pub lt_algo: Option<LtAlgo>,
     /// The paired tests of this shape in the winner's run (runner-up, cublaslt_best).
     pub paired: Vec<Paired>,
 }
@@ -376,7 +431,7 @@ pub fn winners(con: &Connection, arch: Option<i64>) -> Result<Vec<Winner>> {
         "SELECT w.sm_arch, w.op, w.dtype, w.shape_bucket, w.kernel_id, w.run_id, r.git_sha, w.median_us, \
                 w.warm_median_us, w.pct_of_cublas, w.pct_of_cublaslt_best, w.tied, w.tie_set, w.pick_reason, \
                 w.protocol_version, w.tie_method, w.ratio_ci_lo, w.ratio_ci_hi, w.lt_ratio_ci_lo, w.lt_ratio_ci_hi, \
-                w.lt_ratio_median, w.dispatch \
+                w.lt_ratio_median, w.dispatch, w.lt_algo \
          FROM winners w LEFT JOIN runs r USING(run_id) WHERE (?1 IS NULL OR w.sm_arch = ?1) ORDER BY w.rowid",
     )?;
     let raw = stmt
@@ -388,12 +443,12 @@ pub fn winners(con: &Connection, arch: Option<i64>) -> Result<Vec<Winner>> {
                 (r.get::<_, i64>(11)? != 0, r.get::<_, Option<String>>(12)?, r.get::<_, Option<String>>(13)?),
                 (r.get::<_, i64>(14)?, r.get::<_, Option<String>>(15)?),
                 (r.get::<_, Option<f64>>(16)?, r.get::<_, Option<f64>>(17)?, r.get::<_, Option<f64>>(18)?, r.get::<_, Option<f64>>(19)?),
-                (r.get::<_, Option<f64>>(20)?, r.get::<_, Option<String>>(21)?),
+                (r.get::<_, Option<f64>>(20)?, r.get::<_, Option<String>>(21)?, lt_algo(r.get(22)?)?),
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let mut out = Vec::with_capacity(raw.len());
-    for ((sm_arch, op, dtype, shape_bucket), (kernel_id, run_id, git_sha), (median_us, warm, pct_cb, pct_lt), (tied, set, reason), (protocol_version, tie_method), (rlo, rhi, llo, lhi), (lt_median, dispatch)) in raw {
+    for ((sm_arch, op, dtype, shape_bucket), (kernel_id, run_id, git_sha), (median_us, warm, pct_cb, pct_lt), (tied, set, reason), (protocol_version, tie_method), (rlo, rhi, llo, lhi), (lt_median, dispatch, lt)) in raw {
         let d: Vec<i64> = shape_bucket.split('x').map(str::parse).collect::<Result<_, _>>().with_context(|| format!("shape_bucket {shape_bucket}"))?;
         let [m, n, k] = d[..] else { anyhow::bail!("shape_bucket {shape_bucket}: expected MxNxK") };
         let kernel = kernel(con, &kernel_id)?.with_context(|| format!("winner kernel {kernel_id} not in kernels"))?;
@@ -426,6 +481,7 @@ pub fn winners(con: &Connection, arch: Option<i64>) -> Result<Vec<Winner>> {
             lt_ratio_ci: ci(llo, lhi),
             lt_ratio_median: lt_median,
             dispatch: dispatch.as_deref().and_then(crate::tune::Dispatch::parse),
+            lt_algo: lt,
             paired,
         });
     }
@@ -681,6 +737,44 @@ mod tests {
         p
     }
 
+
+    /// The stored cuBLASLt algorithm, typed (core-request #7), on winners and measurements.
+    #[test]
+    fn lt_algo_is_typed() {
+        let p = temp_db("lt");
+        let con = db::connect(&p).unwrap();
+        let j = r#"{"algo_id": 67, "candidates": 6, "cluster_shape": 0, "custom": 29, "heuristic_rank": 2, "inner_shape": 0, "passed": 6, "reduction": 0, "splitk": 1, "stages_id": 35, "swizzle": 0, "tile_id": 317, "workspace": 0}"#;
+        con.execute_batch(&format!(
+            "INSERT INTO runs (run_id, device_id, sm_arch, started_at) VALUES ('r', 'd', 121, '1');
+             INSERT INTO kernels (kernel_id, op, impl, config_json) VALUES ('k', 'gemm', 'mma_x', '{{}}'), ('kl', 'gemm', 'cublaslt_best', '{{}}');
+             INSERT INTO measurements (run_id, kernel_id, dtype, m, n, k, median_us, checked, pass, protocol_version, cache_mode, allow_busy, lt_algo)
+               VALUES ('r', 'kl', 'f16f32f16', 256, 256, 256, 1.0, 1, 1, 2, 'cold', 0, '{j}');
+             INSERT INTO winners (sm_arch, op, dtype, shape_bucket, kernel_id, run_id, median_us, protocol_version, lt_algo)
+               VALUES (121, 'gemm', 'f16f32f16', '256x256x256', 'k', 'r', 1.0, 2, '{j}');"
+        ))
+        .unwrap();
+        drop(con);
+        let con = db::connect_ro(&p).unwrap();
+        let want = LtAlgo {
+            algo_id: Some(67),
+            tile_id: Some(317),
+            stages_id: Some(35),
+            splitk: Some(1),
+            reduction: Some(0),
+            swizzle: Some(0),
+            custom: Some(29),
+            inner_shape: Some(0),
+            cluster_shape: Some(0),
+            heuristic_rank: Some(2),
+            candidates: Some(6),
+            passed: Some(6),
+            workspace: Some(0),
+        };
+        assert_eq!(winners(&con, Some(121)).unwrap()[0].lt_algo.as_ref(), Some(&want));
+        let m = measurements(&con, &MeasurementFilter { impl_: Some("cublaslt_best".into()), ..Default::default() }).unwrap();
+        assert_eq!(m[0].lt_algo.as_ref(), Some(&want));
+        std::fs::remove_file(&p).unwrap();
+    }
     #[test]
     fn connect_ro_refuses_writes() {
         let p = seeded("ro");

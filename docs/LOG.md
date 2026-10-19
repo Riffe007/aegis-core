@@ -2777,3 +2777,36 @@ recomputed, nothing written to the live DB):
   (correction entry above), so they are not evidence yet.
 - The committed `winners/sm_121.h` is not regenerated here. That happens after the tag, from
   the migrated live DB.
+
+## 2026-10-18 — aegis-perf 0.6.0: the library API AEGIS Custos asked for
+
+Every item below is in `aegis_perf` (the library: Custos reads through it, never through SQL or
+text). Custos request numbers are from its `docs/core-requests.md`.
+
+| # | Request | API |
+|---|---|---|
+| 3 | typed schema check | `db::SUPPORTED_SCHEMA` (6..=6); `db::check(path) -> Compat` (`Ok { version }`, `TooOld { found }`, `TooNew { found }`, `Missing { table, column }`, `NotPerfDb`); `connect_ro` fails with a `db::SchemaError` (downcast; same message text as before); CLI `check-db` |
+| 4 | production bars, large-shape definition | `bars::LARGE_MIN_DIM` (1024), `LARGE` (0.90), `DECODE` (1.00), `FLOOR` (= `tune::DISPATCH_FLOOR`); `bars::Bar::of(m, n, k)`, `bars::check(m, n, k, paired) -> BarCheck { bar, verdict: Meets / Below / NotMeasured, below_floor }` on the paired CI |
+| 4 | median-vs-CI rule; dispatch as data | `bars::MEDIAN_CI_DISAGREE_PTS`, `bars::median_disagrees` (previous entry); `winners.dispatch` and `view::Winner::dispatch` |
+| 5 | paired_results identity, device, arch, dtype | schema v7 (build-identity entry); `view::PairedResult::{build_sha_a/_b, build_dirty_a/_b, allow_dirty, device_id, sm_arch, dtype, profile, clean(), dirty()}`; `PairedResultFilter::{device_id, sm_arch, dtype, include_dirty}` |
+| 7 | stored cuBLASLt algorithm | `view::LtAlgo` (algo_id, tile_id, stages_id, splitk, reduction, swizzle, custom, inner_shape, cluster_shape, heuristic_rank, candidates, passed, workspace) on `view::Winner::lt_algo` and `view::Measurement::lt_algo` |
+| 9 | decode floor | `params::ArchParams::decode_floor_us(m, n, k)` = bytes(B) / read_bw (None for M > 16), `pct_of_decode_floor`; matches the LOG's 6.227 / 33.805 µs floors and 1x896x896 at 69.8% |
+| 9 | stated diagnoses | `docs/analysis/diagnoses.json` (`aegis-diagnoses/1`: arch, shape, label, statement, source doc + heading); `analysis::load`, `analysis::of`. Today: 1x896x896 and 16x896x896, "below floor: launch-overhead bound", from Phase C step 4. A test checks every statement against its cited section |
+| 10 | fuzz results in the DB | tables `fuzz_runs`, `fuzz_cases` (schema v7); `fuzz::parse` (the one parser of aegis_fuzz's output); CLI `ingest-fuzz` (build checked, refused when dirty or unknown unless --allow-dirty) and `fuzz-verdict` (verdict, ulp ours / reference, source); `fuzz::fuzz_runs(con, include_dirty)`. The nightly ingests its fuzz as kind nightly |
+| 11 | run kind; the header a nightly ran | `runs.kind`, `view::Run::kind` (`db::RunKind`), `regress::is_sweep`, `regress::run_identity`. A nightly now records its clean build's full SHA, and its header is that commit's `include/aegis/winners/sm_<arch>.h` |
+
+Checked on a scratch copy of the live DB (never the live DB):
+- `check-db` reports the v5 snapshot as `DB schema v5, binary expects v6` (on the repro branch; v7 after the renumbering at the merge onto main).
+- After migration it reports `schema v6, readable` (v7 after the merge).
+- The 2026-10-14 nightly's fuzz output parses (50,000 cases, 1 failure; case 24632 with its
+  detail) and stores only with `--allow-dirty`, because it predates the build line. Case
+  24632's FP64 verdict records as `a reference bug`, 0.43 ulp ours, 2.57 ulp cuBLASLt.
+
+Not done here:
+- The live DB is not migrated and holds no fuzz rows. Backfilling the four existing nightly fuzz
+  files needs `--allow-dirty`, since their builds are unknown, so those rows will stay marked.
+- The committed winners header is not regenerated.
+- Both wait for the tag aegis-perf-v0.6.0, which the owner of main cuts after merging this
+  branch (CLAUDE.md rule 14).
+
+Tests: aegis-perf 50, clippy clean on the workspace.

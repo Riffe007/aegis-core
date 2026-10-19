@@ -95,33 +95,116 @@ fn backup_path(db: &Path, v: i64) -> std::path::PathBuf {
     p
 }
 
-/// Open an existing perf DB read-only (SQLite URI `mode=ro`), for viewers: no
-/// schema creation, no migration, never a write, so a running tune or sweep
-/// is never blocked. Refuses a DB whose schema_version is not SCHEMA_VERSION
-/// ("DB schema vN, binary expects vM"), and one missing a column this crate
-/// reads.
-pub fn connect_ro(db: &Path) -> Result<Connection> {
+/// The schema versions this crate reads (core-request #3). A reader accepts a
+/// DB only at one of these versions; `connect` migrates older ones.
+pub const SUPPORTED_SCHEMA: std::ops::RangeInclusive<i64> = SCHEMA_VERSION..=SCHEMA_VERSION;
+
+/// Whether this aegis-perf can read a perf DB ([`check`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Compat {
+    /// Readable: its schema version is in [`SUPPORTED_SCHEMA`] and every table and column is there.
+    Ok { version: i64 },
+    /// Older than [`SUPPORTED_SCHEMA`] (a DB without schema_version is v1): migrate it with `aegis-perf init`.
+    TooOld { found: i64 },
+    /// Newer: written by a later aegis-perf; rebuild from a newer checkout.
+    TooNew { found: i64 },
+    /// At a supported version but missing a table or column this crate reads.
+    Missing { table: String, column: Option<String> },
+    /// Not an SQLite DB, or not a perf DB.
+    NotPerfDb { reason: String },
+}
+
+/// A DB [`connect_ro`] refused, with the reason as data (`err.downcast_ref::<SchemaError>()`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SchemaError {
+    pub db: std::path::PathBuf,
+    pub compat: Compat,
+}
+
+impl std::fmt::Display for SchemaError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let db = self.db.display();
+        match &self.compat {
+            Compat::Ok { version } => write!(f, "{db}: schema v{version}, readable"),
+            Compat::TooOld { found } => write!(
+                f,
+                "{db}: DB schema v{found}, binary expects v{SCHEMA_VERSION} (migrate it with this binary: aegis-perf --db <DB> init)"
+            ),
+            Compat::TooNew { found } => {
+                write!(f, "{db}: DB schema v{found}, binary expects v{SCHEMA_VERSION} (rebuild aegis-perf from a newer checkout)")
+            }
+            Compat::Missing { table, column: Some(c) } => {
+                write!(f, "{db}: {table}.{c} missing; the DB predates this aegis-perf (migrate it with aegis-perf init)")
+            }
+            Compat::Missing { table, column: None } => {
+                write!(f, "{db}: table {table} missing; the DB predates this aegis-perf (migrate it with aegis-perf init)")
+            }
+            Compat::NotPerfDb { reason } => write!(f, "{db} is not an AEGIS perf DB ({reason})"),
+        }
+    }
+}
+
+impl std::error::Error for SchemaError {}
+
+/// Tables a reader needs beyond the v1 ones (their columns are in ADDED_COLUMNS or created with them).
+const ADDED_TABLES: &[&str] = &["paired", "paired_results", "fuzz_runs", "fuzz_cases"];
+
+fn compat_of(con: &Connection) -> Compat {
+    let found = match schema_version(con) {
+        Ok(v) => v.unwrap_or(1),
+        Err(e) => return Compat::NotPerfDb { reason: format!("{e:#}") },
+    };
+    if found < *SUPPORTED_SCHEMA.start() {
+        return Compat::TooOld { found };
+    }
+    if found > *SUPPORTED_SCHEMA.end() {
+        return Compat::TooNew { found };
+    }
+    let has = |sql: &str, arg: &str| con.prepare(sql).and_then(|mut s| s.exists([arg]));
+    for table in ADDED_TABLES {
+        match has("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", table) {
+            Ok(true) => {}
+            Ok(false) => return Compat::Missing { table: table.to_string(), column: None },
+            Err(e) => return Compat::NotPerfDb { reason: format!("{e:#}") },
+        }
+    }
+    for (table, column, _) in ADDED_COLUMNS {
+        match has(&format!("SELECT 1 FROM pragma_table_info('{table}') WHERE name = ?"), column) {
+            Ok(true) => {}
+            Ok(false) => return Compat::Missing { table: table.to_string(), column: Some(column.to_string()) },
+            Err(e) => return Compat::NotPerfDb { reason: format!("{e:#}") },
+        }
+    }
+    Compat::Ok { version: found }
+}
+
+fn open_ro(db: &Path) -> Result<Connection> {
     let path = db.to_str().with_context(|| format!("non-UTF-8 path {}", db.display()))?;
     let uri = format!("file:{}?mode=ro", path.replace('%', "%25").replace('?', "%3f").replace('#', "%23"));
-    let con = Connection::open_with_flags(
+    Connection::open_with_flags(
         &uri,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
-    .with_context(|| format!("open {} read-only", db.display()))?;
-    let found = schema_version(&con).with_context(|| format!("{} is not an AEGIS perf DB", db.display()))?;
-    if found != Some(SCHEMA_VERSION) {
-        return Err(version_mismatch(db, found.unwrap_or(1)));
+    .with_context(|| format!("open {} read-only", db.display()))
+}
+
+/// Can this aegis-perf read the perf DB at `db`? Opens it read-only (never
+/// creates, migrates or writes). Err only when the file cannot be opened.
+pub fn check(db: &Path) -> Result<Compat> {
+    Ok(compat_of(&open_ro(db)?))
+}
+
+/// Open an existing perf DB read-only (SQLite URI `mode=ro`), for viewers: no
+/// schema creation, no migration, never a write, so a running tune or sweep
+/// is never blocked. Refuses (a [`SchemaError`]) a DB outside
+/// [`SUPPORTED_SCHEMA`] ("DB schema vN, binary expects vM"), and one missing a
+/// table or column this crate reads.
+pub fn connect_ro(db: &Path) -> Result<Connection> {
+    let con = open_ro(db)?;
+    match compat_of(&con) {
+        Compat::Ok { .. } => Ok(con),
+        compat => Err(SchemaError { db: db.to_path_buf(), compat }.into()),
     }
-    for (table, column, _) in ADDED_COLUMNS {
-        let exists: bool = con
-            .prepare(&format!("SELECT 1 FROM pragma_table_info('{table}') WHERE name = ?"))?
-            .exists([column])
-            .with_context(|| format!("{} is not an AEGIS perf DB", db.display()))?;
-        if !exists {
-            bail!("{}: {table}.{column} missing; the DB predates this aegis-perf (migrate it with aegis-perf init)", db.display());
-        }
-    }
-    Ok(con)
 }
 
 /// Columns added after v1. CREATE TABLE IF NOT EXISTS leaves existing tables
@@ -1685,6 +1768,30 @@ mod tests {
         std::fs::remove_file(&p).unwrap();
     }
 
+
+    /// The typed schema check (core-request #3): readers get the DB's version as
+    /// data, from check() and from connect_ro's SchemaError, never by parsing text.
+    #[test]
+    fn typed_schema_check() {
+        let p = tmp("compat.db");
+        let _ = std::fs::remove_file(&p);
+        assert!(check(&p).is_err(), "no file: an I/O error, not a Compat");
+        Connection::open(&p).unwrap().execute_batch("CREATE TABLE runs (run_id TEXT PRIMARY KEY);").unwrap();
+        assert_eq!(check(&p).unwrap(), Compat::TooOld { found: 1 });
+        drop(connect(&p).unwrap());
+        assert_eq!(check(&p).unwrap(), Compat::Ok { version: SCHEMA_VERSION });
+        assert!(SUPPORTED_SCHEMA.contains(&SCHEMA_VERSION));
+        Connection::open(&p).unwrap().execute_batch("DROP TABLE fuzz_cases;").unwrap();
+        assert_eq!(check(&p).unwrap(), Compat::Missing { table: "fuzz_cases".into(), column: None });
+        drop(connect(&p).unwrap());
+        Connection::open(&p).unwrap().execute("UPDATE schema_version SET version = ?", [SCHEMA_VERSION + 1]).unwrap();
+        assert_eq!(check(&p).unwrap(), Compat::TooNew { found: SCHEMA_VERSION + 1 });
+        let err = connect_ro(&p).unwrap_err();
+        let e = err.downcast_ref::<SchemaError>().expect("a typed SchemaError");
+        assert_eq!(e.compat, Compat::TooNew { found: SCHEMA_VERSION + 1 });
+        assert!(err.to_string().contains("binary expects"), "{err}");
+        std::fs::remove_file(&p).ok();
+    }
     /// invalidated needs a reason; status takes only the three values.
     #[test]
     fn status_constraints() {

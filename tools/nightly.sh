@@ -24,7 +24,8 @@
 #    FAIL night. Every step below runs that build, with that commit's shapes
 #    and winners header; its runs are stored as kind "nightly".
 # 2. aegis_fuzz, 50,000 cases (seed = the date, so every night differs),
-#    under tools/gpu_job.sh and the in-process GPU budget (rule 13).
+#    under tools/gpu_job.sh and the in-process GPU budget (rule 13). Stored in the
+#    perf DB (aegis-perf ingest-fuzz: fuzz_runs / fuzz_cases, kind nightly).
 # 3. Regression sweep of the tracked shape set (shapes/default.txt): the
 #    impls the committed winners header dispatches, plus cublaslt_best and
 #    cublas, through aegis-perf sweep --no-winners (idle guard before, idle
@@ -172,6 +173,7 @@ failed=0
 # 2. Fuzz.
 seed="$(date +%Y%m%d)"
 echo "== aegis_fuzz --cases 50000 --seed $seed --poison"
+fuzz_started="$(date -u +%Y-%m-%dT%H:%M:%S+00:00)"
 "$NTREE/tools/gpu_job.sh" "$FUZZ" --cases 50000 --seed "$seed" --poison > "$NDIR/fuzz-$STAMP.txt"
 fuzz_rc=$?
 fuzz_line="$(grep '^aegis_fuzz:' "$NDIR/fuzz-$STAMP.txt" | tail -1)"
@@ -183,6 +185,17 @@ if [[ $fuzz_rc -ne 0 || -z "$fuzz_fail" ]]; then
 else
   fuzz_txt="fuzz 50000 cases, $fuzz_fail failures (seed $seed)"
   [[ "$fuzz_fail" == 0 ]] || failed=1
+fi
+# Into the perf DB (fuzz_runs / fuzz_cases, kind nightly, with the build it ran).
+if [[ -n "$fuzz_fail" ]]; then
+  if ingest_out="$("$PERF" ingest-fuzz "$NDIR/fuzz-$STAMP.txt" --kind nightly --started-at "$fuzz_started" \
+                    --results-dir "$ROOT/results" 2>&1)"; then
+    echo "$ingest_out"
+  else
+    echo "$ingest_out"
+    fuzz_txt+=" (ingest-fuzz FAILED)"
+    failed=1
+  fi
 fi
 
 # 3. Regression sweep: the dispatched impls of the committed header + baselines.

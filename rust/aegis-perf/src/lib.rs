@@ -3,9 +3,11 @@
 //! so no viewer duplicates the schema. Viewers open the DB with
 //! [`db::connect_ro`] and read it through [`view`].
 pub mod ab;
+pub mod analysis;
 pub mod arch;
 pub mod bars;
 pub mod db;
+pub mod fuzz;
 pub mod gpujob;
 pub mod params;
 pub mod pyjson;

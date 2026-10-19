@@ -13,9 +13,11 @@
 //!     aegis-perf paired-ab --a OLD/build/bench_gemm --b build/bench_gemm --impl X --shape M N K
 //!     aegis-perf hw [--root FIXTURE] [--no-cuda] [--no-nvml]   (hardware discovery JSON)
 //!     aegis-perf calibrate [--dry-run] [--out-dir DIR]   (microbench + tune -> arch json + winners header)
+//!     aegis-perf check-db                       (can this binary read the DB: db::check)
+//!     aegis-perf ingest-fuzz FUZZ.txt [--kind nightly]; aegis-perf fuzz-verdict --fuzz-id F --case N ...
 use std::path::PathBuf;
 
-use aegis_perf::{ab, arch, calibrate, db, regress, roofline, sweep, tune, watch};
+use aegis_perf::{ab, arch, calibrate, db, fuzz, regress, roofline, sweep, tune, watch};
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
@@ -74,6 +76,41 @@ enum Cmd {
         /// Store rows from a dirty or unknown build (marked allow_dirty, excluded by default).
         #[arg(long)]
         allow_dirty: bool,
+    },
+    /// Can this aegis-perf read the DB? Prints the schema check (db::check); exit 1 if not.
+    CheckDb,
+    /// Store one aegis_fuzz output (fuzz_runs / fuzz_cases); a dirty or unknown build needs --allow-dirty.
+    IngestFuzz {
+        file: PathBuf,
+        /// nightly or manual.
+        #[arg(long, default_value = "manual")]
+        kind: String,
+        /// When the fuzz started (default: now).
+        #[arg(long)]
+        started_at: Option<String>,
+        /// The arch it ran on (default: results/manifest-<host>.json).
+        #[arg(long)]
+        arch: Option<i64>,
+        #[arg(long, default_value = "results")]
+        results_dir: PathBuf,
+        #[arg(long)]
+        allow_dirty: bool,
+    },
+    /// Record an adjudication of a reported fuzz case (e.g. FP64 ulp of ours and of the reference).
+    FuzzVerdict {
+        #[arg(long)]
+        fuzz_id: String,
+        #[arg(long = "case")]
+        case_no: i64,
+        #[arg(long)]
+        verdict: String,
+        #[arg(long)]
+        ours_ulp: Option<f64>,
+        #[arg(long)]
+        ref_ulp: Option<f64>,
+        /// Where the adjudication is written up (required).
+        #[arg(long)]
+        source: String,
     },
     /// Mark a microbench run's rows invalidated (known bad; hidden everywhere).
     Invalidate {
@@ -312,6 +349,30 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
+        Cmd::CheckDb => match db::check(&cli.db)? {
+            db::Compat::Ok { version } => {
+                println!("{}: schema v{version}, readable (supported v{}-v{})", cli.db.display(), db::SUPPORTED_SCHEMA.start(), db::SUPPORTED_SCHEMA.end());
+                Ok(())
+            }
+            compat => {
+                println!("{}", db::SchemaError { db: cli.db.clone(), compat });
+                std::process::exit(1)
+            }
+        },
+        Cmd::IngestFuzz { file, kind, started_at, arch, results_dir, allow_dirty } => fuzz::ingest(&fuzz::IngestArgs {
+            db: &cli.db,
+            file: &file,
+            kind: &kind,
+            started_at,
+            device_id: db::device_id(&results_dir),
+            sm_arch: arch.or_else(|| fuzz::manifest_arch(&results_dir)),
+            allow_dirty,
+        })
+        .map(|_| ()),
+        Cmd::FuzzVerdict { fuzz_id, case_no, verdict, ours_ulp, ref_ulp, source } => fuzz::record_verdict(
+            &cli.db,
+            &fuzz::Verdict { fuzz_id: &fuzz_id, case_no, verdict: &verdict, ours_ulp, ref_ulp, source: &source },
+        ),
         Cmd::Invalidate { run, probe, reason } => db::cmd_invalidate(&cli.db, &run, probe.as_deref(), &reason),
         Cmd::Winners { arch, build_dir } => {
             let bench = build_dir.join("bench_gemm");

@@ -64,6 +64,79 @@ pub fn median_disagrees(unpaired_pct: f64, p: &PairedPct) -> bool {
     unpaired_pct < p.ci_lo * 100.0 - MEDIAN_CI_DISAGREE_PTS || unpaired_pct > p.ci_hi * 100.0 + MEDIAN_CI_DISAGREE_PTS
 }
 
+/// Which performance bar a shape is held to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Bar {
+    /// M <= params::DECODE_MAX_M: [`DECODE`] (a tie or a win).
+    Decode,
+    /// Every dimension >= [`LARGE_MIN_DIM`]: [`LARGE`].
+    Large,
+    /// Everything else: only the floor ([`FLOOR`]).
+    Floor,
+}
+
+impl Bar {
+    pub fn of(m: i64, n: i64, k: i64) -> Bar {
+        if m as f64 <= crate::params::DECODE_MAX_M {
+            Bar::Decode
+        } else if m.min(n).min(k) >= LARGE_MIN_DIM {
+            Bar::Large
+        } else {
+            Bar::Floor
+        }
+    }
+
+    pub fn threshold(self) -> f64 {
+        match self {
+            Bar::Decode => DECODE,
+            Bar::Large => LARGE,
+            Bar::Floor => FLOOR,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Bar::Decode => "decode (>= 100% of cublaslt_best, a tie or a win)",
+            Bar::Large => "large (>= 90% of cublaslt_best)",
+            Bar::Floor => "floor (>= 80% of cublaslt_best, else dispatch to cuBLASLt)",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Verdict {
+    /// The paired CI reaches the bar (its upper bound >= the threshold: not
+    /// statistically below it; for decode, exactly "a tie or a win").
+    Meets,
+    /// The paired CI lies entirely below the bar.
+    Below,
+    /// No paired test: never judged on an unpaired median.
+    NotMeasured,
+}
+
+/// A kernel against its shape's bar, on its paired CI (vs cublaslt_best).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BarCheck {
+    pub bar: Bar,
+    pub verdict: Verdict,
+    /// The CI lies entirely below the floor: aegis::matmul dispatches to cuBLASLt
+    /// (tune::dispatch; the kernel still fails its bar).
+    pub below_floor: bool,
+}
+
+/// Core's pass / fail for one shape, so every reader gives the same verdict.
+pub fn check(m: i64, n: i64, k: i64, paired: Option<&PairedPct>) -> BarCheck {
+    let bar = Bar::of(m, n, k);
+    match paired {
+        None => BarCheck { bar, verdict: Verdict::NotMeasured, below_floor: false },
+        Some(p) => BarCheck {
+            bar,
+            verdict: if p.ci_hi >= bar.threshold() { Verdict::Meets } else { Verdict::Below },
+            below_floor: p.ci_hi < FLOOR,
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -79,5 +152,24 @@ mod tests {
         let t = PairedPct { median: 1.002, ci_lo: 0.977, ci_hi: 1.012 };
         assert!(t.tie());
         assert_eq!(t.text(), "100.2% (97.7-101.2%, tie)");
+    }
+
+    /// Cases from the LOG's tunes (in-process paired CIs) against their bars.
+    #[test]
+    fn bars_on_the_paired_ci() {
+        let p = |lo: f64, hi: f64| PairedPct { median: (lo + hi) / 2.0, ci_lo: lo, ci_hi: hi };
+        // Decode: a tie meets the bar, a CI below 1.0 does not.
+        assert_eq!(check(1, 4864, 896, Some(&p(0.9987, 1.0012))).verdict, Verdict::Meets);
+        assert_eq!(check(16, 896, 4864, Some(&p(0.983, 0.994))).verdict, Verdict::Below);
+        // Large: 2048^3 at 85.7-86.2% is below 90%; 1024^3 at 98.2-98.7% meets it.
+        assert_eq!(check(2048, 2048, 2048, Some(&p(0.8566, 0.8621))), BarCheck { bar: Bar::Large, verdict: Verdict::Below, below_floor: false });
+        assert_eq!(check(1024, 1024, 1024, Some(&p(0.9819, 0.9869))).verdict, Verdict::Meets);
+        // 4096^3: below its bar and below the floor (dispatched to cuBLASLt).
+        assert!(check(4096, 4096, 4096, Some(&p(0.7337, 0.7428))).below_floor);
+        // 512x4864x896: only the floor applies, and it is below it.
+        let c = check(512, 4864, 896, Some(&p(0.7851, 0.7903)));
+        assert_eq!((c.bar, c.verdict, c.below_floor), (Bar::Floor, Verdict::Below, true));
+        assert_eq!(check(512, 896, 896, None).verdict, Verdict::NotMeasured);
+        assert_eq!(Bar::of(1024, 1024, 512), Bar::Floor);
     }
 }

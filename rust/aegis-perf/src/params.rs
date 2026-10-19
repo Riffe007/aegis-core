@@ -142,12 +142,36 @@ impl ArchParams {
             memory_bound: ai < self.ridge(kind),
         }
     }
+    /// The decode floor (core-request #9; LOG "floor µs"): the time to read B
+    /// (K x N FP16 weights) once at the read-stream bandwidth, bytes(B) / read_bw,
+    /// in µs. A and C are not counted (unlike [`Self::roof`]'s compulsory traffic).
+    /// None for M > DECODE_MAX_M, where B's read is not the bound.
+    pub fn decode_floor_us(&self, m: f64, n: f64, k: f64) -> Option<f64> {
+        (m <= DECODE_MAX_M).then(|| 2.0 * k * n / (self.read_bw_gbps * 1e9) * 1e6)
+    }
+
+    /// % of the decode floor a measured time reaches (floor / median x 100).
+    pub fn pct_of_decode_floor(&self, m: f64, n: f64, k: f64, median_us: f64) -> Option<f64> {
+        self.decode_floor_us(m, n, k).map(|f| f / median_us * 100.0)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::arch::{latency_value, RunPoints};
+
+    /// LOG 2026-10-17 Phase C step 4: floor 6.227 µs at 896x896 and 33.805 µs at
+    /// 4864x896, and 1x896x896 at 8.92 µs = 69.8% of the floor, from the committed arch file.
+    #[test]
+    fn decode_floor_matches_the_log() {
+        let p = load(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../../include/aegis/arch/sm_121.json")).unwrap();
+        let f = |n: f64, k: f64| p.decode_floor_us(1.0, n, k).unwrap();
+        assert!((f(896.0, 896.0) - 6.227).abs() < 0.001, "{}", f(896.0, 896.0));
+        assert!((f(4864.0, 896.0) - 33.805).abs() < 0.001 && (f(896.0, 4864.0) - 33.805).abs() < 0.001);
+        assert!((p.pct_of_decode_floor(1.0, 896.0, 896.0, 8.92).unwrap() - 69.8).abs() < 0.05);
+        assert_eq!(p.decode_floor_us(17.0, 896.0, 896.0), None);
+    }
 
     #[test]
     fn loads_cycle_latencies_and_converts_at_any_clock() {

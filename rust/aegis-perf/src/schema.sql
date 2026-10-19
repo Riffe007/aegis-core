@@ -141,3 +141,44 @@ CREATE TABLE IF NOT EXISTS schema_version (
   id INTEGER PRIMARY KEY CHECK (id = 1),
   version INTEGER NOT NULL
 );
+-- Fuzz runs (schema v7; aegis-perf ingest-fuzz, the nightly): one aegis_fuzz
+-- invocation's summary line, its build (src/bench/build_info.h; refused when
+-- dirty or unknown unless --allow-dirty, then marked and excluded by default),
+-- and where it ran. kind: 'nightly' | 'manual'.
+CREATE TABLE IF NOT EXISTS fuzz_runs (
+  fuzz_id TEXT PRIMARY KEY,
+  kind TEXT NOT NULL,
+  device_id TEXT,
+  sm_arch INTEGER,
+  build_sha TEXT,
+  build_dirty INTEGER,
+  allow_dirty INTEGER NOT NULL DEFAULT 0,
+  seed INTEGER,
+  cases INTEGER NOT NULL,
+  failures INTEGER NOT NULL,
+  fp64_reference INTEGER,       -- cases checked against the CPU FP64 reference
+  cublaslt_reference INTEGER,   -- cases checked against cuBLASLt
+  nan_inf INTEGER,
+  misaligned INTEGER,
+  skipped INTEGER,              -- aegis::matmul cases skipped
+  overruled INTEGER,            -- cuBLASLt-reference failures overruled by FP64
+  seconds REAL,
+  started_at TEXT NOT NULL,
+  source TEXT                   -- the aegis_fuzz output file ingested
+);
+-- Reported cases of a fuzz run: 'FAIL' (counted in failures) or 'note' (a
+-- cuBLASLt-reference failure that FP64 overruled). verdict: an adjudication
+-- recorded afterwards (aegis-perf fuzz-verdict), with the ulp error of ours and
+-- of the reference at the failing element against FP64, and its source.
+CREATE TABLE IF NOT EXISTS fuzz_cases (
+  fuzz_id TEXT NOT NULL REFERENCES fuzz_runs(fuzz_id),
+  case_no INTEGER NOT NULL,
+  kind TEXT NOT NULL CHECK (kind IN ('FAIL', 'note')),
+  summary TEXT NOT NULL,        -- the case line: impl, shape, layouts, ld, alpha/beta, batch, offsets
+  detail TEXT,                  -- the indented lines that follow it
+  verdict TEXT,
+  ours_ulp REAL,
+  ref_ulp REAL,
+  verdict_source TEXT,
+  PRIMARY KEY (fuzz_id, case_no)
+);
