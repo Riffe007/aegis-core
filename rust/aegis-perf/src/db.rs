@@ -1146,8 +1146,69 @@ pub fn registry_of(bench: &Path) -> Result<Registry> {
 /// the runner-up median inside the fastest one's p10-p90): of the two, the one
 /// that wins or ties on the most neighboring shapes, then fewer registers,
 /// then less smem, then lower median, then name.
+/// Where the committed winners headers are, relative to the repo root (aegis-perf
+/// runs from it): their picks are the incumbents of the incumbent rule.
+pub const INCUMBENT_DIR: &str = "include/aegis/winners";
+
+/// The committed header's pick per shape (`<dir>/sm_<arch>.h`, rows
+/// `{M, N, K, "impl", ...}`); none when the file is missing.
+pub fn incumbents(dir: &Path, arch: i64) -> HashMap<(i64, i64, i64), String> {
+    let Ok(text) = std::fs::read_to_string(dir.join(format!("sm_{arch}.h"))) else {
+        return HashMap::new();
+    };
+    text.lines()
+        .filter_map(|l| {
+            let f: Vec<&str> = l.trim().strip_prefix('{')?.splitn(5, ", ").collect();
+            let shape = (f.first()?.parse().ok()?, f.get(1)?.parse().ok()?, f.get(2)?.parse().ok()?);
+            Some((shape, f.get(3)?.strip_prefix('"')?.strip_suffix('"')?.to_string()))
+        })
+        .collect()
+}
+
+/// A paired-ab result between two impls at a shape, as the time ratio x / y and its CI.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AbRatio {
+    pub id: i64,
+    pub ratio: f64,
+    pub ci_lo: f64,
+    pub ci_hi: f64,
+}
+
+/// paired_results rows that count as evidence: cold, protocol v2, idle (reading <= 2%),
+/// not disturbed, not --allow-dirty, both builds known and clean.
+const CLEAN_PAIRED: &str = "cache_mode = 'cold' AND protocol_version = 2 AND coalesce(disturbed, 0) = 0 \
+     AND idle_reading IS NOT NULL AND idle_reading <= 2.0 AND allow_dirty = 0 \
+     AND build_dirty_a = 0 AND build_dirty_b = 0 AND build_sha_a IS NOT NULL AND build_sha_b IS NOT NULL";
+
+/// The newest clean paired-ab of `x` against `y` (either order) at a shape on an arch.
+pub fn clean_ab(con: &Connection, arch: i64, shape: &str, x: &str, y: &str) -> Result<Option<AbRatio>> {
+    let q = format!(
+        "SELECT id, impl_a, ratio, ci_lo, ci_hi FROM paired_results WHERE sm_arch = ?1 AND shape = ?2 AND {CLEAN_PAIRED} \
+         AND ((impl_a = ?3 AND impl_b = ?4) OR (impl_a = ?4 AND impl_b = ?3)) ORDER BY id DESC LIMIT 1"
+    );
+    let row = con
+        .query_row(&q, params![arch, shape, x, y], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, f64>(2)?, r.get::<_, f64>(3)?, r.get::<_, f64>(4)?))
+        })
+        .optional()?;
+    // paired_results.ratio is time B / time A.
+    Ok(row.map(|(id, a, ratio, lo, hi)| {
+        if a == y {
+            AbRatio { id, ratio, ci_lo: lo, ci_hi: hi }
+        } else {
+            AbRatio { id, ratio: 1.0 / ratio, ci_lo: 1.0 / hi, ci_hi: 1.0 / lo }
+        }
+    }))
+}
+
 pub fn cmd_winners(db: &Path, arch: Option<i64>, registry: Option<&Registry>) -> Result<()> {
+    cmd_winners_in(db, arch, registry, Path::new(INCUMBENT_DIR))
+}
+
+/// [`cmd_winners`] with the incumbents read from `incumbent_dir` (tests).
+pub fn cmd_winners_in(db: &Path, arch: Option<i64>, registry: Option<&Registry>, incumbent_dir: &Path) -> Result<()> {
     let con = connect(db)?;
+    let mut incumbent_maps: HashMap<i64, HashMap<(i64, i64, i64), String>> = HashMap::new();
     // Ranked on protocol v2, cold, idle-GPU rows only (CLAUDE.md Benchmark policy).
     let sel = Selection::ranking();
     let rows: Vec<Latest> = latest_rows(&con, arch, &sel, TUNE_RUNS)?
@@ -1234,11 +1295,42 @@ pub fn cmd_winners(db: &Path, arch: Option<i64>, registry: Option<&Registry>) ->
             };
             (pick, format!("tie-break: {by}"))
         };
+        // The incumbent rule (CLAUDE.md rule 11): the committed header's config for the
+        // shape stays unless the newest clean paired-ab of the two shows the new pick
+        // faster (CI of pick / incumbent time entirely below 1).
+        let shape = shape_bucket(*m, *nn, *k);
+        let mut tie_names: Vec<&str> = tie.iter().map(|r| r.impl_.as_str()).collect();
+        let (mut tied, mut method, mut tie_ci) = (tie.len() > 1, call.method, call.ci);
+        let incumbent = incumbent_maps.entry(*arch).or_insert_with(|| incumbents(incumbent_dir, *arch)).get(&(*m, *nn, *k));
+        let (pick, reason) = match incumbent {
+            Some(inc) if *inc != pick.impl_ => {
+                let ab = clean_ab(&con, *arch, &shape, &pick.impl_, inc)?;
+                let ab_text = ab.map_or("no clean paired-ab of the two".to_string(), |a| {
+                    format!("paired_results id {}: {} / {inc} {:.4} [{:.4}, {:.4}]", a.id, pick.impl_, a.ratio, a.ci_lo, a.ci_hi)
+                });
+                match ours.iter().find(|r| r.impl_ == *inc) {
+                    _ if ab.is_some_and(|a| a.ci_hi < 1.0) => (pick, format!("{reason}; beats incumbent {inc} ({ab_text})")),
+                    Some(&kept) => {
+                        tie_names = vec![inc.as_str(), pick.impl_.as_str()];
+                        tied = ab.is_some_and(|a| a.ci_lo <= 1.0 && 1.0 <= a.ci_hi);
+                        method = "incumbent";
+                        tie_ci = ab.map(|a| (a.ci_lo, a.ci_hi));
+                        (kept, format!("incumbent: {} not CI-confirmed faster ({ab_text})", pick.impl_))
+                    }
+                    None => (pick, format!("{reason}; incumbent {inc} not measured in this ranking")),
+                }
+            }
+            _ => (pick, reason),
+        };
         // The cublaslt_best CI of the dispatched config: from a paired test of
         // the pick itself, never of the other config in its tie (aegis_tune
-        // pairs the runner-up too whenever it can become the pick). None when
-        // no such test exists (rows tuned before that).
-        let lt_test = lt_best.and_then(|lt| paired_test(&paired, pick, &lt.impl_, &lt.run_id));
+        // pairs the runner-up too whenever it can become the pick); else from a
+        // clean paired-ab of the pick against cublaslt_best (time cublaslt_best /
+        // pick). None when neither exists.
+        let lt_test = match lt_best.and_then(|lt| paired_test(&paired, pick, &lt.impl_, &lt.run_id)) {
+            Some(t) => Some(t),
+            None => clean_ab(&con, *arch, &shape, "cublaslt_best", &pick.impl_)?.map(|a| (a.ci_lo, a.ci_hi, a.ratio)),
+        };
         let lt_ci = lt_test.map(|(lo, hi, _)| (lo, hi));
         let lt_median = lt_test.map(|(_, _, med)| med);
         // The cuBLASLt algorithm cublaslt_best picked at this shape in the pick's run.
@@ -1259,16 +1351,16 @@ pub fn cmd_winners(db: &Path, arch: Option<i64>, registry: Option<&Registry>) ->
         // Where aegis::matmul sends the shape (the dispatch floor on the paired CI), stored so
         // readers need not restate the rule or parse the header (schema v7).
         let dispatch = crate::tune::dispatch(lt_ci, pct_lt);
-        let set_json = serde_json::to_string(&tie.iter().map(|r| r.impl_.as_str()).collect::<Vec<_>>())?;
+        let set_json = serde_json::to_string(&tie_names)?;
         con.execute(
             "INSERT OR REPLACE INTO winners (sm_arch, op, dtype, shape_bucket, kernel_id, run_id, median_us, \
              pct_of_cublas, tied, tie_set, pick_reason, protocol_version, warm_median_us, pct_of_cublaslt_best, \
              tie_method, ratio_ci_lo, ratio_ci_hi, lt_ratio_ci_lo, lt_ratio_ci_hi, lt_algo, lt_ratio_median, dispatch) \
              VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            params![arch, op, dtype, shape_bucket(*m, *nn, *k), pick.kernel_id, pick.run_id, pick.median_us, pct,
-                    (tie.len() > 1) as i64, set_json, reason, sel.protocol,
-                    warm_of(&pick.kernel_id, (*arch, dtype.as_str(), *m, *nn, *k))?, pct_lt, call.method,
-                    call.ci.map(|c| c.0), call.ci.map(|c| c.1), lt_ci.map(|c| c.0), lt_ci.map(|c| c.1),
+            params![arch, op, dtype, shape, pick.kernel_id, pick.run_id, pick.median_us, pct,
+                    tied as i64, set_json, reason, sel.protocol,
+                    warm_of(&pick.kernel_id, (*arch, dtype.as_str(), *m, *nn, *k))?, pct_lt, method,
+                    tie_ci.map(|c| c.0), tie_ci.map(|c| c.1), lt_ci.map(|c| c.0), lt_ci.map(|c| c.1),
                     lt_algo, lt_median, dispatch.as_str()],
         )?;
         n += 1;
@@ -2033,6 +2125,87 @@ mod tests {
         assert_eq!(v.dispatch, Some(crate::tune::Dispatch::Aegis));
         drop(con);
         std::fs::remove_file(&p).unwrap();
+    }
+
+    /// The incumbent rule: the tune picks a (faster unpaired median), the committed header
+    /// has b. b stays until the newest clean paired-ab of the two shows a faster (CI < 1),
+    /// in either A/B order; a dirty or tied result keeps b. A kept incumbent's
+    /// cublaslt_best CI comes from a clean paired-ab when the tune paired only the pick.
+    #[test]
+    fn winners_keep_the_incumbent_unless_paired_ab_confirms() {
+        let p = tmp("incumbent.db");
+        let dir = tmp("incumbent-headers");
+        let _ = std::fs::remove_file(&p);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("sm_121.h"),
+            "inline constexpr aegis::detail::Winner kWinners_sm121[] = {\n    {64, 64, 64, \"b\", aegis::detail::Dispatch::Aegis, 99.0, 0, 0, {13, 0, 0, 1, 0, 0, 100, 0, 0}},  // x\n};\n",
+        )
+        .unwrap();
+        assert_eq!(incumbents(&dir, 121).get(&(64, 64, 64)).map(String::as_str), Some("b"));
+        let con = connect(&p).unwrap();
+        con.execute_batch(
+            "INSERT INTO runs (run_id, device_id, sm_arch, started_at) VALUES ('tune', 'dev', 121, '2026-01-01');
+             INSERT INTO kernels (kernel_id, op, impl, config_json, regs, smem_bytes) VALUES
+               ('ka', 'gemm', 'a', '{}', 64, 0), ('kb', 'gemm', 'b', '{}', 64, 0), ('kl', 'gemm', 'cublaslt_best', '{}', -1, 0);
+             INSERT INTO measurements (run_id, kernel_id, dtype, m, n, k, median_us, p10_us, p90_us, tflops,
+                                       checked, pass, protocol_version, cache_mode, allow_busy) VALUES
+               ('tune', 'ka', 'f16f32f16', 64, 64, 64, 10.0, 9.9, 10.1, 1, 1, 1, 2, 'cold', 0),
+               ('tune', 'kb', 'f16f32f16', 64, 64, 64, 10.2, 10.1, 10.3, 1, 1, 1, 2, 'cold', 0),
+               ('tune', 'kl', 'f16f32f16', 64, 64, 64, 11.0, 10.9, 11.1, 1, 0, 0, 2, 'cold', 0);
+             INSERT INTO paired (run_id, op, dtype, m, n, k, a_impl, b_impl, role, pairs, ratio_median,
+                                 ratio_ci_lo, ratio_ci_hi, tied, protocol_version, cache_mode) VALUES
+               ('tune', 'gemm', 'f16f32f16', 64, 64, 64, 'a', 'b', 'runner_up', 30, 1.02, 1.01, 1.03, 0, 2, 'cold'),
+               ('tune', 'gemm', 'f16f32f16', 64, 64, 64, 'a', 'cublaslt_best', 'cublaslt_best', 30, 1.1, 1.09, 1.11, 0, 2, 'cold');",
+        )
+        .unwrap();
+        drop(con);
+        // (impl_a, impl_b, ratio B/A, ci_lo, ci_hi, build_dirty_b)
+        let ab = |a: &str, b: &str, r: f64, lo: f64, hi: f64, dirty: i64| {
+            connect(&p)
+                .unwrap()
+                .execute(
+                    "INSERT INTO paired_results (shape, impl_a, impl_b, ratio, ci_lo, ci_hi, n, protocol_version, cache_mode,
+                       idle_reading, started_at, finished_at, build_sha_a, build_sha_b, build_dirty_a, build_dirty_b, sm_arch)
+                     VALUES ('64x64x64', ?1, ?2, ?3, ?4, ?5, 30, 2, 'cold', 0.0, 't', 't', ?6, ?6, 0, ?7, 121)",
+                    params![a, b, r, lo, hi, CLEAN, dirty],
+                )
+                .unwrap();
+        };
+        type W = (String, i64, String, String, Option<f64>, Option<f64>);
+        let winner = || -> W {
+            cmd_winners_in(&p, Some(121), None, &dir).unwrap();
+            connect(&p)
+                .unwrap()
+                .query_row(
+                    "SELECT k.impl, w.tied, w.tie_method, w.pick_reason, w.lt_ratio_ci_lo, w.lt_ratio_ci_hi
+                     FROM winners w JOIN kernels k USING(kernel_id)",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+                )
+                .unwrap()
+        };
+        let w = winner();
+        assert_eq!((w.0.as_str(), w.2.as_str()), ("b", "incumbent"), "no paired-ab: the incumbent stays");
+        assert!(w.3.contains("no clean paired-ab"), "{}", w.3);
+        assert_eq!((w.4, w.5), (None, None), "b's cublaslt_best CI is never borrowed from a");
+        ab("b", "a", 0.95, 0.94, 0.96, 1);
+        assert_eq!(winner().0, "b", "a dirty build is not evidence");
+        ab("cublaslt_best", "b", 0.9, 0.89, 0.91, 0);
+        let w = winner();
+        assert_eq!(w.0, "b");
+        assert!((w.4.unwrap() - 1.0 / 0.91).abs() < 1e-12 && (w.5.unwrap() - 1.0 / 0.89).abs() < 1e-12, "{w:?}");
+        ab("b", "a", 0.95, 0.94, 0.96, 0);
+        let w = winner();
+        assert_eq!((w.0.as_str(), w.4, w.5), ("a", Some(1.09), Some(1.11)), "confirmed: a, with its tune CI");
+        assert!(w.3.contains("beats incumbent b"), "{}", w.3);
+        ab("a", "b", 1.0, 0.99, 1.01, 0);
+        let w = winner();
+        assert_eq!((w.0.as_str(), w.1), ("b", 1), "the newest clean result decides: a tie keeps b");
+        ab("a", "b", 1.05, 1.04, 1.06, 0);
+        assert_eq!(winner().0, "a", "b/a > 1 in the other order is a confirmed win for a too");
+        std::fs::remove_file(&p).ok();
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A config retired from the registry never wins, however fast its old rows:

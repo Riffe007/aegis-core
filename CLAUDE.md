@@ -185,6 +185,14 @@ docs/               LOG.md (dated run log), analysis/ (consolidated analyses, e.
    them as comments. Never hand-edit a winner. Winners rank on tune runs only
    (runs with paired tie tests); sweep rows, the nightly's included, time a
    subset of configs and never decide a winner.
+   **Incumbent rule** (2026-10-19): when the pick differs from the committed
+   header's config for the shape (`include/aegis/winners/sm_<arch>.h`), the
+   incumbent stays unless the newest clean `paired_results` row of the two
+   (paired-ab: cold, v2, idle, not disturbed, both builds clean) puts the pick
+   faster with its CI below 1 (`tie_method` "incumbent", the head-to-head in
+   `pick_reason`). A tune's own tie test does not replace a winner; a paired-ab
+   win does. A kept incumbent's cublaslt_best CI comes from a clean paired-ab
+   against cublaslt_best when the tune did not pair it.
 12. **Never pass `--num-cuda-barriers` to compute-sanitizer.** GB10 memory is
    unified: the sanitizer's tracking allocations come out of host RAM. On
    2026-10-14 synccheck runs with a raised barrier limit drove the machine into
