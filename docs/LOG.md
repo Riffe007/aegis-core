@@ -2810,3 +2810,29 @@ Not done here:
   branch (CLAUDE.md rule 14).
 
 Tests: aegis-perf 50, clippy clean on the workspace.
+
+## 2026-10-18 — sass_dump.sh: one listing per kernel symbol, indexed
+
+`tools/sass_dump.sh` named each listing after the demangled symbol cut to 120 characters. The
+kernels take `Layout` template arguments, so the four layout instantiations of a config share
+the cut name, and each file kept whichever was written last: the column-major one, never the
+row-major A and B that bench_gemm measures. `instruction-mix.txt` cut its names at the first
+`(`, which now falls inside `(aegis::gemm::Layout)1`. AEGIS Custos core-request #6, items 1 and 3.
+
+Now:
+- **Names.** Each listing is `<template name, cut to 80>__<id>.sass`, with id the first 16 hex
+  digits of sha1(mangled symbol). A repeated file name stops the dump.
+- **`index.tsv`.** id, file, layout_a, layout_b (the Layout template arguments in order; 0 =
+  row-major), the full template name and the mangled symbol.
+- **`BUILD`.** `bench_gemm --build-info` of the binary dumped, so a listing is tied to the commit
+  it came from.
+- **`instruction-mix.txt`.** Keyed by id, with the full template name.
+- `AEGIS_SASS_BIN` and `AEGIS_SASS_OUT` override the binary and the output directory.
+  cuobjdump's per-cubin "not found" warnings are dropped, and a symbol without SASS stops the
+  dump.
+
+On this branch's build (CPU only, cuobjdump):
+- 281 kernel symbols give 281 listings: 52 configs in each of the four layouts, plus 73 without
+  Layout arguments (gemv, gemv_tc, mma_tma, CUDA-core tiers, helpers).
+- The old naming on the same binary left 107 files, so 174 listings were overwritten.
+- Not done: Nsight summaries per kernel (#6 item 2).
